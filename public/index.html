@@ -1,0 +1,1446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TosheLabs Pipeline</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2129;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --text-muted: #484f58;
+    --green: #3fb950;
+    --green-dim: #1a4731;
+    --red: #f85149;
+    --red-dim: #4a1e1e;
+    --yellow: #d29922;
+    --yellow-dim: #3d2e00;
+    --blue: #58a6ff;
+    --blue-dim: #1a3a5c;
+    --purple: #bc8cff;
+    --orange: #f0883e;
+    --cyan: #39d2c0;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', monospace;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: grid;
+    grid-template-rows: 48px 1fr;
+    grid-template-columns: 280px 1fr 320px;
+    grid-template-areas:
+      "header header header"
+      "sidebar main artifacts";
+    overflow: hidden;
+  }
+
+  /* ─── HEADER ─── */
+  .header {
+    grid-area: header;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 24px;
+  }
+
+  .header .logo {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--cyan);
+    letter-spacing: 1px;
+  }
+
+  .header .logo span { color: var(--text-dim); font-weight: 400; }
+
+  .header .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .status-pill.running {
+    background: var(--green-dim);
+    color: var(--green);
+  }
+
+  .status-pill .dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .header .spacer { flex: 1; }
+
+  .context-meter {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .context-meter .bar {
+    width: 120px;
+    height: 6px;
+    background: var(--surface2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .context-meter .bar-fill {
+    height: 100%;
+    width: 42%;
+    background: linear-gradient(90deg, var(--green), var(--yellow));
+    border-radius: 3px;
+    transition: width 0.5s;
+  }
+
+  .header .session-info {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  /* ─── SIDEBAR ─── */
+  .sidebar {
+    grid-area: sidebar;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sidebar-header {
+    padding: 12px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .sidebar-header .count {
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  .ticket-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 0;
+  }
+
+  .ticket-item {
+    padding: 10px 16px;
+    border-left: 3px solid transparent;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+
+  .ticket-item:hover { background: var(--surface2); }
+
+  .ticket-item.active {
+    background: var(--surface2);
+    border-left-color: var(--cyan);
+  }
+
+  .ticket-item.done {
+    opacity: 0.5;
+  }
+
+  .ticket-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .ticket-id {
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .ticket-id.bug { color: var(--red); }
+  .ticket-id.feature { color: var(--blue); }
+
+  .ticket-priority {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .ticket-priority.p0 { background: var(--red-dim); color: var(--red); }
+  .ticket-priority.p1 { background: var(--yellow-dim); color: var(--yellow); }
+  .ticket-priority.p2 { background: var(--blue-dim); color: var(--blue); }
+
+  .ticket-title {
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ticket-step-dots {
+    display: flex;
+    gap: 3px;
+    margin-top: 6px;
+  }
+
+  .step-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    background: var(--border);
+  }
+
+  .step-dot.done { background: var(--green); }
+  .step-dot.active { background: var(--yellow); animation: pulse 1.5s infinite; }
+  .step-dot.failed { background: var(--red); }
+
+  .sidebar-stats {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .stat-row {
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .stat-value { color: var(--text); font-weight: 600; }
+  .stat-value.green { color: var(--green); }
+
+  /* ─── MAIN ─── */
+  .main {
+    grid-area: main;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    overflow: hidden;
+  }
+
+  /* Current ticket header */
+  .current-ticket {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .current-ticket-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .current-ticket-header .ticket-id { font-size: 16px; }
+  .current-ticket-header .title {
+    font-size: 14px;
+    color: var(--text);
+  }
+
+  /* Step pipeline */
+  .step-pipeline {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .step-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    background: var(--surface2);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    position: relative;
+  }
+
+  .step-chip.done {
+    background: var(--green-dim);
+    color: var(--green);
+    border-color: transparent;
+  }
+
+  .step-chip.active {
+    background: var(--yellow-dim);
+    color: var(--yellow);
+    border-color: var(--yellow);
+  }
+
+  .step-chip.active .chip-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--yellow);
+    animation: pulse 1.5s infinite;
+  }
+
+  .step-chip .check { font-size: 12px; }
+
+  .step-arrow {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  /* Terminal */
+  .terminal {
+    overflow-y: auto;
+    padding: 16px 20px;
+    font-size: 12px;
+    line-height: 1.7;
+    background: var(--bg);
+  }
+
+  .terminal .line { display: flex; gap: 8px; }
+  .terminal .ts { color: var(--text-muted); white-space: nowrap; min-width: 60px; }
+  .terminal .tag { min-width: 65px; font-weight: 600; white-space: nowrap; }
+  .terminal .tag.opus { color: var(--purple); }
+  .terminal .tag.haiku { color: var(--cyan); }
+  .terminal .tag.gate { color: var(--yellow); }
+  .terminal .tag.system { color: var(--orange); }
+  .terminal .msg { color: var(--text-dim); }
+  .terminal .msg em { color: var(--text); font-style: normal; font-weight: 500; }
+  .terminal .msg .file { color: var(--blue); }
+  .terminal .msg .pass { color: var(--green); }
+  .terminal .msg .fail { color: var(--red); }
+  .terminal .msg .warn { color: var(--yellow); }
+
+  .terminal .divider {
+    border-top: 1px solid var(--border);
+    margin: 8px 0;
+    padding-top: 8px;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* Think loop widget */
+  .think-loop-bar {
+    padding: 10px 20px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .think-loop-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--yellow);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+
+  .think-rounds {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .round-pip {
+    width: 24px;
+    height: 20px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    background: var(--surface2);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+  }
+
+  .round-pip.improved {
+    background: var(--green-dim);
+    color: var(--green);
+    border-color: var(--green);
+  }
+
+  .round-pip.discarded {
+    background: var(--red-dim);
+    color: var(--red);
+    border-color: var(--red);
+  }
+
+  .round-pip.active {
+    border-color: var(--yellow);
+    color: var(--yellow);
+    animation: pulse 1.5s infinite;
+  }
+
+  .think-summary {
+    font-size: 11px;
+    color: var(--text-dim);
+    flex: 1;
+  }
+
+  .think-summary strong { color: var(--text); }
+
+  .converge-status {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 4px;
+  }
+
+  .converge-status.converging {
+    background: var(--yellow-dim);
+    color: var(--yellow);
+  }
+
+  /* ─── ARTIFACTS PANEL ─── */
+  .artifacts {
+    grid-area: artifacts;
+    background: var(--surface);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .artifacts-header {
+    padding: 12px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .artifacts-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  .artifact-section {
+    margin-bottom: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+
+  .artifact-section-header {
+    padding: 8px 12px;
+    background: var(--surface2);
+    font-size: 11px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+  }
+
+  .artifact-section-header .step-status {
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .artifact-section-header .step-status.done {
+    background: var(--green-dim);
+    color: var(--green);
+  }
+
+  .artifact-section-header .step-status.active {
+    background: var(--yellow-dim);
+    color: var(--yellow);
+  }
+
+  .artifact-section-header .step-status.pending {
+    background: var(--surface);
+    color: var(--text-muted);
+  }
+
+  .artifact-body {
+    padding: 10px 12px;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+
+  .artifact-field {
+    margin-bottom: 6px;
+  }
+
+  .artifact-field .label {
+    color: var(--text-muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .artifact-field .value {
+    color: var(--text-dim);
+    padding-left: 8px;
+  }
+
+  .artifact-field .value.file { color: var(--blue); }
+
+  .artifact-field .value li {
+    list-style: none;
+    padding: 1px 0;
+  }
+
+  .artifact-field .value li::before {
+    content: ">";
+    color: var(--text-muted);
+    margin-right: 6px;
+  }
+
+  .gate-result {
+    margin: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .gate-result.pass {
+    background: var(--green-dim);
+    color: var(--green);
+    border: 1px solid #1a4731;
+  }
+
+  .gate-result.fail {
+    background: var(--red-dim);
+    color: var(--red);
+    border: 1px solid #4a1e1e;
+  }
+
+  .gate-result .icon { font-size: 14px; }
+
+  /* validation checklist */
+  .checklist {
+    padding: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .checklist-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    padding: 4px 8px;
+    margin-bottom: 4px;
+  }
+
+  .check-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .check-item .icon { font-size: 12px; }
+  .check-item .icon.pass { color: var(--green); }
+  .check-item .icon.pending { color: var(--text-muted); }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<div class="header">
+  <div class="logo">TOSHELABS <span>PIPELINE</span></div>
+  <div class="status-pill running"><div class="dot"></div> Running</div>
+  <div style="font-size:11px;color:var(--text-dim)">busydad</div>
+  <div class="spacer"></div>
+  <div class="context-meter">
+    <span>CTX</span>
+    <div class="bar"><div class="bar-fill"></div></div>
+    <span>42% &middot; 420k / 1M</span>
+    <span style="color:var(--text-muted);font-size:10px">(next check: 38s)</span>
+  </div>
+  <div style="width:1px;height:20px;background:var(--border)"></div>
+  <div class="session-info">Session 3 &middot; T-275 &middot; 01:47:32</div>
+  <div style="width:1px;height:20px;background:var(--border)"></div>
+  <div style="display:flex;gap:4px;align-items:center;font-size:10px;color:var(--text-muted)">
+    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--green) 78%,var(--surface2) 78%);display:inline-block" title="S1: BUG-143 78%"></span>
+    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--yellow) 85%,var(--surface2) 85%);display:inline-block" title="S2: BUG-145 85%"></span>
+    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--green) 42%,var(--surface2) 42%);display:inline-block;border:1px solid var(--cyan)" title="S3: T-275 42% (active)"></span>
+  </div>
+</div>
+
+<!-- SIDEBAR -->
+<div class="sidebar">
+  <div class="sidebar-header">
+    <span>Ticket Queue</span>
+    <span style="display:flex;align-items:center;gap:8px">
+      <span class="count">8 items</span>
+      <button style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Re-parse BACKLOG.md for new tickets">&#8635; Refresh</button>
+    </span>
+  </div>
+  <div class="ticket-list">
+
+    <div class="ticket-item done">
+      <div class="ticket-top">
+        <span class="ticket-id bug">BUG-143</span>
+        <span class="ticket-priority p0">P0</span>
+      </div>
+      <div class="ticket-title">Reminder nag fires after completion</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item done">
+      <div class="ticket-top">
+        <span class="ticket-id bug">BUG-145</span>
+        <span class="ticket-priority p1">P1</span>
+      </div>
+      <div class="ticket-title">Overdue entries missing from Today view</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item active">
+      <div class="ticket-top">
+        <span class="ticket-id feature">T-275</span>
+        <span class="ticket-priority p1">P1</span>
+      </div>
+      <div class="ticket-title">Inline field editing on entry detail</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot done"></div>
+        <div class="step-dot active"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item">
+      <div class="ticket-top">
+        <span class="ticket-id bug">BUG-147</span>
+        <span class="ticket-priority p1">P1</span>
+      </div>
+      <div class="ticket-title">Capture source lost on follow-up flow</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item">
+      <div class="ticket-top">
+        <span class="ticket-id feature">T-276</span>
+        <span class="ticket-priority p2">P2</span>
+      </div>
+      <div class="ticket-title">Batch entry completion from Today</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item">
+      <div class="ticket-top">
+        <span class="ticket-id feature">T-277</span>
+        <span class="ticket-priority p2">P2</span>
+      </div>
+      <div class="ticket-title">Smart checklist suggestions</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item">
+      <div class="ticket-top">
+        <span class="ticket-id bug">BUG-148</span>
+        <span class="ticket-priority p2">P2</span>
+      </div>
+      <div class="ticket-title">Serialization round-trip drops enum</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+    <div class="ticket-item">
+      <div class="ticket-top">
+        <span class="ticket-id feature">T-278</span>
+        <span class="ticket-priority p2">P2</span>
+      </div>
+      <div class="ticket-title">Enrich Education category fields</div>
+      <div class="ticket-step-dots">
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+        <div class="step-dot"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="sidebar-stats">
+    <div class="stat-row">
+      <span>Completed</span>
+      <span class="stat-value green">2 / 8</span>
+    </div>
+    <div class="stat-row">
+      <span>Tests passing</span>
+      <span class="stat-value green">1,147</span>
+    </div>
+    <div class="stat-row">
+      <span>Think rounds</span>
+      <span class="stat-value">23</span>
+    </div>
+    <div class="stat-row">
+      <span>Elapsed</span>
+      <span class="stat-value">01:47:32</span>
+    </div>
+    <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px">
+      <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:4px">Session History</div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
+          <span style="color:var(--text-muted);width:16px">S1</span>
+          <span style="color:var(--red);width:55px">BUG-143</span>
+          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:78%;height:100%;background:var(--green);border-radius:3px"></div></div>
+          <span style="color:var(--text-muted);font-size:10px">78%</span>
+          <span style="color:var(--green);font-size:10px">&#10003;</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
+          <span style="color:var(--text-muted);width:16px">S2</span>
+          <span style="color:var(--red);width:55px">BUG-145</span>
+          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:85%;height:100%;background:var(--yellow);border-radius:3px"></div></div>
+          <span style="color:var(--text-muted);font-size:10px">85%</span>
+          <span style="color:var(--green);font-size:10px">&#10003;</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
+          <span style="color:var(--cyan);width:16px">S3</span>
+          <span style="color:var(--blue);width:55px">T-275</span>
+          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:42%;height:100%;background:var(--green);border-radius:3px"></div></div>
+          <span style="color:var(--text);font-size:10px">42%</span>
+          <span style="font-size:10px;animation:pulse 2s infinite;color:var(--yellow)">&#9679;</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN -->
+<div class="main">
+  <!-- Current ticket -->
+  <div class="current-ticket">
+    <div class="current-ticket-header">
+      <span class="ticket-id feature" style="font-size:16px">T-275</span>
+      <span class="title">Inline field editing on entry detail</span>
+      <span class="ticket-priority p1" style="font-size:11px">P1</span>
+    </div>
+    <div class="step-pipeline">
+      <div class="step-chip done"><span class="check">&#10003;</span> plan</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip done"><span class="check">&#10003;</span> tests_red</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip done"><span class="check">&#10003;</span> implement</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip active"><div class="chip-dot"></div> tests_green</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip">review</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip">root_cause</div>
+      <span class="step-arrow">&#8250;</span>
+      <div class="step-chip">docs</div>
+    </div>
+  </div>
+
+  <!-- Terminal -->
+  <div class="terminal">
+    <div class="divider">step: plan &middot; completed in 42s</div>
+
+    <div class="line">
+      <span class="ts">00:12</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Reading ticket T-275 from <span class="file">BACKLOG.md</span></span>
+    </div>
+    <div class="line">
+      <span class="ts">00:15</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Reading <span class="file">entry_detail_screen.dart</span> (847 lines)</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:18</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Tracing callers of <em>_save()</em> &rarr; found 3 call sites</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:24</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Plan: 4 files to change, 3 edge cases, risk: <span class="warn">medium</span></span>
+    </div>
+    <div class="line">
+      <span class="ts">00:25</span>
+      <span class="tag gate">GATE</span>
+      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; files_to_change(4), callers_traced(3), edge_cases(3)</span>
+    </div>
+
+    <div class="divider">think loop: plan &middot; 4 rounds, 2 discards &middot; converged</div>
+
+    <div class="line">
+      <span class="ts">00:26</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 1: <span class="pass">&#9650; improved</span> &mdash; "Simpler: use TextEditingController directly instead of debounced stream"</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:34</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 2: <span class="fail">&#9660; discarded</span> &mdash; "Adding ChangeNotifier adds complexity without benefit"</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:40</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 3: <span class="pass">&#9650; improved</span> &mdash; "Found missing edge case: dispose during debounced save"</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:46</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 4: <span class="fail">&#9660; discarded</span> &mdash; "Extract auto-save mixin — premature, only 1 screen uses it"</span>
+    </div>
+    <div class="line">
+      <span class="ts">00:47</span>
+      <span class="tag system">CONV</span>
+      <span class="msg">Converged after 4 rounds (2 discards). Final plan has 5 files, 4 edge cases.</span>
+    </div>
+
+    <div class="divider">step: tests_red &middot; completed in 38s</div>
+
+    <div class="line">
+      <span class="ts">01:02</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Writing widget test: <span class="file">test/unit/entry_detail_inline_test.dart</span></span>
+    </div>
+    <div class="line">
+      <span class="ts">01:14</span>
+      <span class="tag haiku">HAIKU</span>
+      <span class="msg">Running flutter test &mdash; 2 new tests <span class="fail">FAILED</span> as expected</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:15</span>
+      <span class="tag gate">GATE</span>
+      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; outcome=new_test_fails, tests 1147&rarr;1149, failure_output captured</span>
+    </div>
+
+    <div class="divider">step: implement &middot; completed in 1m 12s</div>
+
+    <div class="line">
+      <span class="ts">01:16</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Editing <span class="file">entry_detail_screen.dart</span>: removing _editing toggle, adding auto-save</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:28</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Editing <span class="file">entry_detail_sheet.dart</span>: same pattern, shared TextEditingController</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:35</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Added <em>if (!mounted) return;</em> after await in _autoSave()</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:36</span>
+      <span class="tag gate">GATE</span>
+      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; files_changed covers all 5 planned files</span>
+    </div>
+
+    <div class="divider">think loop: implement &middot; 3 rounds, 2 discards &middot; converged</div>
+
+    <div class="line">
+      <span class="ts">01:37</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 1: <span class="pass">&#9650; improved</span> &mdash; "Catch block at line 260 missing _log.warning"</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:42</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 2: <span class="fail">&#9660; discarded</span> &mdash; "Suggested extracting helper — would be only caller"</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:47</span>
+      <span class="tag opus">OPUS</span>
+      <span class="msg">Round 3: <span class="fail">&#9660; discarded</span> &mdash; "StateNotifier suggestion N/A — using StatefulWidget"</span>
+    </div>
+
+    <div class="divider" style="color:var(--yellow)">step: tests_green &middot; running...</div>
+
+    <div class="line">
+      <span class="ts">01:48</span>
+      <span class="tag haiku">HAIKU</span>
+      <span class="msg">Running: <em>flutter test test/unit/</em></span>
+    </div>
+    <div class="line">
+      <span class="ts">01:49</span>
+      <span class="tag system">CTX</span>
+      <span class="msg">Context check: <span class="warn">42%</span> (420k/1M) &mdash; healthy</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:50</span>
+      <span class="tag haiku">HAIKU</span>
+      <span class="msg">&#9632; 1149/1149 tests passed <span class="pass">(0 failures)</span> &mdash; 54.2s</span>
+    </div>
+    <div class="line">
+      <span class="ts">01:51</span>
+      <span class="tag haiku">HAIKU</span>
+      <span class="msg">Running: <em>flutter analyze</em></span>
+    </div>
+    <div class="line">
+      <span class="ts">01:51</span>
+      <span class="tag haiku">HAIKU</span>
+      <span class="msg" style="animation: pulse 2s infinite">Analyzing project...</span>
+    </div>
+  </div>
+
+  <!-- Think Loop Bar -->
+  <div class="think-loop-bar">
+    <div class="think-loop-label">Think Loop</div>
+    <div class="think-rounds">
+      <div class="round-pip improved" title="R1: improved">&#9650;</div>
+      <div class="round-pip discarded" title="R2: discarded">&#9660;</div>
+      <div class="round-pip improved" title="R3: improved">&#9650;</div>
+      <div class="round-pip discarded" title="R4: discarded">&#9660;</div>
+      <div class="round-pip" title="R5">5</div>
+      <div class="round-pip" title="R6">6</div>
+      <div class="round-pip" title="R7">7</div>
+      <div class="round-pip" title="R8">8</div>
+      <div class="round-pip" title="R9">9</div>
+      <div class="round-pip" title="R10">10</div>
+    </div>
+    <div class="think-summary">
+      Plan: <strong>2 improved, 2 discarded</strong> &rarr; converged &middot;
+      Impl: <strong>1 improved, 2 discarded</strong> &rarr; converged
+    </div>
+    <div class="converge-status converging">step has no think loop</div>
+  </div>
+</div>
+
+<!-- ARTIFACTS -->
+<div class="artifacts">
+  <div class="artifacts-header">Pipeline Artifacts &middot; T-275</div>
+  <div class="artifacts-content">
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Plan</span>
+        <span class="step-status done">done</span>
+      </div>
+      <div class="artifact-body">
+        <div class="artifact-field">
+          <div class="label">Files to Change</div>
+          <div class="value">
+            <ul>
+              <li class="file">entry_detail_screen.dart</li>
+              <li class="file">entry_detail_sheet.dart</li>
+              <li class="file">entry_list_screen.dart</li>
+              <li class="file">field_schema_editor_sheet.dart</li>
+              <li class="file">entry_detail_inline_test.dart</li>
+            </ul>
+          </div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Callers Traced</div>
+          <div class="value">
+            <ul>
+              <li>_save() &rarr; 3 call sites</li>
+              <li>_onFieldChanged() &rarr; 2 call sites</li>
+            </ul>
+          </div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Edge Cases</div>
+          <div class="value">
+            <ul>
+              <li>Dispose during debounced save</li>
+              <li>Rapid field switching</li>
+              <li>Concurrent edit from another device</li>
+              <li>Empty field value (clear all text)</li>
+            </ul>
+          </div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Risk</div>
+          <div class="value" style="color:var(--yellow)">medium</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Tests Red</span>
+        <span class="step-status done">done</span>
+      </div>
+      <div class="artifact-body">
+        <div class="artifact-field">
+          <div class="label">Outcome</div>
+          <div class="value" style="color:var(--red)">new_test_fails</div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Tests Before / After</div>
+          <div class="value">1147 &rarr; 1149 (+2)</div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Failure Output</div>
+          <div class="value" style="font-size:10px;color:var(--red);background:var(--red-dim);padding:6px 8px;border-radius:4px;margin-top:4px">
+            Expected: no pencil icon in AppBar<br>
+            Actual: found 1 widget of type IconButton<br>
+            with icon: Icons.edit
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Implement</span>
+        <span class="step-status done">done</span>
+      </div>
+      <div class="artifact-body">
+        <div class="artifact-field">
+          <div class="label">Files Changed</div>
+          <div class="value">
+            <ul>
+              <li><span class="file">entry_detail_screen.dart</span><br><span style="color:var(--text-muted);font-size:10px">Removed _editing state, added auto-save on field blur</span></li>
+              <li><span class="file">entry_detail_sheet.dart</span><br><span style="color:var(--text-muted);font-size:10px">Same pattern, shared controller</span></li>
+              <li><span class="file">entry_list_screen.dart</span><br><span style="color:var(--text-muted);font-size:10px">Removed edit button from overflow menu</span></li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="gate-result pass">
+      <span class="icon">&#10003;</span>
+      <span>Gate: implement covers all 5 planned files</span>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Tests Green</span>
+        <span class="step-status active">running</span>
+      </div>
+      <div class="artifact-body">
+        <div class="artifact-field">
+          <div class="label">Unit Tests</div>
+          <div class="value"><span style="color:var(--green)">1149 passed</span> / 0 failed</div>
+        </div>
+        <div class="artifact-field">
+          <div class="label">Analyzer</div>
+          <div class="value" style="animation:pulse 2s infinite">Running...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Review</span>
+        <span class="step-status pending">pending</span>
+      </div>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Root Cause</span>
+        <span class="step-status pending">pending</span>
+      </div>
+    </div>
+
+    <div class="artifact-section">
+      <div class="artifact-section-header">
+        <span>Docs Update</span>
+        <span class="step-status pending">pending</span>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="checklist">
+    <div class="checklist-title">Validation Checklist (review step)</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Parameter completeness</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Client/server consistency</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Test coverage new paths</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> State preservation</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Silent error swallowing</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Race condition patterns</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Code duplication</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Serialization round-trip</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Multiple paths check</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> UX touch targets</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Save-and-reload trip</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Stale data check</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Fix plan diff</div>
+    <div class="check-item"><span class="icon pending">&#9675;</span> Cleanup (TODO/debug)</div>
+  </div>
+</div>
+
+<script>
+// ─── TosheLabs Pipeline — Live UI ───
+
+const state = {
+  tickets: [],
+  activeTicket: null,
+  activeStep: null,
+  sessions: [],
+  thinkLoop: { rounds: [], discards: 0, total: 0 },
+  usage: { percent: 0, used: 0, total: 0 },
+  stats: { completed: 0, total: 0, tests: 0, thinkRounds: 0 },
+  startTime: Date.now(),
+};
+
+// SSE connection
+let eventSource;
+function connectSSE() {
+  eventSource = new EventSource('/events');
+  eventSource.onmessage = (e) => {
+    try {
+      const entry = JSON.parse(e.data);
+      handleEvent(entry.event, entry.data);
+    } catch {}
+  };
+  eventSource.onerror = () => {
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+function handleEvent(event, data) {
+  switch (event) {
+    case 'queue_ready':
+      state.tickets = data.tickets || [];
+      state.stats.total = data.total;
+      renderQueue();
+      break;
+
+    case 'ticket_start':
+      state.activeTicket = data.ticket;
+      state.thinkLoop = { rounds: [], discards: 0, total: 0 };
+      updateActiveTicket(data);
+      break;
+
+    case 'ticket_done':
+      state.stats.completed++;
+      markTicketDone(data.ticket);
+      break;
+
+    case 'step_start':
+      state.activeStep = data.step;
+      updateStepPipeline(data.ticket, data.step, 'active');
+      appendTerminal(`── step: ${data.step} ──`, 'divider');
+      break;
+
+    case 'step_done':
+      updateStepPipeline(data.ticket, data.step, 'done');
+      updateArtifacts(data.step, data.artifacts);
+      break;
+
+    case 'step_gate':
+      const icon = data.pass ? '✓ PASS' : '✗ FAIL';
+      const cls = data.pass ? 'pass' : 'fail';
+      let msg = `<span class="${cls}">${icon}</span>`;
+      if (data.failures?.length) msg += ` — ${data.failures.join(', ')}`;
+      appendTerminal(msg, 'gate');
+      break;
+
+    case 'step_skipped':
+      updateStepPipeline(data.ticket, data.step, data.reason === 'already done' ? 'done' : 'skipped');
+      break;
+
+    case 'think_round_end':
+      const arrow = data.outcome === 'improved' ? '▲ improved' : '▼ discarded';
+      const arrowCls = data.outcome === 'improved' ? 'pass' : 'fail';
+      state.thinkLoop.rounds.push(data);
+      state.thinkLoop.total = data.round || state.thinkLoop.total;
+      state.stats.thinkRounds++;
+      appendTerminal(`Round ${data.round}: <span class="${arrowCls}">${arrow}</span> — ${data.reason || ''}`, 'opus');
+      renderThinkLoop();
+      break;
+
+    case 'think_converged':
+      state.thinkLoop.discards = data.discards;
+      appendTerminal(`Converged after ${data.rounds} rounds (${data.discards} discards, ${data.improvements} improvements)`, 'system');
+      renderThinkLoop();
+      break;
+
+    case 'think_loop_start':
+      appendTerminal(`── think loop: ${data.step} ──`, 'divider');
+      state.thinkLoop = { rounds: [], discards: 0, total: 0 };
+      renderThinkLoop();
+      break;
+
+    case 'claude_event':
+      if (data.event?.type === 'raw' && data.event?.text) {
+        appendTerminal(data.event.text, data.step === 'tests_green' ? 'haiku' : 'opus');
+      }
+      break;
+
+    case 'usage_check':
+      if (data.percent != null) {
+        state.usage = data;
+        updateUsageMeter();
+      }
+      break;
+
+    case 'session_rotate':
+      state.sessions.push({ ticket: data.ticket, percent: state.usage.percent });
+      appendTerminal(`Session rotated at ${data.reason}`, 'system');
+      renderSessionHistory();
+      break;
+
+    case 'lock_acquired':
+      appendTerminal('Code lock acquired', 'system');
+      break;
+
+    case 'lock_released':
+      appendTerminal('Code lock released', 'system');
+      break;
+
+    case 'crash_recovery':
+      appendTerminal(`Resuming ${data.ticket} from step ${data.resumeFrom}`, 'system');
+      break;
+
+    case 'backlog_refreshed':
+      appendTerminal(`Backlog refreshed: ${data.total} total, ${data.actionable} actionable`, 'system');
+      break;
+
+    case 'pipeline_complete':
+      appendTerminal(`Pipeline complete — ${data.ticketsProcessed} tickets processed`, 'system');
+      document.querySelector('.status-pill').className = 'status-pill done';
+      document.querySelector('.status-pill').innerHTML = '<span style="color:var(--green)">✓</span> Done';
+      break;
+  }
+
+  updateElapsed();
+  updateStats();
+}
+
+// ─── Rendering helpers ───
+
+function appendTerminal(html, tag = 'system') {
+  const terminal = document.querySelector('.terminal');
+  if (!terminal) return;
+  const elapsed = formatElapsed(Date.now() - state.startTime);
+  const tagHtml = `<span class="tag ${tag}">${tag.toUpperCase()}</span>`;
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.innerHTML = `<span class="ts">${elapsed}</span>${tagHtml}<span class="msg">${html}</span>`;
+  terminal.appendChild(line);
+  terminal.scrollTop = terminal.scrollHeight;
+}
+
+function renderQueue() {
+  // Dynamic queue rendering would go here
+  // For now the mockup has static content
+}
+
+function updateActiveTicket(data) {
+  const header = document.querySelector('.current-ticket-header');
+  if (header) {
+    const idClass = data.ticket?.startsWith('BUG') ? 'bug' : 'feature';
+    header.innerHTML = `
+      <span class="ticket-id ${idClass}" style="font-size:16px">${data.ticket}</span>
+      <span class="title">${data.title || ''}</span>
+    `;
+  }
+}
+
+function updateStepPipeline(ticketId, stepName, status) {
+  // Update the step chips in the pipeline bar
+  const chips = document.querySelectorAll('.step-chip');
+  for (const chip of chips) {
+    if (chip.textContent.trim().replace(/[✓●]/, '').trim() === stepName) {
+      chip.className = `step-chip ${status === 'done' ? 'done' : status === 'active' ? 'active' : ''}`;
+      if (status === 'done') chip.innerHTML = `<span class="check">✓</span> ${stepName}`;
+      else if (status === 'active') chip.innerHTML = `<div class="chip-dot"></div> ${stepName}`;
+      break;
+    }
+  }
+}
+
+function markTicketDone(ticketId) {
+  const items = document.querySelectorAll('.ticket-item');
+  for (const item of items) {
+    if (item.querySelector('.ticket-id')?.textContent === ticketId) {
+      item.classList.add('done');
+      item.classList.remove('active');
+      item.querySelectorAll('.step-dot').forEach(d => d.classList.add('done'));
+      break;
+    }
+  }
+}
+
+function updateArtifacts(step, artifacts) {
+  // Update the artifacts panel for the given step
+  const sections = document.querySelectorAll('.artifact-section');
+  for (const section of sections) {
+    const header = section.querySelector('.artifact-section-header span:first-child');
+    if (header?.textContent?.trim().toLowerCase() === step.replace('_', ' ')) {
+      const status = section.querySelector('.step-status');
+      if (status) {
+        status.className = 'step-status done';
+        status.textContent = 'done';
+      }
+    }
+  }
+}
+
+function renderThinkLoop() {
+  const rounds = document.querySelectorAll('.round-pip');
+  state.thinkLoop.rounds.forEach((r, i) => {
+    if (rounds[i]) {
+      rounds[i].className = `round-pip ${r.outcome === 'improved' ? 'improved' : 'discarded'}`;
+      rounds[i].innerHTML = r.outcome === 'improved' ? '▲' : '▼';
+    }
+  });
+  const summary = document.querySelector('.think-summary');
+  if (summary) {
+    const improved = state.thinkLoop.rounds.filter(r => r.outcome === 'improved').length;
+    const discarded = state.thinkLoop.rounds.filter(r => r.outcome === 'discarded').length;
+    summary.innerHTML = `<strong>${improved} improved, ${discarded} discarded</strong>`;
+  }
+}
+
+function renderSessionHistory() {
+  // Update session bars in sidebar
+}
+
+function updateUsageMeter() {
+  const fill = document.querySelector('.bar-fill');
+  const label = document.querySelector('.context-meter span:last-of-type');
+  if (fill && state.usage.percent != null) {
+    fill.style.width = `${state.usage.percent}%`;
+    const color = state.usage.percent > 85 ? 'var(--red)' : state.usage.percent > 70 ? 'var(--yellow)' : 'var(--green)';
+    fill.style.background = `linear-gradient(90deg, var(--green), ${color})`;
+  }
+  if (label && state.usage.percent != null) {
+    label.textContent = `${state.usage.percent}% · ${(state.usage.used/1000).toFixed(0)}k / ${(state.usage.total/1000).toFixed(0)}k`;
+  }
+}
+
+function updateStats() {
+  const statValues = document.querySelectorAll('.stat-value');
+  // Update stat values if they exist
+}
+
+function updateElapsed() {
+  const el = document.querySelector('.session-info');
+  if (el) {
+    const elapsed = formatElapsed(Date.now() - state.startTime);
+    el.textContent = `Session ${state.sessions.length + 1} · ${state.activeTicket || '—'} · ${elapsed}`;
+  }
+}
+
+function formatElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  return `${String(h).padStart(2,'0')}:${String(m%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+}
+
+// ─── Refresh button ───
+document.addEventListener('click', (e) => {
+  if (e.target.closest('button')?.textContent?.includes('Refresh')) {
+    fetch('/api/backlog/refresh', { method: 'POST' })
+      .then(r => r.json())
+      .then(data => {
+        appendTerminal(`Backlog refreshed: ${data.total} total, ${data.tickets?.length || 0} actionable`, 'system');
+      });
+  }
+});
+
+// ─── Init ───
+connectSSE();
+</script>
+</body>
+</html>

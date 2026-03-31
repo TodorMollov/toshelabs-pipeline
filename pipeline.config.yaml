@@ -1,0 +1,190 @@
+# TosheLabs Pipeline — Project Configuration
+# Point this at any project with a JSON backlog + validation rules
+
+name: busydad
+project_dir: /home/toshe/busydad
+
+# Backlog source (JSON)
+backlog_file: memory/backlog.json
+archive_file: memory/backlog-archive.json
+closed_bugs_file: memory/closed-bugs.json
+
+# Validation rules (injected into every Claude session)
+validation_rules: memory/code_validation.md
+
+# Pipeline state
+pipeline_dir: memory/pipeline
+build_log_dir: memory/build-log
+code_lock: .claude/code.lock
+
+# Context files (read at session start, injected into plan step)
+context_files:
+  - memory/SPEC.md
+  - memory/ARCHITECTURE.md
+  - memory/DATA_MODEL.md
+  - memory/FLOWS.md
+  - memory/MEMORY.md
+
+# Environment (injected into every CLI call)
+environment:
+  PATH: "/home/toshe/tools/flutter/bin:${PATH}"
+  JAVA_HOME: "/usr/lib/jvm/java-17-openjdk-amd64"
+
+# Ticket filtering
+ticket_filter:
+  include_status: [requested, not_started, in_progress]
+  exclude_status: [done, v2, deferred, manual, moot, decided]
+  priority_order: [P0, P1, P2, P3]
+  type_order: [bug, feature, enhancement, refactor, test, performance, ux]
+
+# Session management (Max plan)
+session:
+  model: opus
+  monitor_model: haiku
+  usage_check_interval_sec: 120
+  context_warning_pct: 75
+  context_new_session_pct: 90
+  max_turns_per_step: 30
+
+# Think loop
+think_loop:
+  max_rounds: 10
+  max_discards: 3
+
+# Steps (ordered, configurable)
+steps:
+  - name: plan
+    prompt_template: prompts/plan.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+      - "Bash(git *)"
+    think_loop: true
+    think_challenge: "Is this the simplest approach? Missing edge cases? Wrong abstraction? All affected code paths covered?"
+    model: opus
+    max_turns: 15
+    validation:
+      - field: files_to_change
+        rule: non_empty_array
+      - field: callers_traced
+        rule: non_empty_array
+      - field: edge_cases
+        rule: non_empty_array
+      - field: test_strategy
+        rule: non_empty_string
+
+  - name: tests_red
+    prompt_template: prompts/tests_red.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+      - Write
+      - Edit
+      - "Bash(flutter *)"
+      - "Bash(npm *)"
+    think_loop: false
+    model: opus
+    max_turns: 20
+    validation:
+      - field: outcome
+        rule: one_of
+        values: [new_test_fails, existing_test_fails, existing_test_covers]
+      - field: failure_output
+        rule: non_empty_string
+        unless:
+          field: outcome
+          equals: existing_test_covers
+
+  - name: implement
+    prompt_template: prompts/implement.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+      - Edit
+      - Write
+    think_loop: true
+    think_challenge: "Can the code be simpler? Missed edge cases? Clear naming? Breaks under concurrency/null/empty? Silent catch blocks?"
+    model: opus
+    max_turns: 30
+    validation:
+      - field: files_changed
+        rule: non_empty_array
+      - field: files_changed
+        rule: covers_plan
+
+  - name: tests_green
+    prompt_template: prompts/tests_green.md
+    tools:
+      - "Bash(flutter *)"
+      - "Bash(npm *)"
+    think_loop: false
+    model: haiku
+    max_turns: 10
+    validation:
+      - field: unit_tests.failed
+        rule: equals
+        value: 0
+      - field: analyzer_errors
+        rule: equals
+        value: 0
+
+  - name: review
+    prompt_template: prompts/review.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+    think_loop: true
+    think_challenge: "Did I miss a checklist item? Are findings real or false positives? Did I trace the full call chain before flagging?"
+    model: opus
+    max_turns: 15
+    validation:
+      - field: checklist_items_checked
+        rule: greater_than
+        value: 0
+      - field: findings_fixed
+        rule: true_if_findings
+
+  - name: root_cause
+    prompt_template: prompts/root_cause.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+    think_loop: true
+    think_challenge: "Is there a deeper cause? Better framing? More precise rule?"
+    model: opus
+    max_turns: 10
+    condition:
+      field: type
+      equals: bug
+    validation:
+      - field: why_happened
+        rule: non_empty_string
+      - field: why_not_caught
+        rule: non_empty_string
+      - field: proposed_rule
+        rule: non_empty_string
+
+  - name: docs_update
+    prompt_template: prompts/docs_update.md
+    tools:
+      - Read
+      - Grep
+      - Glob
+      - Edit
+      - Write
+    think_loop: false
+    model: opus
+    max_turns: 10
+    validation:
+      - field: files_updated
+        rule: non_empty_array
+
+# Web UI
+server:
+  port: 3847
+  host: localhost
