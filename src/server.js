@@ -253,6 +253,70 @@ export async function startServer(config) {
     }
   });
 
+  // API: aggregate per-ticket data for the reports page. Walks the live
+  // `memory/pipeline/*.json` and the archived `memory/pipeline/archive/**/*.json`,
+  // returning a flat list with timing + step status distilled from each state file.
+  app.get('/api/reports/tickets', async (req, res) => {
+    try {
+      const { readdir, readFile: rf, stat } = await import('fs/promises');
+      const liveDir = config._resolved.pipelineDir;
+      const archiveDir = resolve(liveDir, 'archive');
+      const results = [];
+
+      const loadFromDir = async (dir, isArchive) => {
+        let files;
+        try { files = await readdir(dir); } catch { return; }
+        for (const f of files) {
+          const full = resolve(dir, f);
+          if (!f.endsWith('.json')) {
+            // archive directories (YYYY-MM-DD/ etc.)
+            if (isArchive) {
+              try {
+                const st = await stat(full);
+                if (st.isDirectory()) await loadFromDir(full, true);
+              } catch { /* skip */ }
+            }
+            continue;
+          }
+          try {
+            const raw = await rf(full, 'utf-8');
+            const s = JSON.parse(raw);
+            if (!s.ticket) continue;
+            const started = s.started_at ? new Date(s.started_at).getTime() : null;
+            const completed = s.completed_at ? new Date(s.completed_at).getTime() : null;
+            const stepStatuses = {};
+            for (const [name, st] of Object.entries(s.steps || {})) stepStatuses[name] = st.status || 'unknown';
+            results.push({
+              id: s.ticket,
+              title: s.title || '',
+              priority: s.priority || null,
+              type: s.type || null,
+              status: s.status || 'unknown',
+              started_at: s.started_at || null,
+              completed_at: s.completed_at || null,
+              duration_sec: (started && completed) ? Math.round((completed - started) / 1000) : null,
+              steps: stepStatuses,
+              archived: isArchive,
+            });
+          } catch { /* skip malformed */ }
+        }
+      };
+
+      await loadFromDir(liveDir, false);
+      await loadFromDir(archiveDir, true);
+
+      // Sort most-recent first (completed_at || started_at || id)
+      results.sort((a, b) => {
+        const ak = a.completed_at || a.started_at || '';
+        const bk = b.completed_at || b.started_at || '';
+        return bk.localeCompare(ak);
+      });
+      res.json({ count: results.length, tickets: results });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // API: read persisted ops events (NDJSON) for the reports page.
   // Query params: from=YYYY-MM-DD, to=YYYY-MM-DD, events=csv list, limit=N
   app.get('/api/reports/events', async (req, res) => {

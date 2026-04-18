@@ -791,6 +791,7 @@
 <div class="header">
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
   <div class="status-pill idle" id="statusPill">Idle</div>
+  <a href="/reports.html" style="margin-left:14px;color:var(--text-dim);font-size:12px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px">Reports &rarr;</a>
   <div class="spacer"></div>
   <div class="context-meter">
     <span>CTX</span>
@@ -1249,18 +1250,9 @@ function handleEvent(ev, d) {
         }
         for (const block of evt.message.content) {
           if (block.type === 'text' && block.text) appendTerminal(block.text, style);
-          else if (block.type === 'tool_use') {
-            const inp = block.input || {};
-            const detail = block.name === 'Read' ? inp.file_path
-              : block.name === 'Edit' ? inp.file_path
-              : block.name === 'Bash' ? (inp.command || '').slice(0, 150)
-              : block.name === 'Grep' ? `"${inp.pattern}" ${inp.path || ''}`
-              : block.name === 'Glob' ? inp.pattern
-              : block.name === 'Write' ? inp.file_path
-              : block.name === 'Agent' ? inp.description
-              : '';
-            appendTerminal(detail || block.name, block.name);
-          }
+          // Tool calls intentionally not rendered in the browser terminal —
+          // they're still captured by the SSE feed and by the server's NDJSON
+          // ops log. Reports page shows them in per-ticket drill-down.
         }
       } else if (evt?.type === 'result') {
         // Log raw result keys so we can see exact field names

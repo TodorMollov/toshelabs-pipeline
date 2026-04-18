@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pipeline — Reports</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg: #0e1116; --panel: #151a21; --panel-2: #1c222b;
+    --text: #e6edf3; --text-dim: #b0bac5; --text-muted: #7d8590;
+    --border: #30363d;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --blue: #58a6ff; --purple: #bc8cff; --cyan: #76dbe1; --orange: #f0a868;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.5 -apple-system, system-ui, Segoe UI, sans-serif; background: var(--bg); color: var(--text); }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.3px; }
+  header .nav a { margin-left: 18px; color: var(--text-dim); }
+  main { padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }
+  .tile .label { color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .tile .value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+  .tile .sub { color: var(--text-muted); font-size: 11px; margin-top: 2px; }
+
+  section { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 20px; }
+  section h2 { margin: 0; padding: 12px 16px; font-size: 13px; font-weight: 600; border-bottom: 1px solid var(--border); color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  section .body { padding: 12px 16px; }
+
+  /* Ops timeline */
+  .timeline { max-height: 340px; overflow-y: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .timeline .row { display: grid; grid-template-columns: 160px 100px 1fr; gap: 12px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .timeline .ts { color: var(--text-muted); }
+  .timeline .evt { font-weight: 600; }
+  .evt-crashed, .evt-pipeline_crashed_detected { color: var(--red); }
+  .evt-rate_limited { color: var(--yellow); }
+  .evt-pipeline_resumed, .evt-server_started { color: var(--green); }
+  .evt-server_stopping, .evt-pipeline_stopped, .evt-stop_requested { color: var(--orange); }
+  .evt-ticket_done { color: var(--cyan); }
+
+  /* Ticket table */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; padding: 8px 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; font-weight: 600; border-bottom: 1px solid var(--border); background: var(--panel-2); cursor: pointer; user-select: none; }
+  th:hover { color: var(--text); }
+  td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.03); vertical-align: middle; }
+  tr.ticket-row { cursor: pointer; }
+  tr.ticket-row:hover { background: var(--panel-2); }
+  tr.drill { display: none; background: var(--panel-2); }
+  tr.drill.open { display: table-row; }
+  tr.drill td { padding: 14px 16px; }
+  .id { font-family: ui-monospace, Menlo, monospace; color: var(--blue); font-weight: 600; }
+  .pri { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; }
+  .pri-P0 { background: rgba(248,81,73,0.15); color: var(--red); }
+  .pri-P1 { background: rgba(240,168,104,0.15); color: var(--orange); }
+  .pri-P2 { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .pri-P3 { background: rgba(88,166,255,0.12); color: var(--blue); }
+  .status-done { color: var(--green); }
+  .status-blocked, .status-failed { color: var(--red); }
+  .status-in_progress { color: var(--yellow); }
+
+  /* Step mini-pipeline */
+  .steps { display: inline-flex; gap: 3px; }
+  .step-dot { width: 10px; height: 10px; border-radius: 2px; background: var(--panel-2); border: 1px solid var(--border); }
+  .step-dot.done { background: var(--green); border-color: var(--green); }
+  .step-dot.failed { background: var(--red); border-color: var(--red); }
+  .step-dot.blocked { background: var(--orange); border-color: var(--orange); }
+  .step-dot.pending { background: transparent; }
+  .step-dot.skipped { background: var(--text-muted); opacity: 0.4; }
+
+  /* Drill content */
+  .drill-grid { display: grid; grid-template-columns: 140px 80px 90px; gap: 8px 14px; font-size: 12px; }
+  .drill-grid .head { color: var(--text-muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+
+  /* Chart: step status distribution */
+  .bar-row { display: grid; grid-template-columns: 100px 1fr 60px; gap: 10px; align-items: center; margin: 4px 0; font-size: 12px; }
+  .bar-row .label { color: var(--text-dim); }
+  .bar-row .bar { height: 14px; background: var(--panel-2); border-radius: 2px; display: flex; overflow: hidden; }
+  .bar-seg { height: 100%; }
+  .bar-row .count { color: var(--text-muted); text-align: right; font-family: ui-monospace, monospace; }
+
+  .empty { color: var(--text-muted); font-style: italic; padding: 16px; text-align: center; }
+  .filters { display: flex; gap: 8px; padding: 8px 16px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
+  .filters input, .filters select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+  .filters input { flex: 1; max-width: 280px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TosheLabs Pipeline — Reports</h1>
+  <div class="nav">
+    <a href="/">← Console</a>
+    <a href="#" onclick="refreshAll(); return false;">Refresh</a>
+  </div>
+</header>
+<main>
+
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <h2>Operations timeline</h2>
+    <div class="body timeline" id="timeline">
+      <div class="empty">loading…</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Step status distribution</h2>
+    <div class="body" id="stepDist">
+      <div class="empty">loading…</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Tickets</h2>
+    <div class="filters">
+      <input id="filterText" placeholder="filter by id or title…" />
+      <select id="filterStatus">
+        <option value="">all statuses</option>
+        <option value="done">done</option>
+        <option value="in_progress">in_progress</option>
+        <option value="blocked">blocked</option>
+        <option value="failed">failed</option>
+      </select>
+      <select id="filterPri">
+        <option value="">all priorities</option>
+        <option>P0</option><option>P1</option><option>P2</option><option>P3</option>
+      </select>
+    </div>
+    <table id="ticketsTable">
+      <thead><tr>
+        <th data-sort="id">ID</th>
+        <th data-sort="title">Title</th>
+        <th data-sort="priority">Pri</th>
+        <th data-sort="type">Type</th>
+        <th data-sort="status">Status</th>
+        <th data-sort="duration_sec">Duration</th>
+        <th>Steps</th>
+        <th data-sort="completed_at">Finished</th>
+      </tr></thead>
+      <tbody id="ticketsBody"><tr><td colspan="8" class="empty">loading…</td></tr></tbody>
+    </table>
+  </section>
+
+</main>
+
+<script>
+const STEP_ORDER = ['plan', 'tests_red', 'implement', 'tests_green', 'review', 'root_cause', 'docs_update'];
+let state = { tickets: [], events: [], sort: { col: 'completed_at', dir: 'desc' } };
+
+const fmtDuration = (s) => {
+  if (s == null) return '—';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+};
+const fmtDate = (iso) => {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  return d.toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+};
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function refreshAll() {
+  await Promise.all([loadTickets(), loadEvents(), loadUsage()]);
+  renderTiles();
+  renderTimeline();
+  renderStepDist();
+  renderTickets();
+}
+
+async function loadTickets() {
+  try {
+    const r = await fetch('/api/reports/tickets');
+    const d = await r.json();
+    state.tickets = d.tickets || [];
+  } catch { state.tickets = []; }
+}
+
+async function loadEvents() {
+  try {
+    // Last 7 days
+    const today = new Date().toISOString().slice(0, 10);
+    const from = new Date(Date.now() - 7 * 86400e3).toISOString().slice(0, 10);
+    const r = await fetch(`/api/reports/events?from=${from}&to=${today}&limit=2000`);
+    const d = await r.json();
+    state.events = d.entries || [];
+  } catch { state.events = []; }
+}
+
+let currentUsage = null;
+async function loadUsage() {
+  try { currentUsage = (await (await fetch('/api/usage')).json()); } catch { currentUsage = null; }
+}
+
+function renderTiles() {
+  const total = state.tickets.length;
+  const done = state.tickets.filter(t => t.status === 'done').length;
+  const inProg = state.tickets.filter(t => t.status === 'in_progress').length;
+  const blocked = state.tickets.filter(t => t.status === 'blocked' || t.status === 'failed').length;
+  const durs = state.tickets.filter(t => t.duration_sec != null).map(t => t.duration_sec);
+  const totalDur = durs.reduce((a, b) => a + b, 0);
+  const avgDur = durs.length ? Math.round(totalDur / durs.length) : null;
+  const crashes = state.events.filter(e => e.event === 'pipeline_crashed_detected').length;
+  const rateLimits = state.events.filter(e => e.event === 'rate_limited').length;
+  const fh = currentUsage?.five_hour?.pct;
+
+  const tiles = [
+    { label: 'Tickets processed', value: total, sub: `${done} done · ${inProg} in progress · ${blocked} blocked/failed` },
+    { label: 'Success rate', value: total ? Math.round(100 * done / total) + '%' : '—', sub: `${done}/${total}` },
+    { label: 'Total runtime', value: fmtDuration(totalDur), sub: avgDur != null ? `avg ${fmtDuration(avgDur)}/ticket` : '' },
+    { label: 'Crashes (7d)', value: crashes, sub: crashes ? 'from ops log' : 'none recorded' },
+    { label: 'Rate-limit hits (7d)', value: rateLimits, sub: rateLimits ? 'from ops log' : 'none recorded' },
+    { label: '5h window now', value: fh != null ? Math.round(fh) + '%' : '—', sub: currentUsage?.five_hour?.resets_at ? 'resets ' + new Date(currentUsage.five_hour.resets_at * 1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '' },
+  ];
+  document.getElementById('tiles').innerHTML = tiles.map(t =>
+    `<div class="tile"><div class="label">${t.label}</div><div class="value">${t.value}</div><div class="sub">${t.sub || ''}</div></div>`
+  ).join('');
+}
+
+function renderTimeline() {
+  // Filter to operationally-interesting events
+  const interesting = new Set([
+    'server_started', 'server_stopping', 'pipeline_crashed_detected', 'pipeline_resumed',
+    'rate_limited', 'rate_limit_resume', 'ticket_start', 'ticket_done',
+    'ticket_failed', 'ticket_blocked_skip_archive', 'pipeline_error',
+    'pipeline_blocked', 'pipeline_complete', 'stop_requested',
+  ]);
+  const rows = state.events.filter(e => interesting.has(e.event)).slice(-100).reverse();
+  if (!rows.length) {
+    document.getElementById('timeline').innerHTML = '<div class="empty">No operational events yet. Restart the pipeline to start capturing.</div>';
+    return;
+  }
+  document.getElementById('timeline').innerHTML = rows.map(e => {
+    const ts = new Date(e.ts).toLocaleString([], { month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+    const d = e.data || {};
+    let summary = '';
+    if (e.event === 'pipeline_crashed_detected') summary = `${d.ticket} stranded at ${d.last_step} (${d.last_step_status}) for ${fmtDuration(d.stranded_duration_sec)}`;
+    else if (e.event === 'rate_limited') summary = `${d.ticket || ''}/${d.step || ''} waiting ${d.waitMinutes}m until ${d.resumeAt || '?'}`;
+    else if (e.event === 'pipeline_resumed') summary = `picked up ${d.count} crashed ticket(s): ${(d.tickets || []).join(', ')}`;
+    else if (e.event === 'ticket_start') summary = `${d.ticket} — ${d.title || ''}`;
+    else if (e.event === 'ticket_done') summary = `${d.ticket}`;
+    else if (e.event === 'ticket_failed') summary = `${d.ticket} — ${d.error || ''}`;
+    else if (e.event === 'pipeline_error') summary = d.error || '';
+    else if (e.event === 'server_started') summary = `pid ${d.pid} · ${d.node || ''}`;
+    else if (e.event === 'server_stopping') summary = d.signal || '';
+    else summary = Object.keys(d).slice(0, 3).map(k => `${k}=${JSON.stringify(d[k]).slice(0, 50)}`).join(' ');
+    return `<div class="row"><span class="ts">${ts}</span><span class="evt evt-${e.event}">${e.event}</span><span>${esc(summary)}</span></div>`;
+  }).join('');
+}
+
+function renderStepDist() {
+  // Per-step status histogram
+  const counts = {};
+  for (const step of STEP_ORDER) counts[step] = { done: 0, failed: 0, blocked: 0, pending: 0, skipped: 0, not_applicable: 0 };
+  for (const t of state.tickets) {
+    for (const [step, st] of Object.entries(t.steps || {})) {
+      if (!counts[step]) counts[step] = { done: 0, failed: 0, blocked: 0, pending: 0, skipped: 0, not_applicable: 0 };
+      counts[step][st] = (counts[step][st] || 0) + 1;
+    }
+  }
+  const colors = { done: 'var(--green)', failed: 'var(--red)', blocked: 'var(--orange)', pending: 'var(--text-muted)', skipped: 'var(--purple)', not_applicable: 'var(--panel-2)' };
+  const rows = STEP_ORDER.filter(s => counts[s]).map(step => {
+    const c = counts[step];
+    const total = Object.values(c).reduce((a, b) => a + b, 0);
+    if (!total) return '';
+    const segs = Object.entries(c).filter(([, v]) => v > 0).map(([k, v]) =>
+      `<div class="bar-seg" style="width:${(100*v/total).toFixed(1)}%; background:${colors[k] || 'var(--panel-2)'}" title="${k}: ${v}"></div>`
+    ).join('');
+    return `<div class="bar-row"><div class="label">${step}</div><div class="bar">${segs}</div><div class="count">${c.done || 0}/${total}</div></div>`;
+  }).join('');
+  const legend = `<div style="margin-top:10px; font-size:11px; color:var(--text-muted);">
+    <span style="color:var(--green)">■</span> done · <span style="color:var(--red)">■</span> failed · <span style="color:var(--orange)">■</span> blocked · <span style="color:var(--text-muted)">■</span> pending · <span style="color:var(--purple)">■</span> skipped
+  </div>`;
+  document.getElementById('stepDist').innerHTML = rows ? rows + legend : '<div class="empty">no step data</div>';
+}
+
+function renderTickets() {
+  const ft = document.getElementById('filterText').value.toLowerCase();
+  const fs = document.getElementById('filterStatus').value;
+  const fp = document.getElementById('filterPri').value;
+  let rows = state.tickets.filter(t => {
+    if (ft && !(t.id.toLowerCase().includes(ft) || (t.title || '').toLowerCase().includes(ft))) return false;
+    if (fs && t.status !== fs) return false;
+    if (fp && t.priority !== fp) return false;
+    return true;
+  });
+  // Sort
+  const { col, dir } = state.sort;
+  rows = rows.slice().sort((a, b) => {
+    const av = a[col]; const bv = b[col];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    const cmp = typeof av === 'number' ? (av - bv) : String(av).localeCompare(String(bv));
+    return dir === 'asc' ? cmp : -cmp;
+  });
+
+  if (!rows.length) {
+    document.getElementById('ticketsBody').innerHTML = '<tr><td colspan="8" class="empty">no tickets match</td></tr>';
+    return;
+  }
+  document.getElementById('ticketsBody').innerHTML = rows.map(t => {
+    const steps = STEP_ORDER.map(s => {
+      const status = t.steps[s];
+      if (!status) return `<div class="step-dot" title="${s}: not run"></div>`;
+      return `<div class="step-dot ${status}" title="${s}: ${status}"></div>`;
+    }).join('');
+    const pri = t.priority ? `<span class="pri pri-${t.priority}">${t.priority}</span>` : '';
+    return `<tr class="ticket-row" data-id="${esc(t.id)}">
+      <td class="id">${esc(t.id)}</td>
+      <td>${esc(t.title).slice(0,80)}</td>
+      <td>${pri}</td>
+      <td>${esc(t.type || '')}</td>
+      <td class="status-${t.status}">${esc(t.status)}</td>
+      <td>${fmtDuration(t.duration_sec)}</td>
+      <td><div class="steps">${steps}</div></td>
+      <td>${fmtDate(t.completed_at || t.started_at)}</td>
+    </tr>
+    <tr class="drill" data-drill="${esc(t.id)}"><td colspan="8">
+      <div class="drill-grid">
+        <div class="head">Step</div><div class="head">Status</div><div class="head">Notes</div>
+        ${STEP_ORDER.map(s => {
+          const st = t.steps[s] || 'not run';
+          return `<div>${s}</div><div class="status-${st}">${st}</div><div style="color:var(--text-muted)">${s === 'root_cause' && t.type !== 'bug' ? '(bugs only)' : ''}</div>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:10px"><a href="/api/pipeline/${encodeURIComponent(t.id)}" target="_blank">raw state JSON →</a></div>
+    </td></tr>`;
+  }).join('');
+
+  // Wire drill-down toggle
+  document.querySelectorAll('tr.ticket-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.dataset.id;
+      const drill = document.querySelector(`tr[data-drill="${id}"]`);
+      if (drill) drill.classList.toggle('open');
+    });
+  });
+}
+
+// Sort header clicks
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const col = th.dataset.sort;
+    if (state.sort.col === col) state.sort.dir = state.sort.dir === 'asc' ? 'desc' : 'asc';
+    else { state.sort.col = col; state.sort.dir = 'desc'; }
+    renderTickets();
+  });
+});
+
+// Filter listeners
+['filterText', 'filterStatus', 'filterPri'].forEach(id =>
+  document.getElementById(id).addEventListener('input', renderTickets));
+
+// Live refresh via SSE — refresh when ticket events fire
+const es = new EventSource('/events');
+es.onmessage = (e) => {
+  try {
+    const entry = JSON.parse(e.data);
+    if (['ticket_done', 'ticket_failed', 'step_done', 'pipeline_complete', 'pipeline_crashed_detected', 'rate_limited'].includes(entry.event)) {
+      // Coalesce refreshes
+      clearTimeout(window._refreshTimer);
+      window._refreshTimer = setTimeout(refreshAll, 1200);
+    }
+  } catch {}
+};
+
+refreshAll();
+// Poll current 5h every 30s
+setInterval(() => loadUsage().then(renderTiles), 30000);
+</script>
+</body>
+</html>
