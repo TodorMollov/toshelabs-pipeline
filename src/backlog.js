@@ -18,7 +18,7 @@ export function filterAndSort(tickets, config, ticketId = null) {
     return match ? [match] : [];
   }
 
-  const { include_status, exclude_status, priority_order, type_order } =
+  const { include_status = [], exclude_status = [], priority_order, type_order } =
     config.ticket_filter;
 
   const actionable = tickets.filter((t) => {
@@ -28,8 +28,13 @@ export function filterAndSort(tickets, config, ticketId = null) {
     return true;
   });
 
-  // Sort: P0 bugs first, then P1 bugs, then P1 features, etc.
+  // Tickets with explicit `order` come first (ascending), then auto-sort by priority/type
   actionable.sort((a, b) => {
+    const oa = a.order != null ? a.order : Infinity;
+    const ob = b.order != null ? b.order : Infinity;
+    if (oa !== ob) return oa - ob;
+
+    // Both have no explicit order — fall back to priority + type sort
     const pa = priority_order.indexOf(a.priority || 'P3');
     const pb = priority_order.indexOf(b.priority || 'P3');
     if (pa !== pb) return pa - pb;
@@ -73,6 +78,43 @@ export async function archiveTicket(ticketId, config) {
     config._resolved.archive,
     JSON.stringify(archive, null, 2)
   );
+}
+
+/**
+ * Move a ticket up or down in execution order.
+ * Assigns explicit `order` values to all actionable tickets, then swaps the target.
+ */
+export async function reorderTicket(ticketId, direction, config) {
+  const raw = await readFile(config._resolved.backlog, 'utf-8');
+  const data = JSON.parse(raw);
+  const tickets = data.tickets || [];
+
+  // Get sorted actionable list to determine current positions
+  const actionable = filterAndSort(tickets, config);
+  const idx = actionable.findIndex((t) => t.id === ticketId);
+  if (idx === -1) return null;
+
+  const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= actionable.length) return null;
+
+  // Assign order values to all actionable tickets based on current sort
+  actionable.forEach((t, i) => {
+    const src = tickets.find((s) => s.id === t.id);
+    if (src) src.order = i;
+  });
+
+  // Swap the two
+  const srcTicket = tickets.find((t) => t.id === actionable[idx].id);
+  const swpTicket = tickets.find((t) => t.id === actionable[swapIdx].id);
+  const tmp = srcTicket.order;
+  srcTicket.order = swpTicket.order;
+  swpTicket.order = tmp;
+
+  data.updated_at = new Date().toISOString().split('T')[0];
+  await writeFile(config._resolved.backlog, JSON.stringify(data, null, 2));
+
+  // Return new sorted list
+  return filterAndSort(tickets, config);
 }
 
 /**

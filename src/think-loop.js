@@ -15,7 +15,6 @@ export async function thinkLoop({
   stepName,
   challengeQuestion,
   config,
-  sessionId,
   ticket,
   emitter,
 }) {
@@ -38,31 +37,36 @@ export async function thinkLoop({
     });
 
     // CHALLENGE: ask Claude to critique the current best
-    const challengePrompt = `You are reviewing the output of the "${stepName}" step for ticket ${ticket.id}: "${ticket.title}".
+    const challengePrompt = `Challenge the "${stepName}" output for ticket ${ticket.id}: "${ticket.title}".
 
-Here is the current best result:
----
-${typeof bestResult === 'string' ? bestResult : JSON.stringify(bestResult, null, 2)}
----
+${challengeQuestion}
 
-Challenge this result. ${challengeQuestion}
+Read the actual files in the working directory to verify the implementation. Do NOT rewrite code — only report issues.
 
-Try to find something deeper, simpler, or more complete. If you find an improvement, output the COMPLETE improved version. If you cannot improve it, say "NO_IMPROVEMENT" and explain why.
+If you find problems, output ONLY a JSON array of findings:
+[{"file": "path", "line": N, "issue": "one sentence", "fix": "one sentence"}]
 
-Important: Do not add unnecessary complexity. Do not suggest abstractions that would only have one caller. Simple and correct beats clever.`;
+If no problems found, output exactly: NO_IMPROVEMENT
+
+No prose. No explanations. No complete rewrites. Just the findings array or NO_IMPROVEMENT.`;
 
     let challengeResult;
     try {
+      let chIn = 0, chOut = 0, chTools = 0;
+      const chStart = Date.now();
       const response = await spawnClaude({
         prompt: challengePrompt,
         model: config.session.model,
         tools: ['Read', 'Grep', 'Glob'],
         maxTurns: 10,
-        systemPromptFile: config._resolved.validationRules,
         workingDir: config.project_dir,
-        sessionId,
+        sessionId: null,
         bare: true,
         onData: (event) => {
+          const usage = event.message?.usage || event.usage;
+          if (usage?.input_tokens) chIn = usage.input_tokens;
+          if (usage?.output_tokens) chOut += usage.output_tokens;
+          if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') chTools++;
           emitter?.emit('claude_event', {
             ticket: ticket.id,
             step: stepName,
@@ -73,10 +77,11 @@ Important: Do not add unnecessary complexity. Do not suggest abstractions that w
         },
       });
       challengeResult = response.result;
-      // Update sessionId if returned
-      if (response.sessionId) sessionId = response.sessionId;
+      const chSecs = Math.round((Date.now() - chStart) / 1000);
+      console.log(`[usage] ${ticket.id}/${stepName} (think-challenge-${rounds}) | ${config.session.model} | ${chSecs}s | ${chIn.toLocaleString()} in / ${chOut.toLocaleString()} out | ${chTools} tools`);
+      emitter?.emit('step_attempt_done', { ticket: ticket.id, step: `${stepName}_think_challenge`, round: rounds, model: config.session.model, inputTokens: chIn, outputTokens: chOut, toolCalls: chTools });
     } catch (err) {
-      // If challenge call fails, stop the loop — don't crash the pipeline
+      if (err.rateLimited) throw err; // let pipeline handle rate limits
       emitter?.emit('think_error', {
         ticket: ticket.id,
         step: stepName,
@@ -127,14 +132,19 @@ Do not hedge. Pick one.`;
 
     let compareResponse;
     try {
+      let cmpIn = 0, cmpOut = 0;
+      const cmpStart = Date.now();
       compareResponse = await spawnClaude({
         prompt: comparePrompt,
-        model: config.session.model,
+        model: 'haiku',
         tools: [],
         maxTurns: 1,
         bare: true,
         workingDir: config.project_dir,
         onData: (event) => {
+          const usage = event.message?.usage || event.usage;
+          if (usage?.input_tokens) cmpIn = usage.input_tokens;
+          if (usage?.output_tokens) cmpOut += usage.output_tokens;
           emitter?.emit('claude_event', {
             ticket: ticket.id,
             step: stepName,
@@ -144,7 +154,11 @@ Do not hedge. Pick one.`;
           });
         },
       });
+      const cmpSecs = Math.round((Date.now() - cmpStart) / 1000);
+      console.log(`[usage] ${ticket.id}/${stepName} (think-compare-${rounds}) | haiku | ${cmpSecs}s | ${cmpIn.toLocaleString()} in / ${cmpOut.toLocaleString()} out`);
+      emitter?.emit('step_attempt_done', { ticket: ticket.id, step: `${stepName}_think_compare`, round: rounds, model: 'haiku', inputTokens: cmpIn, outputTokens: cmpOut });
     } catch (err) {
+      if (err.rateLimited) throw err; // let pipeline handle rate limits
       emitter?.emit('think_error', {
         ticket: ticket.id,
         step: stepName,
@@ -192,5 +206,5 @@ Do not hedge. Pick one.`;
     history,
   });
 
-  return { result: bestResult, rounds, discards, history, sessionId };
+  return { result: bestResult, rounds, discards, history };
 }

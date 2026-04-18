@@ -1,0 +1,114 @@
+# TosheLabs Pipeline
+
+An external orchestrator for [Claude Code](https://claude.com/claude-code) that runs a **TDD-shaped, multi-step pipeline against a backlog of tickets** — autonomously, with crash recovery, rate-limit awareness, and a live web UI.
+
+> Status: experimental. Built for the author's personal project under a Claude Max plan.
+
+## What it does
+
+Given a JSON backlog file, the pipeline processes tickets one at a time through an opinionated sequence of steps. For each ticket it spawns one or more Claude CLI sessions, validates the output against a per-step schema, and writes per-ticket state to disk.
+
+### The per-ticket flow
+
+```
+plan → tests_red → implement → tests_green → review → [root_cause] → docs_update
+```
+
+- **plan** — Opus reads the ticket + project context, produces a structured plan (files to change, edge cases, test strategy). Gated by a "think-loop" that challenges the plan and rewrites if weak.
+- **tests_red** — Sonnet writes new failing tests and records baseline failures.
+- **implement** — Sonnet writes the minimal change needed to make the new tests pass. Reuses the tests_red session for cheap context.
+- **tests_green** — Haiku runs the tests and confirms no regressions.
+- **review** — Opus re-reads the diff against a checklist, fixes findings inline. Think-loop applies here too.
+- **root_cause** — (bugs only) explains the defect mechanism for the build log.
+- **docs_update** — Sonnet rolls docs / backlog / build log forward.
+
+Each step is configured in `pipeline.config.yaml` — model, allowed tools, max turns, validation rules, whether the session is reused, whether a think-loop runs.
+
+## What's distinctive
+
+- **TDD-enforced per ticket** — tests written before code, validated by gates that check outcome + criteria-to-test mapping.
+- **Session reuse between adjacent steps** — tests_red → implement, tests_green → review, root_cause → docs_update. Reduces redundant context re-reads.
+- **Think-loop** — expensive steps (plan, implement, review) re-challenge their own output for up to N rounds before committing.
+- **Self-heal** — when a gate fails, the pipeline re-invokes the same step with the failure reason injected, up to 3 times.
+- **5-hour window awareness** — parses rate-limit events from the Claude CLI stream, pauses until the next window, resumes automatically.
+- **Crash recovery** — each step writes state to a per-ticket JSON; on restart, in-progress tickets resume from the failed step.
+- **Code lock** — a file-based lock prevents two pipeline runs (or the user) from editing the target repo concurrently.
+- **Live monitoring UI** — Express + SSE web console at `http://localhost:3847` with per-step metrics, 5h window, context usage.
+
+## Requirements
+
+- Node 20+
+- Claude Code CLI installed and authenticated
+- A target project with:
+  - a backlog JSON (shape documented below)
+  - a set of prompt templates (referenced from your config)
+  - a test/analyzer wrapper script (e.g. `run-tests.sh`)
+
+## Setup
+
+```bash
+git clone https://github.com/TodorMollov/toshelabs-pipeline.git
+cd toshelabs-pipeline
+npm install
+cp pipeline.config.example.yaml pipeline.config.yaml
+# Edit pipeline.config.yaml — set name, project_dir, context_files, etc.
+./start.sh
+```
+
+Then open http://localhost:3847
+
+Your local `pipeline.config.yaml` is gitignored — it's where you encode the paths specific to your machine and project.
+
+## Config shape
+
+See `pipeline.config.example.yaml`. Key sections:
+
+- `project_dir` — absolute path to the target repo.
+- `backlog_file` — JSON with a `tickets: [...]` array.
+- `context_files` — markdown files injected into the plan step so Claude has project context.
+- `validation_rules` — a markdown file injected as a system-prompt append when `inject_validation_rules: true` on a step.
+- `session.model` — default model; each step can override.
+- `steps[]` — ordered list of steps. Each step has `name`, `prompt_template`, `tools`, `model`, `max_turns`, and a `validation` block.
+
+## Backlog shape
+
+`backlog.json`:
+
+```json
+{
+  "tickets": [
+    {
+      "id": "T-100",
+      "title": "Short description",
+      "type": "feature | bug | enhancement | refactor | test | performance | ux",
+      "priority": "P0 | P1 | P2 | P3",
+      "status": "requested | in_progress | done | blocked | ...",
+      "criteria": ["one bullet per deliverable"]
+    }
+  ]
+}
+```
+
+Tickets move through statuses as the pipeline runs. `done` / `v2` / `deferred` / `manual` / `moot` / `decided` / `subsumed` are excluded from scheduling by default (configurable).
+
+## Endpoints
+
+- `GET  /` — web UI
+- `GET  /events` — Server-Sent Events stream (terminal feed)
+- `GET  /api/backlog` — current backlog (actionable + all)
+- `GET  /api/pipeline/:ticketId` — per-ticket state
+- `GET  /api/usage` — current 5h / 7d usage
+- `POST /api/run/ticket/:id` — run one ticket
+- `POST /api/run/all` — run the whole actionable queue
+- `POST /api/stop` — stop after current step (releases code lock)
+
+## Known limits
+
+- Single-project per config — the pipeline runs against one `project_dir`.
+- Single-builder invariant — assumes **nothing** modifies the target repo while the pipeline is running. Humans editing concurrently = broken test baselines and merge headaches.
+- No dependency graph — tickets are processed in priority order, with no awareness of cross-ticket file overlap.
+- WSL / Linux tested; macOS should work; Windows untested.
+
+## License
+
+MIT

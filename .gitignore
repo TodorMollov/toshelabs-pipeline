@@ -1,1 +1,11 @@
 node_modules/
+
+# Runtime artifacts
+.server.pid
+pipeline.log
+pipeline.log.*
+ops/
+
+# Local / per-user state — do NOT commit
+.claude/
+pipeline.config.yaml

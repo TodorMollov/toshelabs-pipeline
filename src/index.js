@@ -13,6 +13,7 @@ program
   .option('--ticket <id>', 'Only work on a specific ticket')
   .option('--pause', 'Pause between tickets for manual review')
   .option('--no-ui', 'Run without web UI')
+  .option('--server', 'Start web UI only — no pipeline run')
   .option('-p, --port <number>', 'Web UI port override')
   .parse();
 
@@ -24,9 +25,19 @@ async function main() {
 
   // Start web UI
   let emitter;
-  if (opts.ui !== false) {
-    emitter = await startServer(config);
-    console.log(`Pipeline UI: http://${config.server.host}:${config.server.port}`);
+  if (opts.ui !== false || opts.server) {
+    const result = await startServer(config);
+    emitter = result.emitter;
+    if (result.server) {
+      console.log(`Pipeline UI: http://${config.server.host}:${config.server.port}`);
+    }
+  }
+
+  // Server-only mode — just serve the UI, no pipeline
+  if (opts.server) {
+    console.log('Server mode — waiting for connections. Ctrl+C to stop.');
+    await new Promise(() => {}); // hang forever
+    return;
   }
 
   // Create and run pipeline

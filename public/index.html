@@ -11,8 +11,8 @@
     --surface2: #1c2129;
     --border: #30363d;
     --text: #e6edf3;
-    --text-dim: #8b949e;
-    --text-muted: #484f58;
+    --text-dim: #b1bac4;
+    --text-muted: #8b949e;
     --green: #3fb950;
     --green-dim: #1a4731;
     --red: #f85149;
@@ -35,12 +35,39 @@
     height: 100vh;
     display: grid;
     grid-template-rows: 48px 1fr;
-    grid-template-columns: 280px 1fr 320px;
+    grid-template-columns: var(--sidebar-w, 280px) 4px 1fr 4px var(--artifacts-w, 320px);
     grid-template-areas:
-      "header header header"
-      "sidebar main artifacts";
+      "header header header header header"
+      "sidebar handle-l main handle-r artifacts";
     overflow: hidden;
   }
+
+  /* ─── RESIZE HANDLES ─── */
+  .resize-handle {
+    background: transparent;
+    cursor: col-resize;
+    position: relative;
+    z-index: 10;
+  }
+
+  .resize-handle::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 1px;
+    width: 2px;
+    background: var(--border);
+    transition: background 0.15s;
+  }
+
+  .resize-handle:hover::after,
+  .resize-handle.dragging::after {
+    background: var(--cyan);
+  }
+
+  .resize-handle-l { grid-area: handle-l; }
+  .resize-handle-r { grid-area: handle-r; }
 
   /* ─── HEADER ─── */
   .header {
@@ -78,6 +105,59 @@
     background: var(--green-dim);
     color: var(--green);
   }
+
+  .status-pill.idle {
+    background: var(--surface2);
+    color: var(--text-muted);
+  }
+
+  .status-pill.done {
+    background: var(--green-dim);
+    color: var(--green);
+  }
+
+  .status-pill.error {
+    background: var(--red-dim);
+    color: var(--red);
+  }
+
+  .ticket-item .run-btn {
+    display: none;
+    background: var(--green-dim);
+    border: 1px solid var(--green);
+    color: var(--green);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .ticket-item:hover .run-btn { display: inline-block; }
+
+  .reorder-btns {
+    display: none;
+    margin-left: auto;
+    gap: 2px;
+  }
+  .ticket-item:hover .reorder-btns { display: flex; }
+  .reorder-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 11px;
+    width: 20px;
+    height: 18px;
+    border-radius: 3px;
+    cursor: pointer;
+    font-family: inherit;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
+  }
+  .reorder-btn:hover { background: var(--blue-dim); color: var(--blue); border-color: var(--blue); }
 
   .status-pill .dot {
     width: 6px; height: 6px;
@@ -117,16 +197,59 @@
     transition: width 0.5s;
   }
 
-  .header .session-info {
-    font-size: 11px;
+  .usage-widget {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 240px;
+  }
+
+  .usage-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+  }
+
+  .usage-title {
     color: var(--text-muted);
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .usage-bar {
+    width: 60px;
+    height: 6px;
+    background: #4a5260;
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .usage-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--green);
+    border-radius: 3px;
+    transition: width 0.8s ease, background 0.5s;
+  }
+
+  .usage-pct {
+    color: var(--text-dim);
+    font-weight: 700;
+    font-size: 10px;
+    min-width: 28px;
+  }
+
+  .usage-reset {
+    font-size: 9px;
+    color: var(--text-muted);
+    white-space: nowrap;
   }
 
   /* ─── SIDEBAR ─── */
   .sidebar {
     grid-area: sidebar;
     background: var(--surface);
-    border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -285,9 +408,14 @@
     font-size: 11px;
     font-weight: 600;
     background: var(--surface2);
-    color: var(--text-muted);
+    color: var(--text-dim);
     border: 1px solid var(--border);
     position: relative;
+  }
+  .step-chip:hover {
+    background: var(--blue-dim);
+    color: var(--blue);
+    border-color: var(--blue);
   }
 
   .step-chip.done {
@@ -323,15 +451,42 @@
     font-size: 12px;
     line-height: 1.7;
     background: var(--bg);
+    position: relative;
   }
 
+  .scroll-badge {
+    display: none;
+    position: sticky;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--blue);
+    color: var(--bg);
+    padding: 4px 14px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    z-index: 20;
+    text-align: center;
+    width: fit-content;
+    margin: 0 auto;
+  }
+  .scroll-badge.visible { display: block; }
+
   .terminal .line { display: flex; gap: 8px; }
-  .terminal .ts { color: var(--text-muted); white-space: nowrap; min-width: 60px; }
-  .terminal .tag { min-width: 65px; font-weight: 600; white-space: nowrap; }
+  .terminal .ts { color: var(--text-muted); white-space: nowrap; min-width: 72px; }
+  .terminal .tag { min-width: 62px; font-weight: 600; white-space: nowrap; }
+  .terminal .dur { color: var(--text-muted); white-space: nowrap; min-width: 60px; text-align: right; }
+  .terminal .pct { color: var(--text-muted); white-space: nowrap; min-width: 44px; text-align: right; }
   .terminal .tag.opus { color: var(--purple); }
+  .terminal .tag.sonnet { color: var(--green); }
   .terminal .tag.haiku { color: var(--cyan); }
   .terminal .tag.gate { color: var(--yellow); }
   .terminal .tag.system { color: var(--orange); }
+  .terminal .tag.bash, .terminal .tag.read, .terminal .tag.edit,
+  .terminal .tag.write, .terminal .tag.glob, .terminal .tag.grep,
+  .terminal .tag.agent { color: var(--blue); }
   .terminal .msg { color: var(--text-dim); }
   .terminal .msg em { color: var(--text); font-style: normal; font-weight: 500; }
   .terminal .msg .file { color: var(--blue); }
@@ -354,9 +509,13 @@
     padding: 10px 20px;
     background: var(--surface);
     border-top: 1px solid var(--border);
-    display: flex;
+    display: none;
     align-items: center;
     gap: 16px;
+  }
+
+  .think-loop-bar.visible {
+    display: flex;
   }
 
   .think-loop-label {
@@ -430,7 +589,6 @@
   .artifacts {
     grid-area: artifacts;
     background: var(--surface);
-    border-left: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -467,7 +625,6 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    cursor: pointer;
   }
 
   .artifact-section-header .step-status {
@@ -579,6 +736,48 @@
   .check-item .icon.pass { color: var(--green); }
   .check-item .icon.pending { color: var(--text-muted); }
 
+  /* ─── FOLDABLE TICKET GROUPS ─── */
+  .ticket-group {
+    border-top: 1px solid var(--border);
+  }
+
+  .ticket-group summary {
+    padding: 8px 16px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+  }
+
+  .ticket-group summary::-webkit-details-marker { display: none; }
+
+  .ticket-group summary::before {
+    content: '▸';
+    font-size: 10px;
+    transition: transform 0.15s;
+  }
+
+  .ticket-group[open] summary::before {
+    transform: rotate(90deg);
+  }
+
+  .ticket-group summary .group-count {
+    font-weight: 400;
+    color: var(--text-muted);
+    opacity: 0.6;
+  }
+
+  .ticket-group .ticket-item {
+    opacity: 0.4;
+  }
+
   /* scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -591,835 +790,368 @@
 <!-- HEADER -->
 <div class="header">
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
-  <div class="status-pill running"><div class="dot"></div> Running</div>
-  <div style="font-size:11px;color:var(--text-dim)">busydad</div>
+  <div class="status-pill idle" id="statusPill">Idle</div>
   <div class="spacer"></div>
   <div class="context-meter">
     <span>CTX</span>
-    <div class="bar"><div class="bar-fill"></div></div>
-    <span>42% &middot; 420k / 1M</span>
-    <span style="color:var(--text-muted);font-size:10px">(next check: 38s)</span>
+    <div class="bar"><div class="bar-fill" id="ctxFill"></div></div>
+    <span id="ctxLabel">— / —</span>
   </div>
   <div style="width:1px;height:20px;background:var(--border)"></div>
-  <div class="session-info">Session 3 &middot; T-275 &middot; 01:47:32</div>
-  <div style="width:1px;height:20px;background:var(--border)"></div>
-  <div style="display:flex;gap:4px;align-items:center;font-size:10px;color:var(--text-muted)">
-    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--green) 78%,var(--surface2) 78%);display:inline-block" title="S1: BUG-143 78%"></span>
-    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--yellow) 85%,var(--surface2) 85%);display:inline-block" title="S2: BUG-145 85%"></span>
-    <span style="width:20px;height:10px;border-radius:2px;background:linear-gradient(90deg,var(--green) 42%,var(--surface2) 42%);display:inline-block;border:1px solid var(--cyan)" title="S3: T-275 42% (active)"></span>
+  <div class="usage-widget" id="usageWidget">
+    <div class="usage-item">
+      <span class="usage-title">5h</span>
+      <div class="usage-bar"><div class="usage-bar-fill" id="usageFill"></div></div>
+      <span class="usage-pct" id="usagePct">—</span>
+      <span class="usage-reset" id="usageReset"></span>
+    </div>
+    <div class="usage-item">
+      <span class="usage-title">7d</span>
+      <div class="usage-bar"><div class="usage-bar-fill" id="usageFillWeek"></div></div>
+      <span class="usage-pct" id="usagePctWeek">—</span>
+    </div>
   </div>
 </div>
 
 <!-- SIDEBAR -->
 <div class="sidebar">
   <div class="sidebar-header">
-    <span>Ticket Queue</span>
-    <span style="display:flex;align-items:center;gap:8px">
-      <span class="count">8 items</span>
-      <button style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Re-parse BACKLOG.md for new tickets">&#8635; Refresh</button>
+    <span>Backlog</span>
+    <span style="display:flex;align-items:center;gap:6px">
+      <span class="count" id="ticketCount">—</span>
+      <button onclick="refreshBacklog()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-dim);font-size:11px;padding:2px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Re-parse backlog.json">&#8635;</button>
     </span>
   </div>
-  <div class="ticket-list">
 
-    <div class="ticket-item done">
-      <div class="ticket-top">
-        <span class="ticket-id bug">BUG-143</span>
-        <span class="ticket-priority p0">P0</span>
-      </div>
-      <div class="ticket-title">Reminder nag fires after completion</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item done">
-      <div class="ticket-top">
-        <span class="ticket-id bug">BUG-145</span>
-        <span class="ticket-priority p1">P1</span>
-      </div>
-      <div class="ticket-title">Overdue entries missing from Today view</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item active">
-      <div class="ticket-top">
-        <span class="ticket-id feature">T-275</span>
-        <span class="ticket-priority p1">P1</span>
-      </div>
-      <div class="ticket-title">Inline field editing on entry detail</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot done"></div>
-        <div class="step-dot active"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item">
-      <div class="ticket-top">
-        <span class="ticket-id bug">BUG-147</span>
-        <span class="ticket-priority p1">P1</span>
-      </div>
-      <div class="ticket-title">Capture source lost on follow-up flow</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item">
-      <div class="ticket-top">
-        <span class="ticket-id feature">T-276</span>
-        <span class="ticket-priority p2">P2</span>
-      </div>
-      <div class="ticket-title">Batch entry completion from Today</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item">
-      <div class="ticket-top">
-        <span class="ticket-id feature">T-277</span>
-        <span class="ticket-priority p2">P2</span>
-      </div>
-      <div class="ticket-title">Smart checklist suggestions</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item">
-      <div class="ticket-top">
-        <span class="ticket-id bug">BUG-148</span>
-        <span class="ticket-priority p2">P2</span>
-      </div>
-      <div class="ticket-title">Serialization round-trip drops enum</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
-    <div class="ticket-item">
-      <div class="ticket-top">
-        <span class="ticket-id feature">T-278</span>
-        <span class="ticket-priority p2">P2</span>
-      </div>
-      <div class="ticket-title">Enrich Education category fields</div>
-      <div class="ticket-step-dots">
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-        <div class="step-dot"></div>
-      </div>
-    </div>
-
+  <!-- Action buttons -->
+  <div style="padding:8px 12px;display:flex;gap:6px;border-bottom:1px solid var(--border)">
+    <button onclick="runAll()" id="btnRunAll" style="flex:1;background:var(--green-dim);border:1px solid var(--green);color:var(--green);font-size:11px;font-weight:600;padding:6px 0;border-radius:4px;cursor:pointer;font-family:inherit">&#9654; Run All</button>
+    <button onclick="stopPipeline()" id="btnStop" style="flex:1;background:var(--red-dim);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 0;border-radius:4px;cursor:pointer;font-family:inherit" disabled>&#9632; Stop</button>
+    <button onclick="forceUnlock()" id="btnUnlock" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Force-release code lock">&#128275;</button>
   </div>
 
-  <div class="sidebar-stats">
-    <div class="stat-row">
-      <span>Completed</span>
-      <span class="stat-value green">2 / 8</span>
-    </div>
-    <div class="stat-row">
-      <span>Tests passing</span>
-      <span class="stat-value green">1,147</span>
-    </div>
-    <div class="stat-row">
-      <span>Think rounds</span>
-      <span class="stat-value">23</span>
-    </div>
-    <div class="stat-row">
-      <span>Elapsed</span>
-      <span class="stat-value">01:47:32</span>
-    </div>
-    <div style="border-top:1px solid var(--border);margin-top:6px;padding-top:6px">
-      <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:4px">Session History</div>
-      <div style="display:flex;flex-direction:column;gap:3px">
-        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
-          <span style="color:var(--text-muted);width:16px">S1</span>
-          <span style="color:var(--red);width:55px">BUG-143</span>
-          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:78%;height:100%;background:var(--green);border-radius:3px"></div></div>
-          <span style="color:var(--text-muted);font-size:10px">78%</span>
-          <span style="color:var(--green);font-size:10px">&#10003;</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
-          <span style="color:var(--text-muted);width:16px">S2</span>
-          <span style="color:var(--red);width:55px">BUG-145</span>
-          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:85%;height:100%;background:var(--yellow);border-radius:3px"></div></div>
-          <span style="color:var(--text-muted);font-size:10px">85%</span>
-          <span style="color:var(--green);font-size:10px">&#10003;</span>
-        </div>
-        <div style="display:flex;align-items:center;gap:6px;font-size:11px">
-          <span style="color:var(--cyan);width:16px">S3</span>
-          <span style="color:var(--blue);width:55px">T-275</span>
-          <div style="flex:1;height:6px;background:var(--surface2);border-radius:3px;overflow:hidden"><div style="width:42%;height:100%;background:var(--green);border-radius:3px"></div></div>
-          <span style="color:var(--text);font-size:10px">42%</span>
-          <span style="font-size:10px;animation:pulse 2s infinite;color:var(--yellow)">&#9679;</span>
-        </div>
-      </div>
-    </div>
+  <div class="ticket-list" id="ticketList">
+    <div style="padding:20px;text-align:center;color:var(--text-muted);font-size:11px">Loading backlog...</div>
+  </div>
+
+  <div class="sidebar-stats" id="sidebarStats">
+    <div class="stat-row"><span>Status</span><span class="stat-value" id="statStatus">Idle</span></div>
+    <div class="stat-row"><span>Completed</span><span class="stat-value green" id="statCompleted">0</span></div>
+    <div class="stat-row"><span>Think rounds</span><span class="stat-value" id="statThink">0</span></div>
+    <div class="stat-row"><span>5h Usage</span><span class="stat-value" id="statUsage">—</span></div>
+    <div class="stat-row"><span>Elapsed</span><span class="stat-value" id="statElapsed">—</span></div>
   </div>
 </div>
+
+<!-- RESIZE HANDLE (left of main) -->
+<div class="resize-handle resize-handle-l" id="handleL"></div>
 
 <!-- MAIN -->
 <div class="main">
   <!-- Current ticket -->
   <div class="current-ticket">
-    <div class="current-ticket-header">
-      <span class="ticket-id feature" style="font-size:16px">T-275</span>
-      <span class="title">Inline field editing on entry detail</span>
-      <span class="ticket-priority p1" style="font-size:11px">P1</span>
+    <div class="current-ticket-header" id="currentTicketHeader">
+      <span style="color:var(--text-muted);font-size:13px">Select a ticket or click Run All</span>
     </div>
-    <div class="step-pipeline">
-      <div class="step-chip done"><span class="check">&#10003;</span> plan</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip done"><span class="check">&#10003;</span> tests_red</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip done"><span class="check">&#10003;</span> implement</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip active"><div class="chip-dot"></div> tests_green</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip">review</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip">root_cause</div>
-      <span class="step-arrow">&#8250;</span>
-      <div class="step-chip">docs</div>
-    </div>
+    <div class="step-pipeline" id="stepPipeline"></div>
   </div>
 
   <!-- Terminal -->
-  <div class="terminal">
-    <div class="divider">step: plan &middot; completed in 42s</div>
-
-    <div class="line">
-      <span class="ts">00:12</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Reading ticket T-275 from <span class="file">BACKLOG.md</span></span>
-    </div>
-    <div class="line">
-      <span class="ts">00:15</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Reading <span class="file">entry_detail_screen.dart</span> (847 lines)</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:18</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Tracing callers of <em>_save()</em> &rarr; found 3 call sites</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:24</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Plan: 4 files to change, 3 edge cases, risk: <span class="warn">medium</span></span>
-    </div>
-    <div class="line">
-      <span class="ts">00:25</span>
-      <span class="tag gate">GATE</span>
-      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; files_to_change(4), callers_traced(3), edge_cases(3)</span>
-    </div>
-
-    <div class="divider">think loop: plan &middot; 4 rounds, 2 discards &middot; converged</div>
-
-    <div class="line">
-      <span class="ts">00:26</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 1: <span class="pass">&#9650; improved</span> &mdash; "Simpler: use TextEditingController directly instead of debounced stream"</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:34</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 2: <span class="fail">&#9660; discarded</span> &mdash; "Adding ChangeNotifier adds complexity without benefit"</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:40</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 3: <span class="pass">&#9650; improved</span> &mdash; "Found missing edge case: dispose during debounced save"</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:46</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 4: <span class="fail">&#9660; discarded</span> &mdash; "Extract auto-save mixin — premature, only 1 screen uses it"</span>
-    </div>
-    <div class="line">
-      <span class="ts">00:47</span>
-      <span class="tag system">CONV</span>
-      <span class="msg">Converged after 4 rounds (2 discards). Final plan has 5 files, 4 edge cases.</span>
-    </div>
-
-    <div class="divider">step: tests_red &middot; completed in 38s</div>
-
-    <div class="line">
-      <span class="ts">01:02</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Writing widget test: <span class="file">test/unit/entry_detail_inline_test.dart</span></span>
-    </div>
-    <div class="line">
-      <span class="ts">01:14</span>
-      <span class="tag haiku">HAIKU</span>
-      <span class="msg">Running flutter test &mdash; 2 new tests <span class="fail">FAILED</span> as expected</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:15</span>
-      <span class="tag gate">GATE</span>
-      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; outcome=new_test_fails, tests 1147&rarr;1149, failure_output captured</span>
-    </div>
-
-    <div class="divider">step: implement &middot; completed in 1m 12s</div>
-
-    <div class="line">
-      <span class="ts">01:16</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Editing <span class="file">entry_detail_screen.dart</span>: removing _editing toggle, adding auto-save</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:28</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Editing <span class="file">entry_detail_sheet.dart</span>: same pattern, shared TextEditingController</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:35</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Added <em>if (!mounted) return;</em> after await in _autoSave()</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:36</span>
-      <span class="tag gate">GATE</span>
-      <span class="msg"><span class="pass">&#10003; PASS</span> &middot; files_changed covers all 5 planned files</span>
-    </div>
-
-    <div class="divider">think loop: implement &middot; 3 rounds, 2 discards &middot; converged</div>
-
-    <div class="line">
-      <span class="ts">01:37</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 1: <span class="pass">&#9650; improved</span> &mdash; "Catch block at line 260 missing _log.warning"</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:42</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 2: <span class="fail">&#9660; discarded</span> &mdash; "Suggested extracting helper — would be only caller"</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:47</span>
-      <span class="tag opus">OPUS</span>
-      <span class="msg">Round 3: <span class="fail">&#9660; discarded</span> &mdash; "StateNotifier suggestion N/A — using StatefulWidget"</span>
-    </div>
-
-    <div class="divider" style="color:var(--yellow)">step: tests_green &middot; running...</div>
-
-    <div class="line">
-      <span class="ts">01:48</span>
-      <span class="tag haiku">HAIKU</span>
-      <span class="msg">Running: <em>flutter test test/unit/</em></span>
-    </div>
-    <div class="line">
-      <span class="ts">01:49</span>
-      <span class="tag system">CTX</span>
-      <span class="msg">Context check: <span class="warn">42%</span> (420k/1M) &mdash; healthy</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:50</span>
-      <span class="tag haiku">HAIKU</span>
-      <span class="msg">&#9632; 1149/1149 tests passed <span class="pass">(0 failures)</span> &mdash; 54.2s</span>
-    </div>
-    <div class="line">
-      <span class="ts">01:51</span>
-      <span class="tag haiku">HAIKU</span>
-      <span class="msg">Running: <em>flutter analyze</em></span>
-    </div>
-    <div class="line">
-      <span class="ts">01:51</span>
-      <span class="tag haiku">HAIKU</span>
-      <span class="msg" style="animation: pulse 2s infinite">Analyzing project...</span>
-    </div>
+  <div class="terminal" id="terminal">
+    <div class="line"><span class="ts">—</span><span class="tag system">SYSTEM</span><span class="msg">Pipeline ready. Select a ticket or click Run All.</span></div>
+    <div class="scroll-badge" id="scrollBadge"></div>
   </div>
 
-  <!-- Think Loop Bar -->
-  <div class="think-loop-bar">
+  <!-- Think Loop Bar (shown when think loop is active) -->
+  <div class="think-loop-bar" id="thinkLoopBar">
     <div class="think-loop-label">Think Loop</div>
-    <div class="think-rounds">
-      <div class="round-pip improved" title="R1: improved">&#9650;</div>
-      <div class="round-pip discarded" title="R2: discarded">&#9660;</div>
-      <div class="round-pip improved" title="R3: improved">&#9650;</div>
-      <div class="round-pip discarded" title="R4: discarded">&#9660;</div>
-      <div class="round-pip" title="R5">5</div>
-      <div class="round-pip" title="R6">6</div>
-      <div class="round-pip" title="R7">7</div>
-      <div class="round-pip" title="R8">8</div>
-      <div class="round-pip" title="R9">9</div>
-      <div class="round-pip" title="R10">10</div>
-    </div>
-    <div class="think-summary">
-      Plan: <strong>2 improved, 2 discarded</strong> &rarr; converged &middot;
-      Impl: <strong>1 improved, 2 discarded</strong> &rarr; converged
-    </div>
-    <div class="converge-status converging">step has no think loop</div>
+    <div class="think-rounds" id="thinkRounds"></div>
+    <div class="think-summary" id="thinkSummary"></div>
+    <div class="converge-status" id="convergeStatus"></div>
   </div>
 </div>
 
-<!-- ARTIFACTS -->
+<!-- RESIZE HANDLE (right of main) -->
+<div class="resize-handle resize-handle-r" id="handleR"></div>
+
+<!-- RIGHT PANEL — Ticket Detail / Artifacts -->
 <div class="artifacts">
-  <div class="artifacts-header">Pipeline Artifacts &middot; T-275</div>
-  <div class="artifacts-content">
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Plan</span>
-        <span class="step-status done">done</span>
-      </div>
-      <div class="artifact-body">
-        <div class="artifact-field">
-          <div class="label">Files to Change</div>
-          <div class="value">
-            <ul>
-              <li class="file">entry_detail_screen.dart</li>
-              <li class="file">entry_detail_sheet.dart</li>
-              <li class="file">entry_list_screen.dart</li>
-              <li class="file">field_schema_editor_sheet.dart</li>
-              <li class="file">entry_detail_inline_test.dart</li>
-            </ul>
-          </div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Callers Traced</div>
-          <div class="value">
-            <ul>
-              <li>_save() &rarr; 3 call sites</li>
-              <li>_onFieldChanged() &rarr; 2 call sites</li>
-            </ul>
-          </div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Edge Cases</div>
-          <div class="value">
-            <ul>
-              <li>Dispose during debounced save</li>
-              <li>Rapid field switching</li>
-              <li>Concurrent edit from another device</li>
-              <li>Empty field value (clear all text)</li>
-            </ul>
-          </div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Risk</div>
-          <div class="value" style="color:var(--yellow)">medium</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Tests Red</span>
-        <span class="step-status done">done</span>
-      </div>
-      <div class="artifact-body">
-        <div class="artifact-field">
-          <div class="label">Outcome</div>
-          <div class="value" style="color:var(--red)">new_test_fails</div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Tests Before / After</div>
-          <div class="value">1147 &rarr; 1149 (+2)</div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Failure Output</div>
-          <div class="value" style="font-size:10px;color:var(--red);background:var(--red-dim);padding:6px 8px;border-radius:4px;margin-top:4px">
-            Expected: no pencil icon in AppBar<br>
-            Actual: found 1 widget of type IconButton<br>
-            with icon: Icons.edit
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Implement</span>
-        <span class="step-status done">done</span>
-      </div>
-      <div class="artifact-body">
-        <div class="artifact-field">
-          <div class="label">Files Changed</div>
-          <div class="value">
-            <ul>
-              <li><span class="file">entry_detail_screen.dart</span><br><span style="color:var(--text-muted);font-size:10px">Removed _editing state, added auto-save on field blur</span></li>
-              <li><span class="file">entry_detail_sheet.dart</span><br><span style="color:var(--text-muted);font-size:10px">Same pattern, shared controller</span></li>
-              <li><span class="file">entry_list_screen.dart</span><br><span style="color:var(--text-muted);font-size:10px">Removed edit button from overflow menu</span></li>
-            </ul>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="gate-result pass">
-      <span class="icon">&#10003;</span>
-      <span>Gate: implement covers all 5 planned files</span>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Tests Green</span>
-        <span class="step-status active">running</span>
-      </div>
-      <div class="artifact-body">
-        <div class="artifact-field">
-          <div class="label">Unit Tests</div>
-          <div class="value"><span style="color:var(--green)">1149 passed</span> / 0 failed</div>
-        </div>
-        <div class="artifact-field">
-          <div class="label">Analyzer</div>
-          <div class="value" style="animation:pulse 2s infinite">Running...</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Review</span>
-        <span class="step-status pending">pending</span>
-      </div>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Root Cause</span>
-        <span class="step-status pending">pending</span>
-      </div>
-    </div>
-
-    <div class="artifact-section">
-      <div class="artifact-section-header">
-        <span>Docs Update</span>
-        <span class="step-status pending">pending</span>
-      </div>
-    </div>
-
-  </div>
-
-  <div class="checklist">
-    <div class="checklist-title">Validation Checklist (review step)</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Parameter completeness</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Client/server consistency</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Test coverage new paths</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> State preservation</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Silent error swallowing</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Race condition patterns</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Code duplication</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Serialization round-trip</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Multiple paths check</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> UX touch targets</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Save-and-reload trip</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Stale data check</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Fix plan diff</div>
-    <div class="check-item"><span class="icon pending">&#9675;</span> Cleanup (TODO/debug)</div>
+  <div class="artifacts-header" id="detailHeader">Select a ticket</div>
+  <div class="artifacts-content" id="detailContent">
+    <div style="padding:20px;text-align:center;color:var(--text-muted);font-size:11px">Click a ticket in the sidebar to view its details.</div>
   </div>
 </div>
 
 <script>
-// ─── TosheLabs Pipeline — Live UI ───
+const STEPS = ['plan','tests_red','implement','tests_green','review','root_cause','docs_update'];
+const state = { running: false, activeTicket: null, startTime: null, completed: 0, thinkRounds: 0 };
+let allTickets = [];
 
-const state = {
-  tickets: [],
-  activeTicket: null,
-  activeStep: null,
-  sessions: [],
-  thinkLoop: { rounds: [], discards: 0, total: 0 },
-  usage: { percent: 0, used: 0, total: 0 },
-  stats: { completed: 0, total: 0, tests: 0, thinkRounds: 0 },
-  startTime: Date.now(),
-};
-
-// SSE connection
-let eventSource;
-function connectSSE() {
-  eventSource = new EventSource('/events');
-  eventSource.onmessage = (e) => {
-    try {
-      const entry = JSON.parse(e.data);
-      handleEvent(entry.event, entry.data);
-    } catch {}
-  };
-  eventSource.onerror = () => {
-    setTimeout(connectSSE, 3000);
-  };
+// ─── API calls ───
+async function refreshBacklog() {
+  const r = await fetch('/api/backlog/refresh', { method: 'POST' });
+  const data = await r.json();
+  allTickets = data.all || [];
+  renderTicketList(data.all, data.actionable);
+  appendTerminal(`Backlog refreshed: ${data.total} total, ${data.actionable?.length || 0} actionable`, 'system');
 }
 
-function handleEvent(event, data) {
-  switch (event) {
-    case 'queue_ready':
-      state.tickets = data.tickets || [];
-      state.stats.total = data.total;
-      renderQueue();
-      break;
+async function runTicket(id) {
+  if (state.running) return alert('Pipeline already running');
+  state.running = true; state.startTime = Date.now(); state.completed = 0; state.thinkRounds = 0;
+  setRunning(true);
+  const r = await fetch(`/api/run/ticket/${id}`, { method: 'POST', headers: {'Content-Type':'application/json'} });
+  const data = await r.json();
+  appendTerminal(`Started: ${id} ${data.dryRun ? '(dry run)' : ''}`, 'system');
+}
 
-    case 'ticket_start':
-      state.activeTicket = data.ticket;
-      state.thinkLoop = { rounds: [], discards: 0, total: 0 };
-      updateActiveTicket(data);
-      break;
+async function runAll() {
+  if (state.running) return alert('Pipeline already running');
+  state.running = true; state.startTime = Date.now(); state.completed = 0; state.thinkRounds = 0;
+  setRunning(true);
+  const r = await fetch('/api/run/all', { method: 'POST', headers: {'Content-Type':'application/json'} });
+  const data = await r.json();
+  appendTerminal(`Started all: ${data.ticketCount} actionable tickets`, 'system');
+}
 
-    case 'ticket_done':
-      state.stats.completed++;
-      markTicketDone(data.ticket);
-      break;
+async function stopPipeline() {
+  await fetch('/api/stop', { method: 'POST' });
+  setRunning(false);
+  appendTerminal('Pipeline stopped by user', 'system');
+}
 
-    case 'step_start':
-      state.activeStep = data.step;
-      updateStepPipeline(data.ticket, data.step, 'active');
-      appendTerminal(`── step: ${data.step} ──`, 'divider');
-      break;
+async function forceUnlock() {
+  const r = await fetch('/api/unlock', { method: 'POST' });
+  const data = await r.json();
+  appendTerminal(data.status === 'unlocked' ? 'Code lock force-released' : 'No lock held', 'system');
+}
 
-    case 'step_done':
-      updateStepPipeline(data.ticket, data.step, 'done');
-      updateArtifacts(data.step, data.artifacts);
-      break;
+function setRunning(v) {
+  state.running = v;
+  const pill = document.getElementById('statusPill');
+  const btnAll = document.getElementById('btnRunAll');
+  const btnStop = document.getElementById('btnStop');
+  const stat = document.getElementById('statStatus');
+  if (v) {
+    pill.className = 'status-pill running'; pill.innerHTML = '<div class="dot"></div> Running';
+    btnAll.disabled = true; btnAll.style.opacity = '0.4';
+    btnStop.disabled = false; btnStop.style.color = 'var(--red)'; btnStop.style.borderColor = 'var(--red)';
+    stat.textContent = 'Running'; stat.style.color = 'var(--yellow)';
+  } else {
+    pill.className = 'status-pill idle'; pill.textContent = 'Idle';
+    btnAll.disabled = false; btnAll.style.opacity = '1';
+    btnStop.disabled = true; btnStop.style.color = 'var(--text-muted)'; btnStop.style.borderColor = 'var(--border)';
+    state.running = false;
+    stat.textContent = 'Idle'; stat.style.color = '';
+  }
+}
 
-    case 'step_gate':
-      const icon = data.pass ? '✓ PASS' : '✗ FAIL';
-      const cls = data.pass ? 'pass' : 'fail';
-      let msg = `<span class="${cls}">${icon}</span>`;
-      if (data.failures?.length) msg += ` — ${data.failures.join(', ')}`;
-      appendTerminal(msg, 'gate');
-      break;
+// ─── Render ───
+function renderTicketItem(t, actionIds) {
+  const isBug = t.id?.startsWith('BUG') || t.id?.startsWith('DEF') || (t.type||'').includes('bug');
+  const idCls = isBug ? 'bug' : 'feature';
+  const pCls = (t.priority||'P3').toLowerCase();
+  const isActionable = actionIds.has(t.id);
+  const dots = STEPS.map(() => '<div class="step-dot"></div>').join('');
+  const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
+  const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
+  return `<div class="ticket-item" data-id="${t.id}">
+    <div class="ticket-top">
+      <span class="ticket-id ${idCls}">${t.id}</span>
+      <span class="ticket-priority ${pCls}">${t.priority||''}</span>
+      ${runBtn}
+      ${reorderBtns}
+    </div>
+    <div class="ticket-title">${t.title||''}</div>
+    <div class="ticket-step-dots">${dots}</div>
+  </div>`;
+}
 
-    case 'step_skipped':
-      updateStepPipeline(data.ticket, data.step, data.reason === 'already done' ? 'done' : 'skipped');
-      break;
+function renderTicketList(all, actionable) {
+  const list = document.getElementById('ticketList');
+  const actionIds = new Set((actionable||[]).map(t => t.id));
+  document.getElementById('ticketCount').textContent = `${all.length} (${actionIds.size} actionable)`;
 
-    case 'think_round_end':
-      const arrow = data.outcome === 'improved' ? '▲ improved' : '▼ discarded';
-      const arrowCls = data.outcome === 'improved' ? 'pass' : 'fail';
-      state.thinkLoop.rounds.push(data);
-      state.thinkLoop.total = data.round || state.thinkLoop.total;
-      state.stats.thinkRounds++;
-      appendTerminal(`Round ${data.round}: <span class="${arrowCls}">${arrow}</span> — ${data.reason || ''}`, 'opus');
-      renderThinkLoop();
-      break;
+  const groups = { actionable: [], manual: [], v2: [], other: [] };
+  // Actionable group follows server sort order (respects explicit `order` field)
+  groups.actionable = (actionable || []).slice();
+  all.forEach(t => {
+    if (actionIds.has(t.id)) return; // already placed
+    if (t.status === 'manual' || t.type === 'manual') groups.manual.push(t);
+    else if (t.status === 'v2') groups.v2.push(t);
+    else groups.other.push(t);
+  });
 
-    case 'think_converged':
-      state.thinkLoop.discards = data.discards;
-      appendTerminal(`Converged after ${data.rounds} rounds (${data.discards} discards, ${data.improvements} improvements)`, 'system');
-      renderThinkLoop();
-      break;
+  let html = groups.actionable.map(t => renderTicketItem(t, actionIds)).join('');
 
-    case 'think_loop_start':
-      appendTerminal(`── think loop: ${data.step} ──`, 'divider');
-      state.thinkLoop = { rounds: [], discards: 0, total: 0 };
-      renderThinkLoop();
-      break;
+  if (groups.other.length) {
+    html += groups.other.map(t => renderTicketItem(t, actionIds)).join('');
+  }
 
-    case 'claude_event':
-      if (data.event?.type === 'raw' && data.event?.text) {
-        appendTerminal(data.event.text, data.step === 'tests_green' ? 'haiku' : 'opus');
+  if (groups.manual.length) {
+    html += `<details class="ticket-group"><summary>Manual <span class="group-count">${groups.manual.length}</span></summary>`;
+    html += groups.manual.map(t => renderTicketItem(t, actionIds)).join('');
+    html += `</details>`;
+  }
+
+  if (groups.v2.length) {
+    html += `<details class="ticket-group"><summary>V2 <span class="group-count">${groups.v2.length}</span></summary>`;
+    html += groups.v2.map(t => renderTicketItem(t, actionIds)).join('');
+    html += `</details>`;
+  }
+
+  list.innerHTML = html;
+}
+
+function renderStepPipeline() {
+  const el = document.getElementById('stepPipeline');
+  el.innerHTML = STEPS.map(s => `<div class="step-chip" data-step="${s}" style="cursor:pointer">${s}</div>`).join('<span class="step-arrow">&#8250;</span>');
+  el.addEventListener('click', (e) => {
+    const chip = e.target.closest('.step-chip');
+    if (!chip) return;
+    const step = chip.dataset.step;
+    // Find the divider line for this step in the terminal
+    const terminal = document.getElementById('terminal');
+    const dividers = terminal.querySelectorAll('.divider');
+    for (const div of dividers) {
+      if (div.textContent.includes(`step: ${step}`)) {
+        autoScroll = false;
+        div.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        div.style.background = 'var(--blue-dim)';
+        setTimeout(() => div.style.background = '', 1500);
+        return;
       }
-      break;
-
-    case 'usage_check':
-      if (data.percent != null) {
-        state.usage = data;
-        updateUsageMeter();
-      }
-      break;
-
-    case 'session_rotate':
-      state.sessions.push({ ticket: data.ticket, percent: state.usage.percent });
-      appendTerminal(`Session rotated at ${data.reason}`, 'system');
-      renderSessionHistory();
-      break;
-
-    case 'lock_acquired':
-      appendTerminal('Code lock acquired', 'system');
-      break;
-
-    case 'lock_released':
-      appendTerminal('Code lock released', 'system');
-      break;
-
-    case 'crash_recovery':
-      appendTerminal(`Resuming ${data.ticket} from step ${data.resumeFrom}`, 'system');
-      break;
-
-    case 'backlog_refreshed':
-      appendTerminal(`Backlog refreshed: ${data.total} total, ${data.actionable} actionable`, 'system');
-      break;
-
-    case 'pipeline_complete':
-      appendTerminal(`Pipeline complete — ${data.ticketsProcessed} tickets processed`, 'system');
-      document.querySelector('.status-pill').className = 'status-pill done';
-      document.querySelector('.status-pill').innerHTML = '<span style="color:var(--green)">✓</span> Done';
-      break;
-  }
-
-  updateElapsed();
-  updateStats();
-}
-
-// ─── Rendering helpers ───
-
-function appendTerminal(html, tag = 'system') {
-  const terminal = document.querySelector('.terminal');
-  if (!terminal) return;
-  const elapsed = formatElapsed(Date.now() - state.startTime);
-  const tagHtml = `<span class="tag ${tag}">${tag.toUpperCase()}</span>`;
-  const line = document.createElement('div');
-  line.className = 'line';
-  line.innerHTML = `<span class="ts">${elapsed}</span>${tagHtml}<span class="msg">${html}</span>`;
-  terminal.appendChild(line);
-  terminal.scrollTop = terminal.scrollHeight;
-}
-
-function renderQueue() {
-  // Dynamic queue rendering would go here
-  // For now the mockup has static content
-}
-
-function updateActiveTicket(data) {
-  const header = document.querySelector('.current-ticket-header');
-  if (header) {
-    const idClass = data.ticket?.startsWith('BUG') ? 'bug' : 'feature';
-    header.innerHTML = `
-      <span class="ticket-id ${idClass}" style="font-size:16px">${data.ticket}</span>
-      <span class="title">${data.title || ''}</span>
-    `;
-  }
-}
-
-function updateStepPipeline(ticketId, stepName, status) {
-  // Update the step chips in the pipeline bar
-  const chips = document.querySelectorAll('.step-chip');
-  for (const chip of chips) {
-    if (chip.textContent.trim().replace(/[✓●]/, '').trim() === stepName) {
-      chip.className = `step-chip ${status === 'done' ? 'done' : status === 'active' ? 'active' : ''}`;
-      if (status === 'done') chip.innerHTML = `<span class="check">✓</span> ${stepName}`;
-      else if (status === 'active') chip.innerHTML = `<div class="chip-dot"></div> ${stepName}`;
-      break;
-    }
-  }
-}
-
-function markTicketDone(ticketId) {
-  const items = document.querySelectorAll('.ticket-item');
-  for (const item of items) {
-    if (item.querySelector('.ticket-id')?.textContent === ticketId) {
-      item.classList.add('done');
-      item.classList.remove('active');
-      item.querySelectorAll('.step-dot').forEach(d => d.classList.add('done'));
-      break;
-    }
-  }
-}
-
-function updateArtifacts(step, artifacts) {
-  // Update the artifacts panel for the given step
-  const sections = document.querySelectorAll('.artifact-section');
-  for (const section of sections) {
-    const header = section.querySelector('.artifact-section-header span:first-child');
-    if (header?.textContent?.trim().toLowerCase() === step.replace('_', ' ')) {
-      const status = section.querySelector('.step-status');
-      if (status) {
-        status.className = 'step-status done';
-        status.textContent = 'done';
-      }
-    }
-  }
-}
-
-function renderThinkLoop() {
-  const rounds = document.querySelectorAll('.round-pip');
-  state.thinkLoop.rounds.forEach((r, i) => {
-    if (rounds[i]) {
-      rounds[i].className = `round-pip ${r.outcome === 'improved' ? 'improved' : 'discarded'}`;
-      rounds[i].innerHTML = r.outcome === 'improved' ? '▲' : '▼';
     }
   });
-  const summary = document.querySelector('.think-summary');
-  if (summary) {
-    const improved = state.thinkLoop.rounds.filter(r => r.outcome === 'improved').length;
-    const discarded = state.thinkLoop.rounds.filter(r => r.outcome === 'discarded').length;
-    summary.innerHTML = `<strong>${improved} improved, ${discarded} discarded</strong>`;
+}
+
+function setActiveTicket(id, title) {
+  state.activeTicket = id;
+  const isBug = id?.startsWith('BUG') || id?.startsWith('DEF');
+  document.getElementById('currentTicketHeader').innerHTML = `
+    <span class="ticket-id ${isBug?'bug':'feature'}" style="font-size:16px">${id}</span>
+    <span class="title">${title||''}</span>`;
+  renderStepPipeline();
+  // Highlight in sidebar
+  document.querySelectorAll('.ticket-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.id === id);
+  });
+}
+
+function setStepStatus(step, status) {
+  const chip = document.querySelector(`.step-chip[data-step="${step}"]`);
+  if (!chip) return;
+  chip.className = `step-chip ${status === 'done' ? 'done' : status === 'active' ? 'active' : ''}`;
+  if (status === 'done') chip.innerHTML = `<span class="check">&#10003;</span> ${step}`;
+  else if (status === 'active') chip.innerHTML = `<div class="chip-dot"></div> ${step}`;
+  else chip.textContent = step;
+}
+
+// Auto-scroll: pause when user scrolls up, resume at bottom
+let autoScroll = true;
+let scrollPauseCount = 0;
+(function initScrollPause() {
+  const terminal = document.getElementById('terminal');
+  if (!terminal) return;
+  const badge = document.getElementById('scrollBadge');
+  if (badge) badge.addEventListener('click', () => {
+    autoScroll = true;
+    scrollPauseCount = 0;
+    badge.classList.remove('visible');
+    terminal.scrollTop = terminal.scrollHeight;
+  });
+  terminal.addEventListener('scroll', () => {
+    const atBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 40;
+    if (atBottom && !autoScroll) {
+      autoScroll = true;
+      scrollPauseCount = 0;
+      const badge = document.getElementById('scrollBadge');
+      if (badge) badge.classList.remove('visible');
+    } else if (!atBottom) {
+      autoScroll = false;
+    }
+  });
+})();
+
+function appendTerminal(html, tag = 'system', opts = {}) {
+  const terminal = document.getElementById('terminal');
+  const pad = n => String(n).padStart(2, '0');
+  const now = new Date();
+  const wall = opts.time || `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const base = state.stepStartTime || state.startTime || Date.now();
+  const dur = opts.duration || formatElapsed(Date.now() - base);
+  let pctStr = '—';
+  if (opts.pct != null) pctStr = typeof opts.pct === 'string' ? opts.pct : `${Math.round(opts.pct)}%`;
+  else if (state.lastPct != null) pctStr = `${Math.round(state.lastPct)}%`;
+  const line = document.createElement('div');
+  if (tag === 'divider') {
+    line.className = 'divider';
+    line.innerHTML = html;
+  } else {
+    const tagLc = tag.toLowerCase();
+    line.className = 'line';
+    line.innerHTML = `<span class="ts">${wall}</span><span class="tag ${tagLc}">${tag.toUpperCase()}</span><span class="dur">${dur}</span><span class="pct">${pctStr}</span><span class="msg">${html}</span>`;
+  }
+  terminal.appendChild(line);
+  if (autoScroll) {
+    terminal.scrollTop = terminal.scrollHeight;
+  } else {
+    scrollPauseCount++;
+    const badge = document.getElementById('scrollBadge');
+    if (badge) {
+      badge.textContent = `↓ ${scrollPauseCount} new`;
+      badge.classList.add('visible');
+    }
   }
 }
 
-function renderSessionHistory() {
-  // Update session bars in sidebar
+let _usageTimer = null;
+function updateUsageWidget() {
+  if (_usageTimer) return;
+  _usageTimer = setTimeout(() => { _usageTimer = null; }, 2000);
+  // Polls /api/usage for real 5h/7d window data from statusline
+  fetch('/api/usage').then(r => r.json()).then(d => {
+    const fh = d.five_hour;
+    const sd = d.seven_day;
+
+    // 5h session
+    const pctEl = document.getElementById('usagePct');
+    const fill = document.getElementById('usageFill');
+    const resetEl = document.getElementById('usageReset');
+    if (fh && fh.pct != null) {
+      const pct = Math.round(fh.pct);
+      state.lastPct = pct;
+      if (pctEl) { pctEl.textContent = `${pct}%`; pctEl.style.color = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--text-dim)'; }
+      if (fill) { fill.style.width = pct + '%'; fill.style.background = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--green)'; }
+      if (resetEl && fh.resets_at) {
+        const t = new Date(fh.resets_at * 1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+        resetEl.textContent = `Resets ${t}`;
+      }
+      // Update sidebar stat
+      const statEl = document.getElementById('statUsage');
+      if (statEl) { statEl.textContent = `${pct}%`; statEl.style.color = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--green)'; }
+    } else {
+      if (pctEl) pctEl.textContent = '—';
+      if (fill) fill.style.width = '0%';
+      if (resetEl) resetEl.textContent = '';
+    }
+
+    // 7d weekly
+    const pctWeek = document.getElementById('usagePctWeek');
+    const fillWeek = document.getElementById('usageFillWeek');
+    if (sd && sd.pct != null) {
+      const pct = Math.round(sd.pct);
+      if (pctWeek) { pctWeek.textContent = `${pct}%`; pctWeek.style.color = pct > 60 ? 'var(--yellow)' : 'var(--text-dim)'; }
+      if (fillWeek) { fillWeek.style.width = pct + '%'; fillWeek.style.background = pct > 60 ? 'var(--yellow)' : 'var(--blue)'; }
+    } else {
+      if (pctWeek) pctWeek.textContent = '—';
+      if (fillWeek) fillWeek.style.width = '0%';
+    }
+  }).catch(() => {});
 }
 
-function updateUsageMeter() {
-  const fill = document.querySelector('.bar-fill');
-  const label = document.querySelector('.context-meter span:last-of-type');
-  if (fill && state.usage.percent != null) {
-    fill.style.width = `${state.usage.percent}%`;
-    const color = state.usage.percent > 85 ? 'var(--red)' : state.usage.percent > 70 ? 'var(--yellow)' : 'var(--green)';
-    fill.style.background = `linear-gradient(90deg, var(--green), ${color})`;
-  }
-  if (label && state.usage.percent != null) {
-    label.textContent = `${state.usage.percent}% · ${(state.usage.used/1000).toFixed(0)}k / ${(state.usage.total/1000).toFixed(0)}k`;
-  }
-}
-
-function updateStats() {
-  const statValues = document.querySelectorAll('.stat-value');
-  // Update stat values if they exist
-}
-
-function updateElapsed() {
-  const el = document.querySelector('.session-info');
-  if (el) {
-    const elapsed = formatElapsed(Date.now() - state.startTime);
-    el.textContent = `Session ${state.sessions.length + 1} · ${state.activeTicket || '—'} · ${elapsed}`;
-  }
-}
+// Poll usage every 10s
+setInterval(updateUsageWidget, 10000);
 
 function formatElapsed(ms) {
   const s = Math.floor(ms / 1000);
@@ -1428,19 +1160,418 @@ function formatElapsed(ms) {
   return `${String(h).padStart(2,'0')}:${String(m%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
 }
 
-// ─── Refresh button ───
-document.addEventListener('click', (e) => {
-  if (e.target.closest('button')?.textContent?.includes('Refresh')) {
-    fetch('/api/backlog/refresh', { method: 'POST' })
-      .then(r => r.json())
-      .then(data => {
-        appendTerminal(`Backlog refreshed: ${data.total} total, ${data.tickets?.length || 0} actionable`, 'system');
-      });
+// ─── SSE ───
+function connectSSE() {
+  const es = new EventSource('/events');
+  es.onmessage = (e) => {
+    try { const entry = JSON.parse(e.data); handleEvent(entry.event, entry.data); } catch {}
+  };
+  es.onerror = () => setTimeout(connectSSE, 3000);
+}
+
+function handleEvent(ev, d) {
+  switch (ev) {
+    case 'run_requested': setRunning(true); break;
+    case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); break;
+    case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; break;
+    case 'step_start':
+      setStepStatus(d.step, 'active');
+      state.stepStartTime = Date.now();
+      appendTerminal(`── step: ${d.step} ──`, 'divider');
+      // Snapshot 5h% at step start for delta calculation
+      fetch('/api/usage').then(r=>r.json()).then(u=>{ state._stepStartPct = u.five_hour?.pct ?? null; }).catch(()=>{});
+      break;
+    case 'step_done':
+      setStepStatus(d.step, 'done');
+      if (d.metrics) {
+        const m = d.metrics;
+        appendTerminal(`[step] ${d.ticket}/${d.step} · ${m.inputTokens.toLocaleString()} in / ${m.outputTokens.toLocaleString()} out · ${m.toolCalls} tools`, (m.model || 'system'), { duration: m.durationFormatted, pct: m.usagePercent });
+      }
+      break;
+    case 'step_skipped': setStepStatus(d.step, d.reason === 'already done' ? 'done' : ''); break;
+    case 'step_gate':
+      appendTerminal(`<span class="${d.pass?'pass':'fail'}">${d.pass?'✓ PASS':'✗ FAIL'}</span>${d.failures?.length ? ' — '+d.failures.join(', ') : ''}`, 'gate');
+      break;
+    case 'think_loop_start':
+      appendTerminal(`── think loop: ${d.step} ──`, 'divider');
+      document.getElementById('thinkRounds').innerHTML = '';
+      document.getElementById('thinkSummary').innerHTML = '';
+      document.getElementById('convergeStatus').textContent = '';
+      document.getElementById('convergeStatus').className = 'converge-status';
+      document.getElementById('thinkLoopBar').classList.add('visible');
+      break;
+    case 'think_round_end':
+      state.thinkRounds++; document.getElementById('statThink').textContent = state.thinkRounds;
+      appendTerminal(`Round ${d.round}: <span class="${d.outcome==='improved'?'pass':'fail'}">${d.outcome==='improved'?'▲ improved':'▼ discarded'}</span> — ${d.reason||''}`, 'opus');
+      const pip = document.createElement('div');
+      pip.className = `round-pip ${d.outcome === 'improved' ? 'improved' : 'discarded'}`;
+      pip.title = `R${d.round}: ${d.outcome}`;
+      pip.innerHTML = d.outcome === 'improved' ? '&#9650;' : '&#9660;';
+      document.getElementById('thinkRounds').appendChild(pip);
+      break;
+    case 'think_converged':
+      appendTerminal(`Converged: ${d.rounds} rounds, ${d.discards} discards, ${d.improvements} improvements`, 'system');
+      document.getElementById('thinkSummary').innerHTML = `<strong>${d.improvements} improved, ${d.discards} discarded</strong> &rarr; converged`;
+      const cs = document.getElementById('convergeStatus');
+      cs.textContent = 'converged'; cs.className = 'converge-status converging';
+      break;
+    case 'claude_event': {
+      const style = d.step === 'tests_green' ? 'haiku' : 'opus';
+      const evt = d.event;
+      if (evt?.type === 'raw' && evt?.text) {
+        appendTerminal(evt.text, style);
+      } else if (evt?.type === 'assistant' && evt?.message?.content) {
+        // Count each assistant message as a turn (live update)
+        state.totalTurns = (state.totalTurns || 0) + 1;
+        updateUsageWidget();
+        // Update context bar from per-turn usage
+        const u = evt.message?.usage;
+        if (u) {
+          const input = u.input_tokens || 0;
+          const output = u.output_tokens || 0;
+          const cached = u.cache_read_input_tokens || 0;
+          state.totalIn = (state.totalIn || 0) + input;
+          state.totalOut = (state.totalOut || 0) + output;
+          state.totalCached = (state.totalCached || 0) + cached;
+          state.totalTokens = (state.totalIn || 0) + (state.totalOut || 0);
+          // Context window: 200k default, 1M for opus
+          const ctxWindow = (evt.message?.model || '').includes('opus') ? 1000000 : 200000;
+          const pct = Math.min(100, Math.round((input / ctxWindow) * 100));
+          const fill = document.getElementById('ctxFill');
+          const lbl = document.getElementById('ctxLabel');
+          if (fill && lbl) {
+            fill.style.width = pct + '%';
+            fill.style.background = pct > 85 ? 'var(--red)' : pct > 70 ? 'linear-gradient(90deg,var(--green),var(--yellow))' : 'var(--green)';
+            const fmt = n => n >= 1000 ? Math.round(n/1000) + 'k' : n.toLocaleString();
+            lbl.textContent = `${pct}% · ${fmt(state.totalIn)} in · ${fmt(state.totalOut)} out · ${fmt(state.totalCached)} cached`;
+          }
+          updateUsageWidget();
+        }
+        for (const block of evt.message.content) {
+          if (block.type === 'text' && block.text) appendTerminal(block.text, style);
+          else if (block.type === 'tool_use') {
+            const inp = block.input || {};
+            const detail = block.name === 'Read' ? inp.file_path
+              : block.name === 'Edit' ? inp.file_path
+              : block.name === 'Bash' ? (inp.command || '').slice(0, 150)
+              : block.name === 'Grep' ? `"${inp.pattern}" ${inp.path || ''}`
+              : block.name === 'Glob' ? inp.pattern
+              : block.name === 'Write' ? inp.file_path
+              : block.name === 'Agent' ? inp.description
+              : '';
+            appendTerminal(detail || block.name, block.name);
+          }
+        }
+      } else if (evt?.type === 'result') {
+        // Log raw result keys so we can see exact field names
+        console.log('[result event]', JSON.stringify(Object.keys(evt)));
+        const u = evt.usage;
+        if (u) {
+          const parts = [];
+          if (u?.input_tokens) parts.push(`${u.input_tokens.toLocaleString()} in`);
+          if (u?.output_tokens) parts.push(`${u.output_tokens.toLocaleString()} out`);
+          if (evt.num_turns) parts.push(`${evt.num_turns} turns`);
+          if (evt.duration_ms) parts.push(`${Math.round(evt.duration_ms/1000)}s`);
+          // Fetch current 5h % and show step delta
+          fetch('/api/usage').then(r=>r.json()).then(d=>{
+            if (d.five_hour?.pct != null) {
+              const now = d.five_hour.pct;
+              const before = state._stepStartPct;
+              if (before != null) {
+                const delta = Math.max(0, Math.round((now - before) * 10) / 10);
+                parts.push(`5h: +${delta}%`);
+              } else {
+                parts.push(`5h: ${Math.round(now)}%`);
+              }
+            }
+            appendTerminal(`[session] ${parts.join(' · ')}`, 'system');
+          }).catch(()=>{
+            appendTerminal(`[session] ${parts.join(' · ')}`, 'system');
+          });
+        }
+        updateUsageWidget();
+      } else if (evt?.type === 'rate_limit_event') {
+        const info = evt.rate_limit_info;
+        if (info?.resetsAt) {
+          state.resetsAt = new Date(info.resetsAt * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+          state.resetsTz = info.timezone || info.tz || null;
+        }
+        // Defensively extract 5h utilization from a few known/likely fields.
+        // These events arrive ~once per turn, so state.lastPct tracks the
+        // freshest per-call quota — far tighter than the 10s /api/usage poll.
+        const pick = (o) => {
+          if (o == null) return null;
+          const cand = [
+            o.five_hour?.pct, o.five_hour?.utilization,
+            o.unified_5h_limit?.utilization, o.unified_5h_limit_info?.utilization,
+            o.primary_pool_utilization_percentage, o.utilization_percentage,
+          ];
+          for (const v of cand) if (typeof v === 'number' && isFinite(v)) return v;
+          return null;
+        };
+        const fresh = pick(info);
+        if (fresh != null) {
+          state.lastPct = fresh > 1 ? fresh : fresh * 100;  // accept 0-1 or 0-100 forms
+        } else if (!state._rlSampleLogged) {
+          // Log shape once so we can refine the extractor if needed
+          console.log('[rate_limit_event sample]', JSON.stringify(evt));
+          state._rlSampleLogged = true;
+        }
+        updateUsageWidget();
+        if (info?.status !== 'allowed') {
+          appendTerminal(`RATE LIMITED — resets at ${state.resetsAt || 'unknown'}`, 'system');
+        }
+      }
+      break;
+    }
+    case 'usage_check':
+      if (d.percent != null) {
+        const fill = document.getElementById('ctxFill');
+        const lbl = document.getElementById('ctxLabel');
+        fill.style.width = d.percent + '%';
+        fill.style.background = d.percent > 85 ? 'var(--red)' : d.percent > 70 ? 'linear-gradient(90deg,var(--green),var(--yellow))' : 'var(--green)';
+        const fmt = n => n >= 1000 ? Math.round(n/1000) + 'k' : (n || 0).toLocaleString();
+        lbl.textContent = `${d.percent}% · ${fmt(state.totalIn || 0)} in · ${fmt(state.totalOut || 0)} out · ${fmt(state.totalCached || 0)} cached`;
+      }
+      break;
+    case 'lock_acquired': appendTerminal('Code lock acquired', 'system'); break;
+    case 'lock_released': appendTerminal('Code lock released', 'system'); break;
+    case 'rate_limited':
+      appendTerminal(`⏸ RATE LIMITED — waiting ${d.waitMinutes} min, resuming at ${d.resumeAt}`, 'system');
+      document.getElementById('statusPill').className = 'status-pill';
+      document.getElementById('statusPill').textContent = `⏸ ${d.waitMinutes}m`;
+      document.getElementById('statStatus').textContent = 'Rate limited';
+      document.getElementById('statStatus').style.color = 'var(--yellow)';
+      break;
+    case 'rate_limit_resume':
+      appendTerminal(`▶ Resuming ${d.ticket}/${d.step}`, 'system');
+      document.getElementById('statusPill').className = 'status-pill running';
+      document.getElementById('statusPill').innerHTML = '&#9679; Running';
+      document.getElementById('statStatus').textContent = 'Running';
+      document.getElementById('statStatus').style.color = 'var(--green)';
+      break;
+    case 'step_retry':
+      appendTerminal(`Retrying ${d.step} (was: ${d.previousStatus})`, 'system');
+      break;
+    case 'pipeline_complete':
+      appendTerminal(`Pipeline complete — ${d.ticketsProcessed} tickets`, 'system');
+      setRunning(false);
+      document.getElementById('statusPill').className = 'status-pill done';
+      document.getElementById('statusPill').innerHTML = '&#10003; Done';
+      document.getElementById('statStatus').textContent = 'Done'; document.getElementById('statStatus').style.color = 'var(--green)';
+      break;
+    case 'pipeline_error':
+      appendTerminal(`ERROR: ${d.error}`, 'system');
+      setRunning(false);
+      document.getElementById('statusPill').className = 'status-pill error';
+      document.getElementById('statusPill').textContent = 'Error';
+      break;
+    case 'pipeline_blocked': appendTerminal(`BLOCKED: code lock held by ${d.holder}`, 'system'); setRunning(false); break;
+    case 'pipeline_empty': appendTerminal('No actionable tickets', 'system'); setRunning(false); break;
+    case 'backlog_refreshed': break; // handled by refreshBacklog()
+    case 'stop_requested': appendTerminal('Stop requested...', 'system'); break;
+    case 'crash_recovery': appendTerminal(`Resuming ${d.ticket} from ${d.resumeFrom}`, 'system'); break;
+    case 'session_rotate': appendTerminal(`Session rotated: ${d.reason}`, 'system'); break;
+    case 'tests_green_run': appendTerminal(`Running ${d.phase}...`, 'system'); break;
+    case 'tests_green_done': appendTerminal(`Tests: ${d.unit_tests?.passed || 0} passed, ${d.unit_tests?.failed || 0} failed (${d.new_failures || 0} new) · Analyzer: ${d.analyzer_errors || 0} errors`, 'system'); break;
+    case 'tests_green_heal': appendTerminal(`Self-heal attempt ${d.attempt}: ${d.newFailures} failing test${d.newFailures>1?'s':''}`, 'system'); break;
+    case 'self_heal_start': appendTerminal(`Self-heal: ${d.step} — ${d.failures?.join(', ') || ''}`, 'system'); break;
+    case 'self_heal_done': appendTerminal(`Self-heal done: ${d.step}`, 'system'); break;
+    case 'self_heal_error': appendTerminal(`Self-heal failed: ${d.step} — ${d.error}`, 'system'); break;
+    case 'step_attempt_done': appendTerminal(`[${d.model}] ${d.step} attempt ${d.attempt} · ${d.inputTokens?.toLocaleString() || 0} in · ${d.outputTokens?.toLocaleString() || 0} out · ${d.toolCalls || 0} tools${d.maxTurnsHit ? ' · MAX TURNS' : ''}`, 'system'); break;
+    case 'ticket_done': appendTerminal(`── ticket done: ${d.ticket} ──`, 'divider'); break;
+    case 'ticket_report': appendTerminal(`Report: ${d.ticket} — ${d.totalDurationFormatted} · ${d.totalOutputTokens?.toLocaleString() || 0} out · ${d.totalFilesChanged || 0} files${d.usagePercent != null ? ' · 5h: '+d.usagePercent+'%' : ''}`, 'system'); break;
+    case 'ticket_blocked': appendTerminal(`BLOCKED: ${d.ticket} at ${d.step}`, 'system'); break;
+    case 'step_gate_failed': appendTerminal(`Gate FAILED: ${d.step} after ${d.attempts} attempts — ${d.failures?.join(', ')}`, 'system'); break;
+    case 'mechanical_docs': appendTerminal(`[auto] Updated ${d.file}`, 'system'); break;
   }
+  if (state.startTime) document.getElementById('statElapsed').textContent = formatElapsed(Date.now() - state.startTime);
+}
+
+// Elapsed timer
+setInterval(() => {
+  if (state.startTime && state.running) document.getElementById('statElapsed').textContent = formatElapsed(Date.now() - state.startTime);
+}, 1000);
+
+// ─── Ticket detail panel ───
+function showTicketDetail(id) {
+  const t = allTickets.find(x => x.id === id);
+  if (!t) return;
+
+  document.getElementById('detailHeader').textContent = `${t.id} — ${t.title}`;
+
+  // Highlight in sidebar
+  document.querySelectorAll('.ticket-item').forEach(el => {
+    el.classList.toggle('active', el.dataset.id === id);
+  });
+
+  const fields = [
+    ['Status', t.status],
+    ['Priority', t.priority],
+    ['Type', t.type],
+    ['Added', t.added],
+    ['Complexity', t.complexity],
+    ['Area', t.area],
+  ].filter(([,v]) => v);
+
+  const sections = [];
+
+  // Meta fields
+  sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>Info</span></div><div class="artifact-body">${
+    fields.map(([k,v]) => {
+      let color = '';
+      if (k === 'Priority') color = v === 'P0' ? 'var(--red)' : v === 'P1' ? 'var(--yellow)' : 'var(--blue)';
+      if (k === 'Status') color = v === 'done' ? 'var(--green)' : v === 'in_progress' ? 'var(--yellow)' : '';
+      return `<div class="artifact-field"><div class="label">${k}</div><div class="value"${color ? ` style="color:${color}"` : ''}>${esc(v)}</div></div>`;
+    }).join('')
+  }</div></div>`);
+
+  // Description / Problem / Goal
+  for (const key of ['description', 'problem', 'goal']) {
+    if (t[key]) {
+      sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>${key.charAt(0).toUpperCase()+key.slice(1)}</span></div><div class="artifact-body"><div style="color:var(--text-dim);line-height:1.6;white-space:pre-wrap">${esc(t[key])}</div></div></div>`);
+    }
+  }
+
+  // Root cause
+  if (t.root_cause) {
+    sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>Root Cause</span></div><div class="artifact-body"><div style="color:var(--text-dim);line-height:1.6;white-space:pre-wrap">${esc(t.root_cause)}</div></div></div>`);
+  }
+
+  // Fix plan / Design / Approach / Acceptance / Steps
+  for (const key of ['fix_plan', 'design', 'approach', 'acceptance', 'steps', 'remaining_steps']) {
+    if (t[key] && Array.isArray(t[key]) && t[key].length) {
+      const label = key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>${label}</span><span class="step-status" style="background:var(--surface);color:var(--text-muted)">${t[key].length} items</span></div><div class="artifact-body">${
+        t[key].map((s,i) => `<div class="artifact-field"><div class="value"><span style="color:var(--text-muted);margin-right:6px">${i+1}.</span>${esc(typeof s === 'string' ? s : JSON.stringify(s))}</div></div>`).join('')
+      }</div></div>`);
+    }
+  }
+
+  // Files
+  if (t.files && t.files.length) {
+    sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>Files</span><span class="step-status" style="background:var(--surface);color:var(--text-muted)">${t.files.length}</span></div><div class="artifact-body">${
+      t.files.map(f => `<div class="artifact-field"><div class="value file">${esc(f)}</div></div>`).join('')
+    }</div></div>`);
+  }
+
+  // Dependencies
+  if (t.depends_on && t.depends_on.length) {
+    sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>Depends On</span></div><div class="artifact-body"><div class="artifact-field"><div class="value">${t.depends_on.map(d => `<span style="color:var(--blue);cursor:pointer" onclick="showTicketDetail('${d}')">${d}</span>`).join(', ')}</div></div></div></div>`);
+  }
+
+  // Risk
+  if (t.risk) {
+    sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>Risk</span></div><div class="artifact-body"><div style="color:var(--yellow);line-height:1.6">${esc(t.risk)}</div></div></div>`);
+  }
+
+  // Notes / Context
+  for (const key of ['notes', 'context', 'results']) {
+    if (t[key]) {
+      const label = key.charAt(0).toUpperCase() + key.slice(1);
+      sections.push(`<div class="artifact-section"><div class="artifact-section-header"><span>${label}</span></div><div class="artifact-body"><div style="color:var(--text-dim);line-height:1.6;white-space:pre-wrap">${esc(t[key])}</div></div></div>`);
+    }
+  }
+
+  // Run button at bottom for actionable tickets
+  const actionable = !['done','v2','deferred','manual','moot','decided'].includes(t.status);
+  if (actionable) {
+    sections.push(`<div style="padding:8px"><button onclick="runTicket('${t.id}')" style="width:100%;background:var(--green-dim);border:1px solid var(--green);color:var(--green);font-size:12px;font-weight:600;padding:10px 0;border-radius:6px;cursor:pointer;font-family:inherit">&#9654; Run ${t.id}</button></div>`);
+  }
+
+  document.getElementById('detailContent').innerHTML = sections.join('');
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ─── Reorder ticket ───
+async function reorderTicket(ticketId, direction) {
+  try {
+    const res = await fetch('/api/backlog/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticketId, direction }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    allTickets = data.all || [];
+    renderTicketList(data.all, data.actionable);
+  } catch (e) {
+    console.error('Reorder failed:', e);
+  }
+}
+
+// ─── Sidebar click handler ───
+document.getElementById('ticketList').addEventListener('click', (e) => {
+  const item = e.target.closest('.ticket-item');
+  if (!item || e.target.closest('.run-btn') || e.target.closest('.reorder-btn')) return;
+  showTicketDetail(item.dataset.id);
 });
+
+// ─── Resizable panels ───
+const MIN_PANEL = 150;
+const MAX_PANEL = 600;
+
+function initPanelResize() {
+  const saved = JSON.parse(localStorage.getItem('panel-widths') || 'null');
+  if (saved) {
+    document.body.style.setProperty('--sidebar-w', saved.sidebar + 'px');
+    document.body.style.setProperty('--artifacts-w', saved.artifacts + 'px');
+  }
+
+  setupHandle('handleL', '--sidebar-w', (e) => e.clientX);
+  setupHandle('handleR', '--artifacts-w', (e) => window.innerWidth - e.clientX);
+}
+
+function setupHandle(handleId, cssVar, calcWidth) {
+  const handle = document.getElementById(handleId);
+  let dragging = false;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    handle.classList.add('dragging');
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    function onMove(e) {
+      if (!dragging) return;
+      const w = Math.min(MAX_PANEL, Math.max(MIN_PANEL, calcWidth(e)));
+      document.body.style.setProperty(cssVar, w + 'px');
+    }
+
+    function onUp() {
+      dragging = false;
+      handle.classList.remove('dragging');
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      savePanelWidths();
+    }
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+function savePanelWidths() {
+  const style = getComputedStyle(document.body);
+  localStorage.setItem('panel-widths', JSON.stringify({
+    sidebar: parseInt(style.getPropertyValue('--sidebar-w')) || 280,
+    artifacts: parseInt(style.getPropertyValue('--artifacts-w')) || 320,
+  }));
+}
+
+initPanelResize();
 
 // ─── Init ───
 connectSSE();
+updateUsageWidget();
+fetch('/api/backlog').then(r=>r.json()).then(data => {
+  allTickets = data.all || [];
+  renderTicketList(data.all, data.actionable);
+});
 </script>
 </body>
 </html>

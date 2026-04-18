@@ -1,10 +1,10 @@
-# TosheLabs Pipeline — Project Configuration
-# Point this at any project with a JSON backlog + validation rules
+# TosheLabs Pipeline — Project Configuration (example)
+# Copy this file to `pipeline.config.yaml` and edit the paths for your project.
 
-name: busydad
-project_dir: /home/toshe/busydad
+name: my-project
+project_dir: /absolute/path/to/your/project
 
-# Backlog source (JSON)
+# Backlog source (JSON — see docs for shape)
 backlog_file: memory/backlog.json
 archive_file: memory/backlog-archive.json
 closed_bugs_file: memory/closed-bugs.json
@@ -15,7 +15,7 @@ validation_rules: memory/code_validation.md
 # Pipeline state
 pipeline_dir: memory/pipeline
 build_log_dir: memory/build-log
-code_lock: .claude/code.lock
+code_lock: code.lock
 
 # Context files (read at session start, injected into plan step)
 context_files:
@@ -27,31 +27,27 @@ context_files:
 
 # Environment (injected into every CLI call)
 environment:
-  PATH: "/home/toshe/tools/flutter/bin:${PATH}"
-  JAVA_HOME: "/usr/lib/jvm/java-17-openjdk-amd64"
+  PATH: "${PATH}"
 
 # Ticket filtering
 ticket_filter:
-  include_status: [requested, not_started, in_progress]
-  exclude_status: [done, v2, deferred, manual, moot, decided]
+  exclude_status: [done, v2, deferred, manual, moot, decided, subsumed]
   priority_order: [P0, P1, P2, P3]
   type_order: [bug, feature, enhancement, refactor, test, performance, ux]
 
 # Session management (Max plan)
 session:
   model: opus
-  monitor_model: haiku
-  usage_check_interval_sec: 120
   context_warning_pct: 75
   context_new_session_pct: 90
   max_turns_per_step: 30
 
 # Think loop
 think_loop:
-  max_rounds: 10
-  max_discards: 3
+  max_rounds: 2
+  max_discards: 1
 
-# Steps (ordered, configurable)
+# Steps (ordered, configurable). Each step drives one Claude session.
 steps:
   - name: plan
     prompt_template: prompts/plan.md
@@ -61,9 +57,11 @@ steps:
       - Glob
       - "Bash(git *)"
     think_loop: true
-    think_challenge: "Is this the simplest approach? Missing edge cases? Wrong abstraction? All affected code paths covered?"
+    think_challenge: "Missing files? Missing callers? Edge cases that will break at runtime? Implicit assumptions not stated? Will this plan produce code that passes review first time?"
+    inject_validation_rules: true
     model: opus
-    max_turns: 15
+    effort: high
+    max_turns: 25
     validation:
       - field: files_to_change
         rule: non_empty_array
@@ -85,7 +83,8 @@ steps:
       - "Bash(flutter *)"
       - "Bash(npm *)"
     think_loop: false
-    model: opus
+    inject_validation_rules: false
+    model: sonnet
     max_turns: 20
     validation:
       - field: outcome
@@ -96,9 +95,12 @@ steps:
         unless:
           field: outcome
           equals: existing_test_covers
+      - field: criteria_to_test_map
+        rule: covers_plan_criteria
 
   - name: implement
     prompt_template: prompts/implement.md
+    reuse_session: true   # reuses tests_red session — test files + failure output already in context
     tools:
       - Read
       - Grep
@@ -107,7 +109,9 @@ steps:
       - Write
     think_loop: true
     think_challenge: "Can the code be simpler? Missed edge cases? Clear naming? Breaks under concurrency/null/empty? Silent catch blocks?"
-    model: opus
+    inject_validation_rules: true
+    model: sonnet
+    effort: high
     max_turns: 30
     validation:
       - field: files_changed
@@ -120,12 +124,16 @@ steps:
     tools:
       - "Bash(flutter *)"
       - "Bash(npm *)"
+      - Read
+      - Edit
+      - Write
     think_loop: false
+    inject_validation_rules: false
     model: haiku
-    max_turns: 10
+    max_turns: 20
     validation:
-      - field: unit_tests.failed
-        rule: equals
+      - field: new_failures
+        rule: equals_or_missing
         value: 0
       - field: analyzer_errors
         rule: equals
@@ -133,14 +141,19 @@ steps:
 
   - name: review
     prompt_template: prompts/review.md
+    reuse_session: true   # reuses tests_green session — test output already in context
     tools:
       - Read
       - Grep
       - Glob
+      - Edit
+      - Write
     think_loop: true
-    think_challenge: "Did I miss a checklist item? Are findings real or false positives? Did I trace the full call chain before flagging?"
+    think_challenge: "Missed any checklist items? False positives? Unfixed findings that should have been fixed? Missing test coverage for new code paths?"
+    inject_validation_rules: true
     model: opus
-    max_turns: 15
+    effort: high
+    max_turns: 25
     validation:
       - field: checklist_items_checked
         rule: greater_than
@@ -154,9 +167,9 @@ steps:
       - Read
       - Grep
       - Glob
-    think_loop: true
-    think_challenge: "Is there a deeper cause? Better framing? More precise rule?"
-    model: opus
+    think_loop: false
+    inject_validation_rules: false
+    model: sonnet
     max_turns: 10
     condition:
       field: type
@@ -171,6 +184,7 @@ steps:
 
   - name: docs_update
     prompt_template: prompts/docs_update.md
+    reuse_session: true   # reuses root_cause session (or review session for features)
     tools:
       - Read
       - Grep
@@ -178,13 +192,17 @@ steps:
       - Edit
       - Write
     think_loop: false
-    model: opus
-    max_turns: 10
+    inject_validation_rules: false
+    model: sonnet
+    max_turns: 25
     validation:
       - field: files_updated
         rule: non_empty_array
+      - field: backlog_updated
+        rule: equals
+        value: true
 
 # Web UI
 server:
   port: 3847
-  host: localhost
+  host: "::"
