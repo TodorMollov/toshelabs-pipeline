@@ -509,21 +509,39 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const dir = this.config._resolved.pipelineDir;
     if (!existsSync(dir)) return [];
 
-    const { readdir } = await import('fs/promises');
+    const { readdir, stat } = await import('fs/promises');
     const files = await readdir(dir);
     const resumed = [];
+    const detectedAt = new Date().toISOString();
 
     for (const file of files) {
       if (!file.endsWith('.json')) continue;
-      const raw = await readFile(resolve(dir, file), 'utf-8');
+      const filePath = resolve(dir, file);
+      const raw = await readFile(filePath, 'utf-8');
       const state = JSON.parse(raw);
       if (state.status === 'in_progress') {
         const resumeStep = Object.entries(state.steps).find(
           ([, s]) => s.status !== 'done' && s.status !== 'not_applicable'
         );
         if (resumeStep) {
+          // Infer when the ticket was last touched — ticket JSON mtime is
+          // the best proxy for "pipeline last wrote something about you".
+          let strandedSince = state.started_at;
+          try {
+            const st = await stat(filePath);
+            strandedSince = st.mtime.toISOString();
+          } catch { /* keep started_at */ }
+
+          // Structured crash-detected event for the ops log and reports page.
+          this.emit('pipeline_crashed_detected', {
+            ticket: state.ticket,
+            last_step: resumeStep[0],
+            last_step_status: resumeStep[1]?.status || 'unknown',
+            stranded_since: strandedSince,
+            stranded_duration_sec: strandedSince ? Math.round((Date.now() - new Date(strandedSince).getTime()) / 1000) : null,
+            detected_at: detectedAt,
+          });
           this.emit('crash_recovery', { ticket: state.ticket, resumeFrom: resumeStep[0] });
-          // Create a minimal ticket object for the queue
           resumed.push({
             id: state.ticket,
             title: state.title,
@@ -536,6 +554,9 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       }
     }
 
+    if (resumed.length > 0) {
+      this.emit('pipeline_resumed', { count: resumed.length, tickets: resumed.map((t) => t.id) });
+    }
     return resumed;
   }
 

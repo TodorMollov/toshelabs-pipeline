@@ -5,6 +5,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket } from './backlog.js';
 import { Pipeline } from './pipeline.js';
+import { EventLogger } from './event-log.js';
 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -21,6 +22,10 @@ export async function startServer(config) {
   const eventLog = [];
   const MAX_LOG = 5000;
 
+  // Persistent ops log (NDJSON, one file per day in ops/). Survives restarts
+  // and is the authoritative source for the reports page.
+  const opsLogger = new EventLogger();
+
   emitter.on('*', () => {}); // no-op to prevent unhandled
 
   // Intercept all emits to log them
@@ -29,9 +34,29 @@ export async function startServer(config) {
     const entry = { event, data, timestamp: new Date().toISOString() };
     eventLog.push(entry);
     if (eventLog.length > MAX_LOG) eventLog.shift();
+    opsLogger.write(event, data);
     originalEmit(event, data);
     originalEmit('_sse', entry);
   };
+
+  // First event of every process: server boot. Reports page pairs this with
+  // the stranded tickets detected at pipeline start to infer crash causes.
+  emitter.emit('server_started', {
+    pid: process.pid,
+    node: process.version,
+    argv: process.argv.slice(2),
+  });
+
+  // Record the signal and then exit — don't swallow the signal, otherwise
+  // start.sh's `kill` won't actually stop the process.
+  const gracefulExit = (signal) => {
+    emitter.emit('server_stopping', { signal });
+    opsLogger.close();
+    // Small delay so the final write flushes before we exit.
+    setTimeout(() => process.exit(0), 50);
+  };
+  process.on('SIGTERM', () => gracefulExit('SIGTERM'));
+  process.on('SIGINT',  () => gracefulExit('SIGINT'));
 
   app.use(express.json());
 
@@ -225,6 +250,24 @@ export async function startServer(config) {
       res.json({ status: 'unlocked' });
     } else {
       res.json({ status: 'no_lock' });
+    }
+  });
+
+  // API: read persisted ops events (NDJSON) for the reports page.
+  // Query params: from=YYYY-MM-DD, to=YYYY-MM-DD, events=csv list, limit=N
+  app.get('/api/reports/events', async (req, res) => {
+    try {
+      const { from, to, events, limit } = req.query;
+      const wanted = events ? new Set(String(events).split(',').map(s => s.trim())) : null;
+      const entries = await opsLogger.readRange({
+        from: from || undefined,
+        to: to || undefined,
+        limit: limit ? Math.min(parseInt(limit, 10) || 5000, 50000) : 5000,
+        filter: wanted ? (e) => wanted.has(e.event) : undefined,
+      });
+      res.json({ count: entries.length, entries });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
     }
   });
 
