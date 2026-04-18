@@ -190,8 +190,11 @@ steps:
     model: haiku
     max_turns: 20
     validation:
+      # `equals` (not `equals_or_missing`) — forces the field to be present
+      # and zero. A missing field used to pass the gate silently, letting
+      # regression-introducing tickets slip through tests_green.
       - field: new_failures
-        rule: equals_or_missing
+        rule: equals
         value: 0
       - field: analyzer_errors
         rule: equals

@@ -74,6 +74,18 @@ export class Pipeline {
         } catch (err) {
           if (err.rateLimited) throw err; // bubble up — runWithRateLimitRetry handles the wait
           console.error(`[pipeline] ${ticket.id} failed: ${err.message}`);
+          // Persist the failure to the ticket state file so it doesn't
+          // remain in_progress forever and get re-queued as a "crashed"
+          // ticket on the next restart.
+          try {
+            const existing = await this.loadPipelineJson(ticket.id);
+            if (existing && existing.status === 'in_progress') {
+              existing.status = 'failed';
+              existing.failed_at = new Date().toISOString();
+              existing.failure_reason = err.message;
+              await this.savePipelineJson(ticket.id, existing);
+            }
+          } catch { /* best-effort */ }
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
           continue;
         }
@@ -389,16 +401,24 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         break;
       }
 
-      // Other blocked steps — halt cleanly
-      if (stepArtifactsFinal.status === 'blocked') {
+      // Other blocked/failed/crashed steps — halt cleanly and mark the
+      // TICKET (not just the step) so it stops accumulating as in_progress.
+      // Previously only 'blocked' was caught here; 'failed' (native
+      // tests_green regression) and 'crashed' (self-heal exhaustion) leaked
+      // through, leaving tickets in_progress on disk and piling up on each
+      // restart.
+      if (['blocked', 'failed', 'crashed'].includes(stepArtifactsFinal.status)) {
+        const stepStatus = stepArtifactsFinal.status;
         this.emit('ticket_blocked', {
           ticket: ticket.id,
           step: stepConfig.name,
+          stepStatus,
         });
-        console.log(`[blocked] ${ticket.id} halted at ${stepConfig.name}`);
-        pipelineState.status = 'blocked';
+        console.log(`[${stepStatus}] ${ticket.id} halted at ${stepConfig.name}`);
+        pipelineState.status = stepStatus === 'blocked' ? 'blocked' : 'failed';
         pipelineState.blocked_at = new Date().toISOString();
         pipelineState.blocked_step = stepConfig.name;
+        pipelineState.blocked_reason = stepArtifactsFinal.reason || `${stepConfig.name} returned ${stepStatus}`;
         await this.savePipelineJson(ticket.id, pipelineState);
         break;
       }
