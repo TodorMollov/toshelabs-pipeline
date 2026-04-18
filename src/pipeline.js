@@ -927,20 +927,25 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     const tc = profile.test_commands || {};
 
     const runPhase = (spec) => {
-      if (!spec) return { output: '', exitCode: 0 };
+      if (!spec) return { output: '', exitCode: 0, skipped: true };
       const cwd = spec.cwd ? resolve(projectDir, spec.cwd) : projectDir;
-      const timeout = (spec.timeout_sec || 300) * 1000;
+      const timeout = (spec.timeout_sec || 600) * 1000; // default 10 min — test suites can be slow
       try {
-        return { output: execSync(`${spec.cmd} 2>&1`, { cwd, encoding: 'utf-8', env, timeout }), exitCode: 0 };
+        const out = execSync(`${spec.cmd} 2>&1`, { cwd, encoding: 'utf-8', env, timeout, maxBuffer: 50 * 1024 * 1024 });
+        return { output: out, exitCode: 0, skipped: false };
       } catch (err) {
-        return { output: err.stdout || err.message, exitCode: err.status || 1 };
+        return { output: err.stdout || err.message, exitCode: err.status || 1, skipped: false };
       }
     };
 
     // --- Unit tests ---
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'unit_tests' });
-    console.log(`[tests_green] Running unit tests (${tc.unit?.cmd || 'not configured'})...`);
-    const { output: testOutput } = runPhase(tc.unit);
+    if (!tc.unit) {
+      console.warn(`[tests_green] WARNING: project_profile.test_commands.unit is not configured — no unit tests will run for ${ticket.id}.`);
+    } else {
+      console.log(`[tests_green] Running unit tests (${tc.unit.cmd})...`);
+    }
+    const { output: testOutput, exitCode: testExitCode, skipped: unitSkipped } = runPhase(tc.unit);
 
     let passed = 0, failed = 0;
     const statsRe = tc.unit?.stats_pattern ? new RegExp(tc.unit.stats_pattern, 'g') : /\+(\d+)\s+-(\d+):\s/g;
@@ -964,6 +969,15 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     const baselineSet = new Set(baseline);
     const newFailures = failedTests.filter((t) => !baselineSet.has(t)).length;
 
+    // Detect silent failures: non-zero exit with no parseable stats ⇒ the
+    // runner crashed before producing a summary. Don't let that slip through
+    // as a green pass.
+    let unitCrashed = false;
+    if (!unitSkipped && testExitCode !== 0 && matches.length === 0) {
+      unitCrashed = true;
+      console.error(`[tests_green] unit runner crashed (exit ${testExitCode}) with no parseable stats. Output head: ${testOutput.slice(0, 500)}`);
+    }
+
     // --- Analyzer ---
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'analyzer' });
     let analyzeOutput = '';
@@ -981,30 +995,33 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     }
 
-    // --- Extra phases (e.g. backend), conditional on file-path prefix ---
+    // --- Extra phases (e.g. backend, integration), each conditional on file-path prefix ---
     const implFiles = pipelineState.steps.implement?.files_changed || [];
     const implPaths = implFiles.map((f) => (typeof f === 'object' ? f.path : f));
-    let backendOutput = '';
-    for (const [phase, spec] of Object.entries(tc)) {
-      if (phase === 'unit' || phase === 'analyzer') continue;
+    let extraOutput = '';
+    for (const [phase, spec] of Object.entries(tc.extras || {})) {
       const prefix = spec.trigger_file_prefix;
       if (prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
-      console.log(`[tests_green] Running ${phase} tests (${spec.cmd})...`);
-      backendOutput += runPhase(spec).output + '\n';
+      console.log(`[tests_green] Running ${phase} (${spec.cmd})...`);
+      const r = runPhase(spec);
+      extraOutput += `--- ${phase} (exit ${r.exitCode}) ---\n${r.output}\n`;
     }
 
     // Write results
     const step = {
-      status: newFailures > 0 ? 'failed' : 'done',
+      status: (newFailures > 0 || unitCrashed) ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: failed === 0,
+      all_pass: failed === 0 && !unitCrashed,
       unit_tests: { passed, failed, skipped: 0 },
+      unit_crashed: unitCrashed,
+      unit_exit_code: testExitCode,
       analyzer_errors: analyzerErrors,
       failed_tests: failedTests,
       baseline_failures: baseline,
       new_failures: newFailures,
       test_output_summary: testOutput.split('\n').slice(-5).join('\n').trim(),
       analyze_output_summary: analyzeOutput.split('\n').slice(-3).join('\n').trim(),
+      extra_output_summary: extraOutput ? extraOutput.split('\n').slice(-5).join('\n').trim() : undefined,
       native_step: true,
     };
 

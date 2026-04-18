@@ -83,13 +83,17 @@ function renderTestCommands(config) {
   const tc = config.project_profile?.test_commands;
   if (!tc) return '(no test commands configured — run tests via your project conventions)';
   const lines = [];
-  let n = 1;
-  for (const [phase, spec] of Object.entries(tc)) {
-    const cwd = spec.cwd ? `cd {{project_dir}}/${spec.cwd} && ` : '';
-    const cond = spec.when ? ` (${spec.when})` : '';
-    lines.push(`${n++}. ${cwd}${spec.cmd}${cond}`);
+  const emit = (spec, note = '') => {
+    const cwd = spec.cwd ? `cd ${config.project_dir}/${spec.cwd} && ` : '';
+    lines.push(`- ${cwd}${spec.cmd}${note}`);
+  };
+  if (tc.unit) emit(tc.unit);
+  if (tc.analyzer) emit(tc.analyzer);
+  for (const [name, spec] of Object.entries(tc.extras || {})) {
+    const note = spec.trigger_file_prefix ? ` (only if implement touched ${spec.trigger_file_prefix})` : '';
+    emit(spec, note);
   }
-  return lines.join('\n');
+  return lines.length ? lines.join('\n') : '(no test commands configured)';
 }
 
 function getDefaultTemplate(stepName) {
