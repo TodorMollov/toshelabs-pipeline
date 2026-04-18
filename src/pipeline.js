@@ -917,85 +917,80 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
 
   async runTestsGreen(ticket, pipelineState) {
     const projectDir = this.config.project_dir;
-    const appDir = resolve(projectDir, 'app');
     const env = { ...process.env };
-    // Expand environment from config
     for (const [k, v] of Object.entries(this.config.environment || {})) {
       env[k] = String(v).replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '');
     }
 
     const baseline = pipelineState.steps.tests_red?.baseline_failures || [];
+    const profile = this.config.project_profile || {};
+    const tc = profile.test_commands || {};
 
-    // Run unit tests
+    const runPhase = (spec) => {
+      if (!spec) return { output: '', exitCode: 0 };
+      const cwd = spec.cwd ? resolve(projectDir, spec.cwd) : projectDir;
+      const timeout = (spec.timeout_sec || 300) * 1000;
+      try {
+        return { output: execSync(`${spec.cmd} 2>&1`, { cwd, encoding: 'utf-8', env, timeout }), exitCode: 0 };
+      } catch (err) {
+        return { output: err.stdout || err.message, exitCode: err.status || 1 };
+      }
+    };
+
+    // --- Unit tests ---
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'unit_tests' });
-    console.log(`[tests_green] Running flutter test...`);
-    let testOutput = '';
-    let testExitCode = 0;
-    try {
-      testOutput = execSync('flutter test test/unit/ 2>&1', {
-        cwd: appDir, encoding: 'utf-8', env, timeout: 600000,
-      });
-    } catch (err) {
-      testOutput = err.stdout || err.message;
-      testExitCode = err.status || 1;
-    }
+    console.log(`[tests_green] Running unit tests (${tc.unit?.cmd || 'not configured'})...`);
+    const { output: testOutput } = runPhase(tc.unit);
 
-    // Parse test results from last line: "00:42 +1372 -9: Some tests failed."
-    const testMatch = testOutput.match(/\+(\d+)\s+-(\d+):\s/g);
-    const lastMatch = testMatch?.[testMatch.length - 1];
     let passed = 0, failed = 0;
-    if (lastMatch) {
-      const m = lastMatch.match(/\+(\d+)\s+-(\d+)/);
-      passed = parseInt(m[1]);
-      failed = parseInt(m[2]);
+    const statsRe = tc.unit?.stats_pattern ? new RegExp(tc.unit.stats_pattern, 'g') : /\+(\d+)\s+-(\d+):\s/g;
+    const matches = [...testOutput.matchAll(statsRe)];
+    if (matches.length) {
+      const last = matches[matches.length - 1];
+      passed = parseInt(last[1] || '0');
+      failed = parseInt(last[2] || '0');
     }
 
-    // Extract failed test names
     const failedTests = [];
+    const failRe = tc.unit?.failed_name_pattern ? new RegExp(tc.unit.failed_name_pattern) : /:\s+(.+?)\s+\[E\]/;
+    const failLineMarker = tc.unit?.failed_line_marker || '[E]';
     for (const line of testOutput.split('\n')) {
-      if (line.includes('[E]') && line.includes(':')) {
-        const nameMatch = line.match(/:\s+(.+?)\s+\[E\]/);
-        if (nameMatch) failedTests.push(nameMatch[1].trim());
+      if (line.includes(failLineMarker) && line.includes(':')) {
+        const m = line.match(failRe);
+        if (m) failedTests.push(m[1].trim());
       }
     }
 
-    // Count new failures (not in baseline)
     const baselineSet = new Set(baseline);
     const newFailures = failedTests.filter((t) => !baselineSet.has(t)).length;
 
-    // Run analyzer
+    // --- Analyzer ---
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'analyzer' });
-    console.log(`[tests_green] Running flutter analyze...`);
     let analyzeOutput = '';
     let analyzerErrors = 0;
-    try {
-      analyzeOutput = execSync('flutter analyze 2>&1', {
-        cwd: appDir, encoding: 'utf-8', env, timeout: 120000,
-      });
-    } catch (err) {
-      analyzeOutput = err.stdout || err.message;
-    }
-
-    if (analyzeOutput.includes('No issues found')) {
-      analyzerErrors = 0;
-    } else {
-      const errMatch = analyzeOutput.match(/(\d+)\s+issue/);
-      analyzerErrors = errMatch ? parseInt(errMatch[1]) : (analyzeOutput.includes('error') ? 1 : 0);
-    }
-
-    // Run backend tests if any backend files changed
-    const implFiles = pipelineState.steps.implement?.files_changed || [];
-    const hasBackend = implFiles.some((f) => (typeof f === 'object' ? f.path : f).startsWith('backend/'));
-    let backendOutput = '';
-    if (hasBackend) {
-      console.log(`[tests_green] Running backend tests...`);
-      try {
-        backendOutput = execSync('npm test 2>&1', {
-          cwd: resolve(projectDir, 'backend/functions'), encoding: 'utf-8', env, timeout: 120000,
-        });
-      } catch (err) {
-        backendOutput = err.stdout || err.message;
+    if (tc.analyzer) {
+      console.log(`[tests_green] Running analyzer (${tc.analyzer.cmd})...`);
+      analyzeOutput = runPhase(tc.analyzer).output;
+      const ok = tc.analyzer.success_marker || 'No issues found';
+      if (analyzeOutput.includes(ok)) {
+        analyzerErrors = 0;
+      } else {
+        const issueRe = tc.analyzer.issue_pattern ? new RegExp(tc.analyzer.issue_pattern) : /(\d+)\s+issue/;
+        const m = analyzeOutput.match(issueRe);
+        analyzerErrors = m ? parseInt(m[1]) : (analyzeOutput.includes('error') ? 1 : 0);
       }
+    }
+
+    // --- Extra phases (e.g. backend), conditional on file-path prefix ---
+    const implFiles = pipelineState.steps.implement?.files_changed || [];
+    const implPaths = implFiles.map((f) => (typeof f === 'object' ? f.path : f));
+    let backendOutput = '';
+    for (const [phase, spec] of Object.entries(tc)) {
+      if (phase === 'unit' || phase === 'analyzer') continue;
+      const prefix = spec.trigger_file_prefix;
+      if (prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
+      console.log(`[tests_green] Running ${phase} tests (${spec.cmd})...`);
+      backendOutput += runPhase(spec).output + '\n';
     }
 
     // Write results

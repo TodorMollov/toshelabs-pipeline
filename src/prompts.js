@@ -71,9 +71,25 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     )
     .replace(/\{\{backlog_path\}\}/g, config._resolved.backlog)
     .replace(/\{\{project_dir\}\}/g, config.project_dir)
-    .replace(/\{\{pipeline_dir\}\}/g, config._resolved.pipelineDir);
+    .replace(/\{\{pipeline_dir\}\}/g, config._resolved.pipelineDir)
+    .replace(/\{\{tech_stack_hints\}\}/g, config.project_profile?.tech_stack_hints || 'use the project conventions')
+    .replace(/\{\{test_commands\}\}/g, renderTestCommands(config))
+    .replace(/\{\{docs_check_files\}\}/g, (config.project_profile?.docs_check_files || []).map((f, i) => `${i+1}. ${f}`).join('\n') || '(none configured)');
 
   return template;
+}
+
+function renderTestCommands(config) {
+  const tc = config.project_profile?.test_commands;
+  if (!tc) return '(no test commands configured — run tests via your project conventions)';
+  const lines = [];
+  let n = 1;
+  for (const [phase, spec] of Object.entries(tc)) {
+    const cwd = spec.cwd ? `cd {{project_dir}}/${spec.cwd} && ` : '';
+    const cond = spec.when ? ` (${spec.when})` : '';
+    lines.push(`${n++}. ${cwd}${spec.cmd}${cond}`);
+  }
+  return lines.join('\n');
 }
 
 function getDefaultTemplate(stepName) {
@@ -97,7 +113,7 @@ PLAN STEP:
 5. Identify edge cases
 6. Define test strategy
 
-For features: check if we need model, repository, DAO, service, provider, widget, tests, backend.
+For features: {{tech_stack_hints}}
 For schema changes: flag if a numbered migration is needed.
 New dependencies: STOP and report.
 
@@ -119,7 +135,7 @@ ${EFFICIENCY_RULE}
 TESTS RED STEP:
 1. Read plan from PIPELINE STATE
 2. Grep for existing tests covering this behavior
-3. If none: write new tests (bugs: test the CLASS; UI: widget tests)
+3. If none: write new tests (bugs: test the CLASS; UI: matching surface test)
 4. Record test count BEFORE adding tests
 5. Run tests — must FAIL
 6. Run full suite BEFORE changes to capture baseline_failures
@@ -160,10 +176,10 @@ PIPELINE STATE: {{pipeline_state}}
 
 TESTS GREEN — run tests and write JSON. Nothing else.
 
-1. cd {{project_dir}}/app && flutter test test/unit/
-2. cd {{project_dir}}/app && flutter analyze
-3. If backend files changed: cd {{project_dir}}/backend/functions && npm test
-4. Write {{pipeline_dir}}/{{ticket_id}}.json immediately:
+Test commands (run in order):
+{{test_commands}}
+
+Then write {{pipeline_dir}}/{{ticket_id}}.json immediately:
 
 steps.tests_green = {
   "status": "done",
@@ -187,7 +203,7 @@ WORK (do all of this, but don't narrate):
 1. Read every file in steps.implement.files_changed
 2. If steps.implement.files_skipped exists — verify EVERY skip. For each skipped file:
    a. Read the skipped file.
-   b. Look at the plan's what_to_do for that file — extract the key nouns/verbs (e.g. "showDialog", "create.*entry", the widget class name).
+   b. Look at the plan's what_to_do for that file — extract the key nouns/verbs (e.g. function/class names, behaviors).
    c. Grep the skipped file for those terms. If the functionality is NOT present, the skip is false — add a BLOCKING finding: "file_path: plan required [what_to_do] but file has no matching code."
    d. A skip reason of "Already implemented" is only valid if the grep proves the code exists.
 3. Run the full 16-point checklist: parameter completeness, client/server consistency, test coverage, state preservation, error handling, race conditions, code duplication, serialization, multiple paths, UX targets, save-reload, plan coverage
@@ -232,7 +248,8 @@ Check and update if applicable (skip silently if N/A):
 2. memory/ARCHITECTURE.md — if architecture changed
 3. memory/DATA_MODEL.md — if data model changed
 4. memory/FLOWS.md — if user flows changed
-5. help_screen.dart — if user-facing behavior changed
+5. Project-specific docs (from config.project_profile.docs_check_files):
+{{docs_check_files}}
 6. Grep for stale hints/tooltips referencing old behavior
 7. memory/code_validation.md — if new coding rule from root_cause
 

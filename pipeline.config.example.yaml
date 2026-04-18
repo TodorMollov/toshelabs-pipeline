@@ -29,6 +29,53 @@ context_files:
 environment:
   PATH: "${PATH}"
 
+# Project-specific assumptions — used by prompts and the tests_green runner.
+# Everything the pipeline needs to know about your toolchain goes here.
+project_profile:
+  # One-line summary injected into the plan prompt. Guides what kinds of
+  # components the plan should consider (e.g. "Flutter/Dart app with
+  # Firebase backend — consider model, repository, provider, widget, tests").
+  tech_stack_hints: "describe your stack in one line"
+
+  # Extra files the docs_update step should check for staleness (beyond
+  # the standard memory/SPEC.md, ARCHITECTURE.md, DATA_MODEL.md, FLOWS.md).
+  docs_check_files:
+    # - app/lib/help_screen.dart  — user-facing text
+    # - docs/public-api.md        — API surface
+
+  # Commands run by the built-in tests_green runner. Each phase has:
+  #   cmd              — shell command (run with `2>&1`)
+  #   cwd              — relative to project_dir (optional)
+  #   timeout_sec      — per-phase timeout (default 300)
+  #   trigger_file_prefix — (non-unit/analyzer phases only) only run
+  #                          if implement changed a file under this prefix
+  #   stats_pattern    — (unit only) regex capturing (passed,failed).
+  #                      Matched with /g; the LAST match is used.
+  #   failed_name_pattern — (unit only) regex capturing the failing test name
+  #   failed_line_marker  — (unit only) substring that flags a failed line
+  #   success_marker   — (analyzer only) substring that means "clean"
+  #   issue_pattern    — (analyzer only) regex capturing issue count
+  test_commands:
+    # Example for a Flutter/Dart + Firebase Cloud Functions project:
+    # unit:
+    #   cmd: "flutter test test/unit/"
+    #   cwd: app
+    #   timeout_sec: 600
+    #   stats_pattern: "\\+(\\d+)\\s+-(\\d+):\\s"
+    #   failed_name_pattern: ":\\s+(.+?)\\s+\\[E\\]"
+    #   failed_line_marker: "[E]"
+    # analyzer:
+    #   cmd: "flutter analyze"
+    #   cwd: app
+    #   timeout_sec: 120
+    #   success_marker: "No issues found"
+    #   issue_pattern: "(\\d+)\\s+issue"
+    # backend:
+    #   cmd: "npm test"
+    #   cwd: backend/functions
+    #   timeout_sec: 120
+    #   trigger_file_prefix: "backend/"
+
 # Ticket filtering
 ticket_filter:
   exclude_status: [done, v2, deferred, manual, moot, decided, subsumed]
