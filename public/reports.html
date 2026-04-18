@@ -85,6 +85,10 @@
   .bar-row .count { color: var(--text-muted); text-align: right; font-family: ui-monospace, monospace; }
 
   .empty { color: var(--text-muted); font-style: italic; padding: 16px; text-align: center; }
+  tr.group-header td { background: var(--panel-2); padding: 10px 12px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; user-select: none; border-bottom: 1px solid var(--border); }
+  tr.group-header .caret { display: inline-block; width: 10px; color: var(--text-muted); }
+  tr.group-header .group-count { color: var(--text-muted); font-weight: 400; margin-left: 8px; }
+  tr.ticket-row.collapsed, tr.drill.collapsed { display: none; }
   .filters { display: flex; gap: 8px; padding: 8px 16px; background: var(--panel-2); border-bottom: 1px solid var(--border); }
   .filters input, .filters select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-size: 12px; }
   .filters input { flex: 1; max-width: 280px; }
@@ -281,6 +285,12 @@ function renderStepDist() {
   document.getElementById('stepDist').innerHTML = rows ? rows + legend : '<div class="empty">no step data</div>';
 }
 
+// Group ordering: most-actionable first. Collapsed-by-default groups
+// avoid burying the important stuff.
+const STATUS_ORDER = ['in_progress', 'blocked', 'failed', 'requested', 'planning', 'done'];
+const STATUS_COLLAPSED_BY_DEFAULT = new Set(['done']);
+state.collapsedGroups = state.collapsedGroups || new Set(STATUS_COLLAPSED_BY_DEFAULT);
+
 function renderTickets() {
   const ft = document.getElementById('filterText').value.toLowerCase();
   const fs = document.getElementById('filterStatus').value;
@@ -306,14 +316,27 @@ function renderTickets() {
     document.getElementById('ticketsBody').innerHTML = '<tr><td colspan="8" class="empty">no tickets match</td></tr>';
     return;
   }
-  document.getElementById('ticketsBody').innerHTML = rows.map(t => {
+
+  // Group by status
+  const groups = {};
+  for (const t of rows) {
+    const s = t.status || 'unknown';
+    (groups[s] = groups[s] || []).push(t);
+  }
+  const groupNames = Object.keys(groups).sort((a, b) => {
+    const ai = STATUS_ORDER.indexOf(a); const bi = STATUS_ORDER.indexOf(b);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  const ticketRow = (t, groupName) => {
     const steps = STEP_ORDER.map(s => {
       const status = t.steps[s];
       if (!status) return `<div class="step-dot" title="${s}: not run"></div>`;
       return `<div class="step-dot ${status}" title="${s}: ${status}"></div>`;
     }).join('');
     const pri = t.priority ? `<span class="pri pri-${t.priority}">${t.priority}</span>` : '';
-    return `<tr class="ticket-row" data-id="${esc(t.id)}">
+    const collapsed = state.collapsedGroups.has(groupName) ? ' collapsed' : '';
+    return `<tr class="ticket-row${collapsed}" data-id="${esc(t.id)}" data-group="${esc(groupName)}">
       <td class="id">${esc(t.id)}</td>
       <td>${esc(t.title).slice(0,80)}</td>
       <td>${pri}</td>
@@ -323,7 +346,7 @@ function renderTickets() {
       <td><div class="steps">${steps}</div></td>
       <td>${fmtDate(t.completed_at || t.started_at)}</td>
     </tr>
-    <tr class="drill" data-drill="${esc(t.id)}"><td colspan="8">
+    <tr class="drill${collapsed}" data-drill="${esc(t.id)}" data-group="${esc(groupName)}"><td colspan="8">
       <div class="drill-grid">
         <div class="head">Step</div><div class="head">Status</div><div class="head">Notes</div>
         ${STEP_ORDER.map(s => {
@@ -333,11 +356,32 @@ function renderTickets() {
       </div>
       <div style="margin-top:10px"><a href="/api/pipeline/${encodeURIComponent(t.id)}" target="_blank">raw state JSON →</a></div>
     </td></tr>`;
-  }).join('');
+  };
 
-  // Wire drill-down toggle
-  document.querySelectorAll('tr.ticket-row').forEach(row => {
+  let html = '';
+  for (const g of groupNames) {
+    const isCollapsed = state.collapsedGroups.has(g);
+    html += `<tr class="group-header" data-group="${esc(g)}">
+      <td colspan="8"><span class="caret">${isCollapsed ? '▸' : '▾'}</span> <span class="status-${g}">${esc(g)}</span><span class="group-count">${groups[g].length}</span></td>
+    </tr>`;
+    html += groups[g].map(t => ticketRow(t, g)).join('');
+  }
+  document.getElementById('ticketsBody').innerHTML = html;
+
+  // Wire group-header toggle
+  document.querySelectorAll('tr.group-header').forEach(row => {
     row.addEventListener('click', () => {
+      const g = row.dataset.group;
+      if (state.collapsedGroups.has(g)) state.collapsedGroups.delete(g);
+      else state.collapsedGroups.add(g);
+      renderTickets();
+    });
+  });
+
+  // Wire drill-down toggle (stop propagation to avoid collapsing group)
+  document.querySelectorAll('tr.ticket-row').forEach(row => {
+    row.addEventListener('click', (e) => {
+      e.stopPropagation();
       const id = row.dataset.id;
       const drill = document.querySelector(`tr[data-drill="${id}"]`);
       if (drill) drill.classList.toggle('open');
