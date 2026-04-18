@@ -999,29 +999,44 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     const implFiles = pipelineState.steps.implement?.files_changed || [];
     const implPaths = implFiles.map((f) => (typeof f === 'object' ? f.path : f));
     let extraOutput = '';
+    const extraFailures = [];
     for (const [phase, spec] of Object.entries(tc.extras || {})) {
       const prefix = spec.trigger_file_prefix;
       if (prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
       console.log(`[tests_green] Running ${phase} (${spec.cmd})...`);
       const r = runPhase(spec);
-      extraOutput += `--- ${phase} (exit ${r.exitCode}) ---\n${r.output}\n`;
+      // Keep per-phase tail in the summary (don't truncate after concat).
+      const phaseTail = r.output.split('\n').slice(-8).join('\n');
+      extraOutput += `--- ${phase} (exit ${r.exitCode}) ---\n${phaseTail}\n`;
+      // Non-zero extras must fail the step — no silent greens. Users who
+      // truly want an optional phase can guard it via trigger_file_prefix.
+      if (r.exitCode !== 0) extraFailures.push({ phase, exitCode: r.exitCode });
     }
 
-    // Write results
+    // Suspicious: ran unit but saw zero tests total (command ran but no
+    // results). Common cause: wrong cwd, wrong test path, empty glob.
+    const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed;
+    if (unitRanNothing) {
+      console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${testExitCode}. Tail: ${testOutput.slice(-500)}`);
+    }
+
+    const failed_ = (newFailures > 0) || unitCrashed || extraFailures.length > 0;
     const step = {
-      status: (newFailures > 0 || unitCrashed) ? 'failed' : 'done',
+      status: failed_ ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: failed === 0 && !unitCrashed,
+      all_pass: failed === 0 && !unitCrashed && extraFailures.length === 0,
       unit_tests: { passed, failed, skipped: 0 },
       unit_crashed: unitCrashed,
       unit_exit_code: testExitCode,
+      unit_ran_nothing: unitRanNothing,
       analyzer_errors: analyzerErrors,
       failed_tests: failedTests,
       baseline_failures: baseline,
       new_failures: newFailures,
+      extra_failures: extraFailures,
       test_output_summary: testOutput.split('\n').slice(-5).join('\n').trim(),
       analyze_output_summary: analyzeOutput.split('\n').slice(-3).join('\n').trim(),
-      extra_output_summary: extraOutput ? extraOutput.split('\n').slice(-5).join('\n').trim() : undefined,
+      extra_output_summary: extraOutput ? extraOutput.trim() : undefined,
       native_step: true,
     };
 
