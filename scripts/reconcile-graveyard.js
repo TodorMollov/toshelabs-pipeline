@@ -33,6 +33,14 @@ const opts = {
   dryRun: !args.includes('--commit'),
   includeInProgress: args.includes('--include-in-progress'),
   unattributed: 'list', // 'commit' | 'skip' | 'list'
+  // META-001 Phase 2: by default the reconciler only attributes files to
+  // tickets that are FULLY complete (status=done + every sub-step terminal-OK).
+  // Blocked/failed tickets are excluded; their files stay dirty until the
+  // pipeline re-runs them to completion. Pass --allow-partial to override
+  // (emergency-only: it re-enables the legacy behaviour that caused
+  // commits like 4d7811a and 8d657bf to land partial/misattributed work).
+  allowPartial: args.includes('--allow-partial'),
+  unattributedCap: 10, // files — above this, refuse to create a mega-commit without --allow-partial
 };
 const configIdx = args.indexOf('--config');
 if (configIdx >= 0) opts.config = args[configIdx + 1];
@@ -80,7 +88,31 @@ function collectDeclaredFiles(state) {
   return out;
 }
 
-const fileOwners = new Map(); // path → [{ id, title, status, completed_at }]
+// META-001 Phase 2: a ticket is "fully complete" only if its top-level status
+// is 'done' AND every sub-step reached a terminal-OK state AND no blocked_at
+// is set. The previous behaviour treated 'blocked' tickets as eligible for
+// commit attribution, which — combined with pipeline.js:644 silently
+// overwriting blocked→done — produced the 4d7811a/8d657bf bad commits.
+const TERMINAL_OK = new Set(['done', 'not_applicable', 'skipped']);
+function isFullyComplete(state) {
+  if (state.status !== 'done') return false;
+  if (state.blocked_at) return false;
+  for (const step of Object.values(state.steps || {})) {
+    if (!step || !TERMINAL_OK.has(step.status)) return false;
+  }
+  return true;
+}
+function describeIncomplete(state) {
+  if (state.blocked_at) return `blocked_at=${state.blocked_at} step=${state.blocked_step || '?'}`;
+  if (state.status !== 'done') return `status=${state.status}`;
+  const bad = Object.entries(state.steps || {})
+    .filter(([, s]) => !s || !TERMINAL_OK.has(s.status))
+    .map(([n, s]) => `${n}=${s?.status ?? 'missing'}`)
+    .join(', ');
+  return bad || 'unknown';
+}
+
+const fileOwners = new Map(); // path → [{ id, title, status, completed_at, fullyComplete, incompleteReason }]
 for (const t of tickets) {
   const files = collectDeclaredFiles(t);
   for (const p of files) {
@@ -89,6 +121,8 @@ for (const t of tickets) {
       title: t.title || '',
       status: t.status,
       completed_at: t.completed_at || null,
+      fullyComplete: isFullyComplete(t),
+      incompleteReason: isFullyComplete(t) ? null : describeIncomplete(t),
     };
     if (!fileOwners.has(p)) fileOwners.set(p, []);
     fileOwners.get(p).push(entry);
@@ -124,6 +158,7 @@ function pickOwner(candidates) {
 const byTicket = new Map(); // ticketId → { ticket, files[], conflicts[] }
 const unattributed = [];
 const skippedInProgress = []; // files owned only by in_progress tickets
+const skippedPartial = []; // META-001 Phase 2: files owned only by incomplete/blocked tickets
 
 for (const [path, code] of dirty) {
   const candidates = fileOwners.get(path) || [];
@@ -131,11 +166,25 @@ for (const [path, code] of dirty) {
     unattributed.push({ path, code });
     continue;
   }
-  const completed = candidates.filter((c) => c.status === 'done' || c.status === 'blocked');
-  const pool = completed.length > 0 ? completed
+  // META-001 Phase 2: default is fullyComplete-only. --allow-partial re-enables
+  // the legacy pool that accepted blocked tickets.
+  const eligiblePool = opts.allowPartial
+    ? candidates.filter((c) => c.status === 'done' || c.status === 'blocked')
+    : candidates.filter((c) => c.fullyComplete);
+  const pool = eligiblePool.length > 0 ? eligiblePool
     : (opts.includeInProgress ? candidates : []);
   if (pool.length === 0) {
-    skippedInProgress.push({ path, code, owners: candidates.map((c) => `${c.id}(${c.status})`) });
+    // Split skipped reasons so operators can see WHY a file was left dirty.
+    const partialOwners = candidates.filter((c) => !c.fullyComplete && c.status !== 'in_progress');
+    if (partialOwners.length > 0 && !opts.allowPartial) {
+      skippedPartial.push({
+        path,
+        code,
+        owners: partialOwners.map((c) => `${c.id}(${c.incompleteReason})`),
+      });
+    } else {
+      skippedInProgress.push({ path, code, owners: candidates.map((c) => `${c.id}(${c.status})`) });
+    }
     continue;
   }
   const winner = pickOwner(pool);
@@ -161,10 +210,12 @@ const ticketOrder = [...byTicket.keys()].sort((a, b) => {
 
 console.log(`\n=== Graveyard reconciliation plan ===`);
 console.log(`project_dir:    ${projectDir}`);
+console.log(`mode:           ${opts.allowPartial ? 'ALLOW-PARTIAL (legacy, unsafe)' : 'strict (fully-complete tickets only)'}`);
 console.log(`dirty files:    ${dirty.size}`);
 console.log(`ticketed:       ${[...byTicket.values()].reduce((n, b) => n + b.files.length, 0)}`);
 console.log(`unattributed:   ${unattributed.length}`);
-console.log(`skipped (live): ${skippedInProgress.length}\n`);
+console.log(`skipped (live): ${skippedInProgress.length}`);
+console.log(`skipped (partial/blocked): ${skippedPartial.length}\n`);
 
 for (const id of ticketOrder) {
   const b = byTicket.get(id);
@@ -184,10 +235,34 @@ if (skippedInProgress.length) {
   console.log();
 }
 
+if (skippedPartial.length) {
+  console.log(`--- Skipped: owned only by PARTIAL/BLOCKED tickets (META-001 Phase 2 gate) ---`);
+  console.log(`These tickets did not complete every sub-step. Committing their files`);
+  console.log(`would ship partial/unreviewed work under a 'done' label. Re-run the`);
+  console.log(`pipeline on the ticket until it completes, or pass --allow-partial to`);
+  console.log(`bypass (legacy behaviour — unsafe).\n`);
+  for (const f of skippedPartial) console.log(`  ${f.code.padEnd(2)} ${f.path}  [${f.owners.join(', ')}]`);
+  console.log();
+}
+
 if (unattributed.length) {
   console.log(`--- Unattributed: no ticket claims these files ---`);
   for (const f of unattributed) console.log(`  ${f.code.padEnd(2)} ${f.path}`);
-  console.log(`\n(--unattributed=${opts.unattributed}: ${opts.unattributed === 'commit' ? 'will be committed as one "graveyard-unattributed" commit' : opts.unattributed === 'skip' ? 'will be left uncommitted' : 'listed only — will not touch these'})\n`);
+  console.log(`\n(--unattributed=${opts.unattributed}: ${opts.unattributed === 'commit' ? 'will be committed as one "graveyard-unattributed" commit' : opts.unattributed === 'skip' ? 'will be left uncommitted' : 'listed only — will not touch these'})`);
+  // META-001 Phase 2: cap the unattributed mega-commit to prevent another
+  // 56-file, 6117-line dump like 4d7811a. Above the cap, require --allow-partial.
+  if (opts.unattributed === 'commit' && unattributed.length > opts.unattributedCap && !opts.allowPartial) {
+    console.log(`\n⛔ REFUSING: unattributed bucket (${unattributed.length} files) exceeds cap (${opts.unattributedCap}).`);
+    console.log(`   A large unattributed commit means many files aren't tied to any ticket —`);
+    console.log(`   meaning no plan, no review, no acceptance criteria. This is how 4d7811a`);
+    console.log(`   (56 files, 'Review manually') happened. Resolve by:`);
+    console.log(`     (a) tying files to tickets (update pipelineState.steps.*.files_changed), or`);
+    console.log(`     (b) reverting/removing files that shouldn't be on disk, or`);
+    console.log(`     (c) passing --allow-partial to bypass (documented emergency only).\n`);
+    // Downgrade unattributed to 'list' mode for this run.
+    opts.unattributed = 'list';
+  }
+  console.log();
 }
 
 if (opts.dryRun) {

@@ -640,10 +640,51 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     // Persist report alongside pipeline JSON
     pipelineState.report = report;
 
-    // Mark ticket pipeline as done
-    pipelineState.status = 'done';
-    pipelineState.completed_at = new Date().toISOString();
-    await this.savePipelineJson(ticket.id, pipelineState);
+    // META-001 Phase 1: guard ticket completion so blocked/failed state is
+    // never silently overwritten. Previously this block unconditionally set
+    // status='done', which clobbered the 'blocked'/'failed' status set by
+    // the in-loop break on lines 550/571 — producing the pattern where
+    // blocked_at and completed_at land within milliseconds of each other
+    // and partial work gets committed under a 'done' label.
+    //
+    // Terminal step statuses that count as completed: done, not_applicable, skipped.
+    // Anything else (pending, blocked, failed, crashed, resumed, in_progress)
+    // means the ticket is not finished — halt with status=blocked.
+    const TERMINAL_OK = new Set(['done', 'not_applicable', 'skipped']);
+    const incompleteSteps = Object.entries(pipelineState.steps || {})
+      .filter(([, step]) => !step || !TERMINAL_OK.has(step.status));
+
+    if (pipelineState.status === 'blocked' || pipelineState.status === 'failed' || pipelineState.blocked_at) {
+      // Loop already halted this ticket with a terminal failure state.
+      // NEVER flip status back to 'done'. Just persist the report.
+      console.log(`[preserve-blocked] ${ticket.id}: keeping status=${pipelineState.status} (blocked_step=${pipelineState.blocked_step || 'n/a'})`);
+      await this.savePipelineJson(ticket.id, pipelineState);
+    } else if (incompleteSteps.length > 0) {
+      // Loop completed without setting a terminal state, but some sub-steps
+      // never reached done/not_applicable/skipped. Treat the ticket as blocked
+      // rather than silently shipping partial work.
+      const stepList = incompleteSteps
+        .map(([name, s]) => `${name}=${s?.status ?? 'missing'}`)
+        .join(', ');
+      pipelineState.status = 'blocked';
+      pipelineState.blocked_at = new Date().toISOString();
+      pipelineState.blocked_step = incompleteSteps[0][0];
+      pipelineState.blocked_reason =
+        `Pipeline loop ended without failure, but sub-steps not complete: ${stepList}`;
+      this.emit('ticket_blocked', {
+        ticket: ticket.id,
+        step: incompleteSteps[0][0],
+        stepStatus: 'post_loop_incomplete',
+        reason: pipelineState.blocked_reason,
+      });
+      console.log(`[blocked] ${ticket.id} post-loop incomplete: ${stepList}`);
+      await this.savePipelineJson(ticket.id, pipelineState);
+    } else {
+      // All sub-steps terminal-OK and no failure state. Truly done.
+      pipelineState.status = 'done';
+      pipelineState.completed_at = new Date().toISOString();
+      await this.savePipelineJson(ticket.id, pipelineState);
+    }
   }
 
   // --- Pipeline JSON management ---
