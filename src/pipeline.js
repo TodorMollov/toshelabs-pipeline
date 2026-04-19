@@ -255,7 +255,9 @@ export class Pipeline {
 
       // tests_green: run tests + analyzer directly, self-heal if failures
       if (stepConfig.name === 'tests_green') {
-        const maxHealAttempts = 2;
+        // 3 attempts to give the model-escalation ladder all three rungs:
+        // attempt 1 = haiku (cheap), 2 = sonnet (most fixes), 3 = opus (last resort).
+        const maxHealAttempts = 3;
         let healAttempt = 0;
         let testsGreenResult;
 
@@ -264,8 +266,10 @@ export class Pipeline {
           pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
           const stepArtifacts = pipelineState.steps.tests_green || {};
 
-          // If tests pass or we've exhausted heal attempts, proceed to gate
-          if (stepArtifacts.new_failures === 0 || healAttempt >= maxHealAttempts) {
+          // If tests pass (no new failures AND no new analyzer errors) or
+          // we've exhausted heal attempts, proceed to gate.
+          const needsHeal = (stepArtifacts.new_failures > 0) || (stepArtifacts.new_analyzer_errors > 0);
+          if (!needsHeal || healAttempt >= maxHealAttempts) {
             const planArtifacts = pipelineState.steps.plan || {};
             const validation = validateStep(stepArtifacts, stepConfig, planArtifacts);
 
@@ -289,31 +293,33 @@ export class Pipeline {
             break;
           }
 
-          // Tests have new failures — ask Claude to fix the code
+          // Tests have new failures (or new analyzer errors) — ask Claude to fix
           healAttempt++;
-          // Only surface failures this ticket introduced — preexisting red
-          // tests are captured in pipelineState.baseline_failures and aren't
-          // this ticket's responsibility to fix.
           const newFailedTests = stepArtifacts.new_failed_tests || stepArtifacts.failed_tests || [];
-          this.emit('tests_green_heal', { ticket: ticket.id, attempt: healAttempt, newFailures: stepArtifacts.new_failures, failedTests: newFailedTests });
-          console.log(`[self-heal] ${ticket.id}/tests_green: ${stepArtifacts.new_failures} new failures, fix attempt ${healAttempt}/${maxHealAttempts}`);
+          const newAnalyzerErrCount = stepArtifacts.new_analyzer_errors || 0;
+          const compileFirst = stepArtifacts.unit_skipped_compile_errors;
+          this.emit('tests_green_heal', { ticket: ticket.id, attempt: healAttempt, newFailures: stepArtifacts.new_failures, newAnalyzerErrors: newAnalyzerErrCount, failedTests: newFailedTests });
+          console.log(`[self-heal] ${ticket.id}/tests_green: ${stepArtifacts.new_failures} new test failures, ${newAnalyzerErrCount} new analyzer errors, attempt ${healAttempt}/${maxHealAttempts}`);
 
           // Detect load/compile errors — these indicate a broken import
           // (usually a missing dependency in pubspec/package.json), not a
           // logic bug. Self-heal needs to treat them differently.
           const loadErrorPattern = /^loading\s+\/|uri_does_not_exist|undefined[_ ]class|undefined[_ ]function|Target of URI doesn't exist/i;
           const loadErrors = newFailedTests.filter((t) => loadErrorPattern.test(t));
+          const compileHint = (compileFirst || newAnalyzerErrCount > 0)
+            ? `\n\n⚠️  COMPILE ERRORS DETECTED (${newAnalyzerErrCount} new analyzer errors). Unit tests were ${compileFirst ? 'SKIPPED' : 'also run'} because the code doesn't compile cleanly. FIX COMPILE ERRORS FIRST. The analyzer output below lists them. Don't touch test logic until the analyzer is clean.`
+            : '';
           const depHint = loadErrors.length > 0
             ? `\n\n⚠️  LOAD ERRORS DETECTED (${loadErrors.length} of ${newFailedTests.length}). When a test fails with "loading <path>" or an "URI doesn't exist / undefined class" message, the test file cannot compile — usually because an imported package is NOT in the project's manifest. DO NOT try to fix the test logic first. FIRST:\n1. Read the failing test file and list every \`package:\` / \`import ... from\` it uses.\n2. Compare against pubspec.yaml / package.json.\n3. If any dependency is missing, add it (for Dart: under dev_dependencies with a compatible version; for Node: npm install / add to package.json).\n4. Then re-examine remaining test failures once compile errors are gone.`
             : '';
 
           const fixPrompt = `You are fixing failing tests for ticket ${ticket.id}: "${ticket.title}".
 
-FAILING TESTS (${stepArtifacts.new_failures} new failures — preexisting red tests are filtered out):
+${newAnalyzerErrCount > 0 ? `NEW ANALYZER ERRORS (${newAnalyzerErrCount} — fix these first):\n${stepArtifacts.analyze_output_summary || '(see full analyzer output in pipeline state)'}\n\n` : ''}FAILING TESTS (${stepArtifacts.new_failures} new failures — preexisting red tests are filtered out):
 ${newFailedTests.join('\n')}
 
 TEST OUTPUT (last lines):
-${stepArtifacts.test_output_summary}${depHint}
+${stepArtifacts.test_output_summary}${compileHint}${depHint}
 
 PIPELINE STATE:
 ${JSON.stringify({ plan: pipelineState.steps.plan, implement: pipelineState.steps.implement, tests_green: pipelineState.steps.tests_green })}
@@ -322,13 +328,17 @@ Fix the code so these tests pass. Read the failing test files to understand what
 
 After fixing, DO NOT run the tests — the pipeline will re-run them automatically.`;
 
+          // Model escalation ladder: most heal fixes are trivial (missing
+          // import, null check, typo) — haiku handles them cheaply. Escalate
+          // only when a cheaper model has already failed on the same run.
+          const healModel = healAttempt === 1 ? 'haiku' : healAttempt === 2 ? 'sonnet' : 'opus';
           try {
             let healIn = 0, healOut = 0, healTools = 0;
             const healStart = Date.now();
             const healResult = await this.runWithRateLimitRetry(
               () => spawnClaude({
                 prompt: fixPrompt,
-                model: 'sonnet',
+                model: healModel,
                 tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write'],
                 maxTurns: 20,
                 workingDir: this.config.project_dir,
@@ -346,8 +356,8 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
               'tests_green_heal',
             );
             this.updateRateLimitInfo(healResult.rateLimitInfo);
-            console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/tests_green (heal-${healAttempt}) | sonnet | ${formatDuration(Date.now() - healStart)} | ${healIn.toLocaleString()} in / ${healOut.toLocaleString()} out | ${healTools} tools`);
-            this.emit('step_attempt_done', { ticket: ticket.id, step: 'tests_green_heal', attempt: healAttempt, model: 'sonnet', inputTokens: healIn, outputTokens: healOut, toolCalls: healTools });
+            console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/tests_green (heal-${healAttempt}) | ${healModel} | ${formatDuration(Date.now() - healStart)} | ${healIn.toLocaleString()} in / ${healOut.toLocaleString()} out | ${healTools} tools`);
+            this.emit('step_attempt_done', { ticket: ticket.id, step: 'tests_green_heal', attempt: healAttempt, model: healModel, inputTokens: healIn, outputTokens: healOut, toolCalls: healTools });
           } catch (err) {
             if (err.rateLimited) throw err; // let pipeline handle rate limits
             console.error(`[self-heal] Fix attempt failed: ${err.message}`);
@@ -723,6 +733,32 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       out.add(path);
     }
     return out;
+  }
+
+  // Returns paths currently dirty that are NOT declared anywhere (plan.
+  // files_to_change ∪ all steps' files_changed) AND were not dirty at
+  // ticket start. Forces the implement step to own every file it wrote:
+  // either declare it or revert it. Without this, silent writes accumulate
+  // into the kind of 40-file graveyard we cleaned up in 2026-04-19.
+  checkSilentWrites(pipelineState) {
+    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
+    const nowDirty = this.getDirtyFiles(this.config.project_dir);
+    const declared = this.collectDeclaredFiles(pipelineState);
+    // Also accept paths the planner declared under plan.files_to_change
+    // even if no step reports them in files_changed yet.
+    const plan = pipelineState.steps?.plan;
+    for (const fc of (plan?.files_to_change || [])) {
+      const p = typeof fc === 'object' ? fc.path : fc;
+      if (p && typeof p === 'string' && !p.startsWith('memory/pipeline/')) declared.add(p);
+    }
+    const silent = [];
+    for (const path of nowDirty.keys()) {
+      if (dirtyAtStart.has(path)) continue;
+      if (path.startsWith('memory/pipeline/')) continue;
+      if (declared.has(path)) continue;
+      silent.push(path);
+    }
+    return silent;
   }
 
   // `git status --porcelain` snapshot keyed by path. Values: 'M' (modified),
@@ -1197,6 +1233,22 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         } catch (err) {
           console.warn(`[deps-check] skipped for ${ticket.id}: ${err.message}`);
         }
+
+        // Plan-vs-actual gate: every file implement touched must be declared
+        // in either plan.files_to_change OR implement.files_changed. Catches
+        // silent writes (LLM wrote a helper and forgot to list it) before
+        // they leak into the tree as orphan files that poison future tickets.
+        try {
+          const silent = this.checkSilentWrites(pipelineState);
+          if (silent.length > 0) {
+            validation.pass = false;
+            validation.failures.push(
+              `undeclared file writes (${silent.length}): ${silent.slice(0, 10).join(', ')}${silent.length > 10 ? ` ...+${silent.length - 10} more` : ''}. Add these to implement.files_changed or revert them.`,
+            );
+          }
+        } catch (err) {
+          console.warn(`[silent-writes] skipped for ${ticket.id}: ${err.message}`);
+        }
       }
 
       this.emit('step_gate', {
@@ -1535,6 +1587,42 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     // with "uri doesn't exist" even though the dep is declared.
     await this.syncDepsIfManifestChanged(pipelineState, projectDir, env);
 
+    // --- Analyzer first (fast-fail gate on compile errors) ---
+    // Running ~30s of analyzer before the 2–5 min unit suite lets us skip
+    // the slow phase when the code doesn't compile — heal then sees only
+    // compile errors, not a pile of cascading test failures. For baseline
+    // (runAllExtras=true) we always continue so the full picture is captured.
+    let analyzeOutput = '';
+    let analyzerErrors = 0;
+    if (tc.analyzer) {
+      console.log(`[test-suite] Running analyzer (${tc.analyzer.cmd})...`);
+      analyzeOutput = runPhase(tc.analyzer).output;
+      const ok = tc.analyzer.success_marker || 'No issues found';
+      if (analyzeOutput.includes(ok)) {
+        analyzerErrors = 0;
+      } else {
+        const issueRe = tc.analyzer.issue_pattern ? new RegExp(tc.analyzer.issue_pattern) : /(\d+)\s+issue/;
+        const m = analyzeOutput.match(issueRe);
+        analyzerErrors = m ? parseInt(m[1]) : (analyzeOutput.includes('error') ? 1 : 0);
+      }
+    }
+
+    const baselineAnalyzerErrors = pipelineState.baseline_analyzer_errors || 0;
+    const newAnalyzerErrors = Math.max(0, analyzerErrors - baselineAnalyzerErrors);
+    const skipUnitForCompileErrors = !runAllExtras && newAnalyzerErrors > 0;
+
+    if (skipUnitForCompileErrors) {
+      console.log(`[test-suite] Skipping unit tests — ${newAnalyzerErrors} new analyzer errors (vs baseline ${baselineAnalyzerErrors}). Heal should fix compile errors first.`);
+      return {
+        passed: 0, failed: 0, failedTests: [],
+        unitCrashed: false, unitExitCode: 0, unitRanNothing: false, unitSkipped: true,
+        analyzerErrors, analyzeOutput,
+        extraFailures: [], extraOutput: '',
+        testOutput: '',
+        skippedDueToCompileErrors: true,
+      };
+    }
+
     // --- Unit tests ---
     if (!tc.unit) {
       console.warn(`[test-suite] WARNING: project_profile.test_commands.unit is not configured — no unit tests will run.`);
@@ -1570,22 +1658,6 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     // results). Common cause: wrong cwd, wrong test path, empty glob.
     const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed;
 
-    // --- Analyzer ---
-    let analyzeOutput = '';
-    let analyzerErrors = 0;
-    if (tc.analyzer) {
-      console.log(`[test-suite] Running analyzer (${tc.analyzer.cmd})...`);
-      analyzeOutput = runPhase(tc.analyzer).output;
-      const ok = tc.analyzer.success_marker || 'No issues found';
-      if (analyzeOutput.includes(ok)) {
-        analyzerErrors = 0;
-      } else {
-        const issueRe = tc.analyzer.issue_pattern ? new RegExp(tc.analyzer.issue_pattern) : /(\d+)\s+issue/;
-        const m = analyzeOutput.match(issueRe);
-        analyzerErrors = m ? parseInt(m[1]) : (analyzeOutput.includes('error') ? 1 : 0);
-      }
-    }
-
     // --- Extras (e.g. backend, integration) ---
     const implFiles = pipelineState.steps?.implement?.files_changed || [];
     const implPaths = implFiles.map((f) => (typeof f === 'object' ? f.path : f));
@@ -1607,6 +1679,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       analyzerErrors, analyzeOutput,
       extraFailures, extraOutput,
       testOutput,
+      skippedDueToCompileErrors: false,
     };
   }
 
@@ -1665,6 +1738,12 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     // ticket's fault — only count newly-broken phases.
     const newExtraFailures = res.extraFailures.filter((e) => !baselineExtras.has(e.phase));
 
+    // Analyzer gate: new compile errors vs baseline count as a failure even
+    // if the test suite was skipped. This is the analyzer-first fast-fail
+    // path in runTestSuite — unit tests are useless while code won't compile.
+    const baselineAnalyzerErrors = pipelineState.baseline_analyzer_errors || 0;
+    const newAnalyzerErrors = Math.max(0, res.analyzerErrors - baselineAnalyzerErrors);
+
     if (res.unitCrashed) {
       console.error(`[tests_green] unit runner crashed (exit ${res.unitExitCode}) with no parseable stats. Output head: ${res.testOutput.slice(0, 500)}`);
     }
@@ -1672,16 +1751,18 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${res.unitExitCode}. Tail: ${res.testOutput.slice(-500)}`);
     }
 
-    const failed_ = (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0;
+    const failed_ = (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0 || newAnalyzerErrors > 0;
     const step = {
       status: failed_ ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0,
+      all_pass: res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0 && newAnalyzerErrors === 0,
       unit_tests: { passed: res.passed, failed: res.failed, skipped: 0 },
       unit_crashed: res.unitCrashed,
       unit_exit_code: res.unitExitCode,
       unit_ran_nothing: res.unitRanNothing,
+      unit_skipped_compile_errors: res.skippedDueToCompileErrors || false,
       analyzer_errors: res.analyzerErrors,
+      new_analyzer_errors: newAnalyzerErrors,
       failed_tests: res.failedTests,
       new_failed_tests: newFailedTests,
       baseline_failures: baseline,
@@ -1689,7 +1770,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       extra_failures: res.extraFailures,
       new_extra_failures: newExtraFailures,
       test_output_summary: res.testOutput.split('\n').slice(-5).join('\n').trim(),
-      analyze_output_summary: res.analyzeOutput.split('\n').slice(-3).join('\n').trim(),
+      analyze_output_summary: res.analyzeOutput.split('\n').slice(-5).join('\n').trim(),
       extra_output_summary: res.extraOutput ? res.extraOutput.trim() : undefined,
       native_step: true,
     };
