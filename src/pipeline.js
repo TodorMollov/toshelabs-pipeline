@@ -9,6 +9,12 @@ import { validateStep } from './validator.js';
 import { buildPrompt } from './prompts.js';
 import { acquireLock, releaseLock } from './lock.js';
 
+// Module-scoped set of ticket ids already surfaced as stranded in this
+// server process. Without this, every `/api/run/all` re-scans the pipeline
+// dir and re-emits pipeline_crashed_detected for the same tickets — 23
+// duplicates in a single day's ops log. Cleared on server restart.
+const _crashedDetectedThisBoot = new Set();
+
 export class Pipeline {
   constructor(config, opts = {}) {
     this.config = config;
@@ -1082,8 +1088,18 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     for (const file of files) {
       if (!file.endsWith('.json')) continue;
       const filePath = resolve(dir, file);
-      const raw = await readFile(filePath, 'utf-8');
-      const state = JSON.parse(raw);
+      let state;
+      try {
+        let raw = await readFile(filePath, 'utf-8');
+        // Same sanitizer loadPipelineJson uses — LLMs occasionally emit
+        // JS expressions in JSON.
+        raw = raw.replace(/:\s*(\d+)\s*\+\s*(\d+)/g, (_, a, b) => ': ' + (parseInt(a) + parseInt(b)));
+        state = JSON.parse(raw);
+      } catch (err) {
+        console.error(`[checkCrashed] skipping malformed ${file}: ${err.message}`);
+        this.emit('pipeline_state_unreadable', { file, error: err.message });
+        continue;
+      }
       if (state.status === 'in_progress') {
         const resumeStep = Object.entries(state.steps).find(
           ([, s]) => s.status !== 'done' && s.status !== 'not_applicable'
@@ -1097,15 +1113,20 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             strandedSince = st.mtime.toISOString();
           } catch { /* keep started_at */ }
 
-          // Structured crash-detected event for the ops log and reports page.
-          this.emit('pipeline_crashed_detected', {
-            ticket: state.ticket,
-            last_step: resumeStep[0],
-            last_step_status: resumeStep[1]?.status || 'unknown',
-            stranded_since: strandedSince,
-            stranded_duration_sec: strandedSince ? Math.round((Date.now() - new Date(strandedSince).getTime()) / 1000) : null,
-            detected_at: detectedAt,
-          });
+          // Structured crash-detected event for the ops log and reports
+          // page. Emit once per ticket per server boot — duplicate fires
+          // on repeated /api/run/all invocations just clutter the timeline.
+          if (!_crashedDetectedThisBoot.has(state.ticket)) {
+            _crashedDetectedThisBoot.add(state.ticket);
+            this.emit('pipeline_crashed_detected', {
+              ticket: state.ticket,
+              last_step: resumeStep[0],
+              last_step_status: resumeStep[1]?.status || 'unknown',
+              stranded_since: strandedSince,
+              stranded_duration_sec: strandedSince ? Math.round((Date.now() - new Date(strandedSince).getTime()) / 1000) : null,
+              detected_at: detectedAt,
+            });
+          }
           this.emit('crash_recovery', { ticket: state.ticket, resumeFrom: resumeStep[0] });
           resumed.push({
             id: state.ticket,

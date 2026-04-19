@@ -119,11 +119,14 @@ PLAN STEP:
 
 For features: {{tech_stack_hints}}
 For schema changes: flag if a numbered migration is needed.
-New dependencies: STOP and report.
+
+DEPENDENCY DISCIPLINE (critical — this has broken past tickets):
+If any file you plan to write will import a package (Dart: \`package:foo/…\`; TS/JS: \`import 'bar'\` or \`require('bar')\`; etc.) that is NOT already declared in the project's manifest (pubspec.yaml / package.json / etc.), you MUST add that manifest file to files_to_change with an explicit what_to_do describing the exact dep+version to add. A missing dep add will cause load-time compile failures that self-heal cannot fix. Check manifests before finalising the plan.
 
 IMPORTANT: You MUST write the pipeline JSON file before your session ends.
 Write {{pipeline_dir}}/{{ticket_id}}.json with steps.plan.status = "done" and ALL of these fields:
-- files_to_change: [{path, reason, what_to_do}] — ONLY files that MUST change for the ticket to work. If a caller might be affected but the change is backward-compatible, do NOT list it. Verify: "will this file fail to compile or behave incorrectly without a change?" If no, exclude it. reason: WHY. what_to_do: SPECIFIC action.
+- files_to_change: [{path, reason, what_to_do}] — ONLY files that MUST change for the ticket to work. If a caller might be affected but the change is backward-compatible, do NOT list it. Verify: "will this file fail to compile or behave incorrectly without a change?" If no, exclude it. reason: WHY. what_to_do: SPECIFIC action. If the action is pure plumbing (field passing, data addition, constructor shape, import reorg) — something that will be covered transitively by behavioural tests rather than a dedicated test case — prefix the what_to_do with "[no-test]". tests_red will skip those bullets from coverage checks. Use sparingly; behavioural additions always need dedicated tests.
+- SCOPE GATE: if files_to_change has more than 15 paths OR you find yourself writing more than 20 distinct what_to_do bullets, STOP. One implement step cannot reliably carry that much — it will hit max_turns and the ticket will be rolled back. Set status = "needs_split" with a suggested_sub_tickets: [{title, scope}] array of 2–4 sub-tickets covering the work, and STOP writing the plan.
 - callers_traced: [{function, callers: ["file:line"]}] — just file:line refs, not grep output
 - edge_cases: ["short description"] — one line each
 - test_strategy: "one paragraph max"
@@ -150,7 +153,7 @@ Write {{pipeline_dir}}/{{ticket_id}}.json with steps.tests_red.status = "done":
 - outcome, test_files, test_names, tests_before, tests_after
 - failure_output: "one line per failing test — assertion message only, no stack traces"
 - baseline_failures: [test names already failing before changes]
-- criteria_to_test_map: [{criterion: "what the plan says must happen", test_name: "name of test that covers it"}] — one entry per deliverable/acceptance criterion from the plan. If a plan deliverable has no corresponding test, you MUST write one. Every files_to_change what_to_do must appear as a criterion.
+- criteria_to_test_map: [{criterion: "what the plan says must happen", test_name: "name of test that covers it"}] — one entry per BEHAVIOURAL deliverable from the plan. Plan bullets prefixed with "[no-test]" are plumbing and SHOULD NOT appear here — they're covered transitively. Every other files_to_change what_to_do must appear as a criterion.
 If blocked: set status = "blocked" with reason.`,
 
     implement: `Ticket {{ticket_id}}: "{{ticket_title}}"
@@ -217,13 +220,16 @@ WORK (do all of this, but don't narrate):
 
 OUTPUT — only this, nothing else:
 Write {{pipeline_dir}}/{{ticket_id}}.json with steps.review:
-- status: "done" (all fixed or no findings) | "blocked" (unfixable findings)
-- checklist_items_checked: number
+- status: "done" (no findings, or you fixed all of them) | "blocked" (unfixable findings — name them)
+- checklist_items_checked: number — MUST always be >0 (how many checklist items you actually evaluated). If you checked anything at all, this is not 0.
 - findings: [{file, line, severity, issue, fix}] — issue is ONE sentence, fix is ONE sentence
-- findings_fixed: <number you fixed>
+- findings_fixed: if findings exist, one of:
+    • true — you fixed all of them in this session (preferred when the fix is small)
+    • "deferred" — findings are real but belong to a later cycle / different ticket; next implement pass will pick them up
+  If findings_fixed is missing OR false while findings are non-empty AND status is not "blocked", the gate FAILS. Choose one of the three dispositions every time.
 
 Severity: "blocking" = breaks at runtime. "medium" = wrong behavior. "low" = style/cleanup.
-If 0 findings: status = "done", findings = [], findings_fixed = 0.`,
+If 0 findings: status = "done", findings = [], findings_fixed = true (vacuously — there was nothing to fix).`,
 
     root_cause: `Ticket {{ticket_id}} ("{{ticket_title}}") — bug fix.
 PIPELINE STATE: {{pipeline_state}}
