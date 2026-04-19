@@ -77,6 +77,23 @@
   .drill-grid { display: grid; grid-template-columns: 140px 80px 90px; gap: 8px 14px; font-size: 12px; }
   .drill-grid .head { color: var(--text-muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
 
+  /* Ticket rollup + per-step metrics */
+  .rollup { display: flex; flex-wrap: wrap; gap: 10px 24px; font-size: 12px; padding: 6px 0 12px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+  .rollup .kv { display: flex; gap: 6px; align-items: baseline; }
+  .rollup .kv .k { color: var(--text-muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.4px; }
+  .rollup .kv .v { font-family: ui-monospace, monospace; font-weight: 600; }
+  .rollup .kv .v.warn { color: var(--orange); }
+  .rollup .kv .v.bad { color: var(--red); }
+  .rollup .kv .v.good { color: var(--green); }
+
+  table.step-metrics { width: 100%; border-collapse: collapse; font-size: 11px; font-family: ui-monospace, Menlo, monospace; }
+  table.step-metrics th { text-align: left; padding: 4px 8px; color: var(--text-muted); text-transform: uppercase; font-size: 10px; font-weight: 500; letter-spacing: 0.4px; border-bottom: 1px solid var(--border); }
+  table.step-metrics td { padding: 4px 8px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  table.step-metrics td.num { text-align: right; }
+  table.step-metrics td.warn { color: var(--orange); }
+  table.step-metrics td.bad { color: var(--red); }
+  table.step-metrics tr.no-metrics td { color: var(--text-muted); font-style: italic; }
+
   /* Chart: step status distribution */
   .bar-row { display: grid; grid-template-columns: 100px 1fr 60px; gap: 10px; align-items: center; margin: 4px 0; font-size: 12px; }
   .bar-row .label { color: var(--text-dim); }
@@ -171,6 +188,72 @@ const fmtDate = (iso) => {
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+const fmtMs = (ms) => (ms == null ? '—' : fmtDuration(Math.round(ms / 1000)));
+const fmtTokens = (n) => (n == null ? '—' : (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n)));
+const fmtPct = (r) => (r == null ? '—' : Math.round(r * 100) + '%');
+
+function renderTicketRollup(t) {
+  const totals = t.totals || {};
+  const rework = t.rework || {};
+  const cells = [];
+  if (t.working_sec != null) cells.push(`<div class="kv"><span class="k">work</span><span class="v">${fmtDuration(t.working_sec)}</span></div>`);
+  if (t.waited_sec) cells.push(`<div class="kv"><span class="k">waited</span><span class="v warn">${fmtDuration(t.waited_sec)}</span></div>`);
+  if (totals.inputTokens != null) cells.push(`<div class="kv"><span class="k">in</span><span class="v">${fmtTokens(totals.inputTokens)}</span></div>`);
+  if (totals.outputTokens != null) cells.push(`<div class="kv"><span class="k">out</span><span class="v">${fmtTokens(totals.outputTokens)}</span></div>`);
+  if (totals.cacheHitRatio != null) {
+    const cls = totals.cacheHitRatio >= 0.7 ? 'good' : totals.cacheHitRatio >= 0.4 ? 'warn' : 'bad';
+    cells.push(`<div class="kv"><span class="k">cache hit</span><span class="v ${cls}">${fmtPct(totals.cacheHitRatio)}</span></div>`);
+  }
+  if (rework.tokenRatio != null) {
+    const cls = rework.tokenRatio <= 0.1 ? 'good' : rework.tokenRatio <= 0.25 ? 'warn' : 'bad';
+    cells.push(`<div class="kv"><span class="k">rework</span><span class="v ${cls}">${fmtPct(rework.tokenRatio)}</span></div>`);
+  }
+  if (rework.reviewCycles) cells.push(`<div class="kv"><span class="k">review cycles</span><span class="v warn">${rework.reviewCycles}</span></div>`);
+  if (rework.maxTurnsHitSteps && rework.maxTurnsHitSteps.length) cells.push(`<div class="kv"><span class="k">max-turns</span><span class="v bad">${esc(rework.maxTurnsHitSteps.join(', '))}</span></div>`);
+  if (rework.sessionRotations) cells.push(`<div class="kv"><span class="k">session rotations</span><span class="v warn">${rework.sessionRotations}</span></div>`);
+  if (totals.toolCalls != null) cells.push(`<div class="kv"><span class="k">tools</span><span class="v">${totals.toolCalls}</span></div>`);
+  if (totals.filesChanged != null) cells.push(`<div class="kv"><span class="k">files</span><span class="v">${totals.filesChanged}</span></div>`);
+  if (!cells.length) return '<div style="color:var(--text-muted);font-size:12px;padding:6px 0 12px">no metrics (ran before instrumentation)</div>';
+  return `<div class="rollup">${cells.join('')}</div>`;
+}
+
+function renderStepMetricsTable(t) {
+  const sm = t.step_metrics || {};
+  const rows = STEP_ORDER.map((name) => {
+    const m = sm[name];
+    const status = t.steps[name] || 'not run';
+    if (!m) {
+      return `<tr class="no-metrics"><td>${name}</td><td class="status-${status}">${status}</td><td colspan="9">no metrics captured</td></tr>`;
+    }
+    const attempts = m.attempts || 1;
+    const attemptsCell = attempts > 1 ? `<td class="num warn">${attempts}</td>` : `<td class="num">${attempts}</td>`;
+    const cacheCls = m.cacheHitRatio != null && m.cacheHitRatio < 0.4 ? 'bad' : '';
+    const mtCell = m.maxTurnsHit ? `<td class="bad">yes</td>` : `<td>—</td>`;
+    const topTools = Object.entries(m.toolCallsByName || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, v]) => `${k}:${v}`).join(' ');
+    const wait = m.waitedMs ? ` <span style="color:var(--orange)">(+${fmtMs(m.waitedMs)} wait)</span>` : '';
+    return `<tr>
+      <td>${name}</td>
+      <td class="status-${status}">${status}</td>
+      <td>${esc(m.model || '—')}</td>
+      <td class="num">${fmtMs(m.durationMs)}${wait}</td>
+      ${attemptsCell}
+      ${mtCell}
+      <td class="num">${fmtTokens(m.inputTokens)}</td>
+      <td class="num">${fmtTokens(m.outputTokens)}</td>
+      <td class="num ${cacheCls}">${fmtPct(m.cacheHitRatio)}</td>
+      <td class="num">${m.toolCalls ?? 0}</td>
+      <td>${esc(topTools)}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="step-metrics">
+    <thead><tr>
+      <th>Step</th><th>Status</th><th>Model</th><th>Time</th><th>Tries</th><th>MaxTurns</th>
+      <th>In</th><th>Out</th><th>Cache%</th><th>Tools</th><th>Top tools</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 async function refreshAll() {
   await Promise.all([loadTickets(), loadEvents(), loadUsage()]);
   renderTiles();
@@ -235,6 +318,9 @@ function renderTimeline() {
     'rate_limited', 'rate_limit_resume', 'ticket_start', 'ticket_done',
     'ticket_failed', 'ticket_blocked_skip_archive', 'pipeline_error',
     'pipeline_blocked', 'pipeline_complete', 'stop_requested',
+    'baseline_captured', 'baseline_capture_failed',
+    'ticket_rolled_back', 'auto_commit_done', 'auto_commit_failed', 'auto_commit_skipped',
+    'ticket_blocked_escalated',
   ]);
   const rows = state.events.filter(e => interesting.has(e.event)).slice(-100).reverse();
   if (!rows.length) {
@@ -254,6 +340,13 @@ function renderTimeline() {
     else if (e.event === 'pipeline_error') summary = d.error || '';
     else if (e.event === 'server_started') summary = `pid ${d.pid} · ${d.node || ''}`;
     else if (e.event === 'server_stopping') summary = d.signal || '';
+    else if (e.event === 'baseline_captured') summary = `${d.ticket}: ${d.failingTestCount} preexisting failing tests, ${d.analyzerErrors} analyzer errs, ${d.extraFailureCount} extras · ${fmtDuration((d.durationMs||0)/1000)}`;
+    else if (e.event === 'baseline_capture_failed') summary = `${d.ticket}: ${d.error || ''}`;
+    else if (e.event === 'ticket_rolled_back') summary = `${d.ticket}: reverted ${d.revertedCount}, deleted ${d.deletedCount}, kept ${d.skippedCount} (not this ticket's)`;
+    else if (e.event === 'auto_commit_done') summary = `${d.ticket}: ${d.sha?.slice(0,7)} · ${d.fileCount} files`;
+    else if (e.event === 'auto_commit_failed') summary = `${d.ticket}: ${d.error || ''}`;
+    else if (e.event === 'auto_commit_skipped') summary = `${d.ticket}: ${d.reason || ''}`;
+    else if (e.event === 'ticket_blocked_escalated') summary = `${d.ticket}: blocked ${d.attempts}× — escalated to failed, rollback will fire`;
     else summary = Object.keys(d).slice(0, 3).map(k => `${k}=${JSON.stringify(d[k]).slice(0, 50)}`).join(' ');
     return `<div class="row"><span class="ts">${ts}</span><span class="evt evt-${e.event}">${e.event}</span><span>${esc(summary)}</span></div>`;
   }).join('');
@@ -347,13 +440,8 @@ function renderTickets() {
       <td>${fmtDate(t.completed_at || t.started_at)}</td>
     </tr>
     <tr class="drill${collapsed}" data-drill="${esc(t.id)}" data-group="${esc(groupName)}"><td colspan="8">
-      <div class="drill-grid">
-        <div class="head">Step</div><div class="head">Status</div><div class="head">Notes</div>
-        ${STEP_ORDER.map(s => {
-          const st = t.steps[s] || 'not run';
-          return `<div>${s}</div><div class="status-${st}">${st}</div><div style="color:var(--text-muted)">${s === 'root_cause' && t.type !== 'bug' ? '(bugs only)' : ''}</div>`;
-        }).join('')}
-      </div>
+      ${renderTicketRollup(t)}
+      ${renderStepMetricsTable(t)}
       <div style="margin-top:10px"><a href="/api/pipeline/${encodeURIComponent(t.id)}" target="_blank">raw state JSON →</a></div>
     </td></tr>`;
   };

@@ -40,8 +40,10 @@ export class Pipeline {
     this.emit('lock_acquired', {});
 
     try {
-      // Check for crashed pipelines (resume)
-      const resumed = await this.checkCrashedPipelines();
+      // Check for crashed pipelines (resume) — but only when no specific
+      // ticket was pinned. An explicit "Run T-X" click should not pull in
+      // unrelated stranded tickets ahead of the user's choice.
+      const resumed = this.ticketId ? [] : await this.checkCrashedPipelines();
 
       // Load and filter backlog
       const allTickets = await loadBacklog(this.config);
@@ -77,15 +79,23 @@ export class Pipeline {
           // Persist the failure to the ticket state file so it doesn't
           // remain in_progress forever and get re-queued as a "crashed"
           // ticket on the next restart.
+          let failedState = null;
           try {
-            const existing = await this.loadPipelineJson(ticket.id);
-            if (existing && existing.status === 'in_progress') {
-              existing.status = 'failed';
-              existing.failed_at = new Date().toISOString();
-              existing.failure_reason = err.message;
-              await this.savePipelineJson(ticket.id, existing);
+            failedState = await this.loadPipelineJson(ticket.id);
+            if (failedState && failedState.status === 'in_progress') {
+              failedState.status = 'failed';
+              failedState.failed_at = new Date().toISOString();
+              failedState.failure_reason = err.message;
+              await this.savePipelineJson(ticket.id, failedState);
             }
           } catch { /* best-effort */ }
+          // Atomic rollback: revert this ticket's declared files so the next
+          // ticket's baseline is clean. Skipped on dry-run and when the
+          // ticket has no declared files (e.g. crashed before plan).
+          if (!this.dryRun && failedState) {
+            try { await this.rollbackTicketFiles(ticket, failedState); }
+            catch (rbErr) { console.error(`[rollback] ${ticket.id}: ${rbErr.message}`); }
+          }
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
           continue;
         }
@@ -95,11 +105,22 @@ export class Pipeline {
         // Dry run: only plan step
         if (this.dryRun) continue;
 
-        // Don't archive blocked tickets — they need another pass
+        // Don't archive blocked tickets — they need another pass. Files
+        // stay on disk so the next retry can resume without re-writing
+        // them; only terminally-failed tickets get rolled back.
         const finalState = await this.loadPipelineJson(ticket.id);
         if (finalState?.status === 'blocked') {
           this.emit('ticket_blocked_skip_archive', { ticket: ticket.id, step: finalState.blocked_step });
           continue;
+        }
+
+        // Auto-commit: successful tickets commit their declared files as a
+        // single ticket-tagged commit. Keeps the tree clean so subsequent
+        // baseline captures reflect a genuine HEAD, not a pile of
+        // uncommitted work from earlier pipeline runs.
+        if (finalState?.status === 'done') {
+          try { await this.commitTicketFiles(ticket, finalState); }
+          catch (err) { console.error(`[auto-commit] ${ticket.id}: ${err.message}`); }
         }
 
         // Archive the ticket
@@ -123,13 +144,56 @@ export class Pipeline {
   }
 
   async processTicket(ticket) {
+    const MAX_BLOCKED_ATTEMPTS = 3;
     const steps = this.config.steps;
     let pipelineState = await this.loadOrCreatePipelineJson(ticket);
     const ticketStartTime = Date.now();
     const stepMetrics = [];
 
+    // Blocked-retry escalation: a ticket that keeps getting blocked on the
+    // same step consumes LLM budget forever. After N attempts we escalate
+    // to `failed`, which triggers rollback in run()'s catch block so its
+    // abandoned files don't poison future tickets.
+    if (pipelineState.status === 'blocked') {
+      const attempts = (pipelineState.blocked_attempts || 0) + 1;
+      if (attempts >= MAX_BLOCKED_ATTEMPTS) {
+        pipelineState.status = 'failed';
+        pipelineState.blocked_attempts = attempts;
+        pipelineState.failed_at = new Date().toISOString();
+        pipelineState.failure_reason = `Blocked ${attempts} times — escalated to failed`;
+        await this.savePipelineJson(ticket.id, pipelineState);
+        this.emit('ticket_blocked_escalated', { ticket: ticket.id, attempts });
+        console.log(`[blocked-escalate] ${ticket.id}: ${attempts} attempts — escalating to failed`);
+        throw new Error(pipelineState.failure_reason);
+      }
+      pipelineState.blocked_attempts = attempts;
+      pipelineState.status = 'in_progress';
+      await this.savePipelineJson(ticket.id, pipelineState);
+      console.log(`[blocked-retry] ${ticket.id}: attempt ${attempts}/${MAX_BLOCKED_ATTEMPTS}`);
+    }
+
     // Start usage monitoring
     this.startUsageMonitor();
+
+    // Capture test-suite baseline before any work on this ticket. Skipped on
+    // crash recovery (already captured) and in dry-run (plan only). This is
+    // what prevents this ticket from being blamed for red tests left behind
+    // by earlier tickets whose implement step never finished.
+    if (!this.dryRun) {
+      try {
+        await this.captureBaseline(ticket, pipelineState);
+      } catch (err) {
+        console.error(`[baseline] capture failed for ${ticket.id}: ${err.message}. Continuing without baseline — tests_green may flag preexisting failures as new.`);
+        this.emit('baseline_capture_failed', { ticket: ticket.id, error: err.message });
+      }
+      // Record which files were already dirty so rollback/auto-commit can
+      // distinguish this ticket's output from earlier uncommitted work.
+      try {
+        await this.snapshotDirtyAtStart(ticket, pipelineState);
+      } catch (err) {
+        console.error(`[dirty-snapshot] failed for ${ticket.id}: ${err.message}`);
+      }
+    }
 
     for (const stepConfig of steps) {
       // Session sharing: reuse previous session when configured.
@@ -177,6 +241,9 @@ export class Pipeline {
 
       this.emit('step_start', { ticket: ticket.id, step: stepConfig.name });
       const stepStartTime = Date.now();
+      // Reset per-step rate-limit wait accumulator so step duration can
+      // exclude idle time spent waiting for the 5h usage window to reset.
+      this.currentStepWaitMs = 0;
       let stepInputTokens = 0;
       let stepOutputTokens = 0;
       let stepToolCalls = 0;
@@ -224,16 +291,29 @@ export class Pipeline {
 
           // Tests have new failures — ask Claude to fix the code
           healAttempt++;
-          this.emit('tests_green_heal', { ticket: ticket.id, attempt: healAttempt, newFailures: stepArtifacts.new_failures, failedTests: stepArtifacts.failed_tests });
+          // Only surface failures this ticket introduced — preexisting red
+          // tests are captured in pipelineState.baseline_failures and aren't
+          // this ticket's responsibility to fix.
+          const newFailedTests = stepArtifacts.new_failed_tests || stepArtifacts.failed_tests || [];
+          this.emit('tests_green_heal', { ticket: ticket.id, attempt: healAttempt, newFailures: stepArtifacts.new_failures, failedTests: newFailedTests });
           console.log(`[self-heal] ${ticket.id}/tests_green: ${stepArtifacts.new_failures} new failures, fix attempt ${healAttempt}/${maxHealAttempts}`);
+
+          // Detect load/compile errors — these indicate a broken import
+          // (usually a missing dependency in pubspec/package.json), not a
+          // logic bug. Self-heal needs to treat them differently.
+          const loadErrorPattern = /^loading\s+\/|uri_does_not_exist|undefined[_ ]class|undefined[_ ]function|Target of URI doesn't exist/i;
+          const loadErrors = newFailedTests.filter((t) => loadErrorPattern.test(t));
+          const depHint = loadErrors.length > 0
+            ? `\n\n⚠️  LOAD ERRORS DETECTED (${loadErrors.length} of ${newFailedTests.length}). When a test fails with "loading <path>" or an "URI doesn't exist / undefined class" message, the test file cannot compile — usually because an imported package is NOT in the project's manifest. DO NOT try to fix the test logic first. FIRST:\n1. Read the failing test file and list every \`package:\` / \`import ... from\` it uses.\n2. Compare against pubspec.yaml / package.json.\n3. If any dependency is missing, add it (for Dart: under dev_dependencies with a compatible version; for Node: npm install / add to package.json).\n4. Then re-examine remaining test failures once compile errors are gone.`
+            : '';
 
           const fixPrompt = `You are fixing failing tests for ticket ${ticket.id}: "${ticket.title}".
 
-FAILING TESTS (${stepArtifacts.new_failures} new failures):
-${stepArtifacts.failed_tests.join('\n')}
+FAILING TESTS (${stepArtifacts.new_failures} new failures — preexisting red tests are filtered out):
+${newFailedTests.join('\n')}
 
 TEST OUTPUT (last lines):
-${stepArtifacts.test_output_summary}
+${stepArtifacts.test_output_summary}${depHint}
 
 PIPELINE STATE:
 ${JSON.stringify({ plan: pipelineState.steps.plan, implement: pipelineState.steps.implement, tests_green: pipelineState.steps.tests_green })}
@@ -275,28 +355,57 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           }
         }
 
-        const durationMs = Date.now() - stepStartTime;
+        const wallMs = Date.now() - stepStartTime;
+        const waitedMs = this.currentStepWaitMs || 0;
+        const durationMs = Math.max(0, wallMs - waitedMs);
         const finalArtifacts = pipelineState.steps.tests_green || {};
         const metric = {
           step: 'tests_green', model: healAttempt > 0 ? 'native+sonnet' : 'native',
           startedAt: new Date(stepStartTime).toISOString(),
           durationMs, durationFormatted: formatDuration(durationMs),
+          wallMs, waitedMs,
           inputTokens: 0, outputTokens: 0, toolCalls: 0,
           filesChanged: 0, gate: 'pass', status: finalArtifacts.status || 'done',
           usagePercent: this.getUsagePercent().percent,
         };
         stepMetrics.push(metric);
+        if (pipelineState.steps.tests_green && typeof pipelineState.steps.tests_green === 'object') {
+          pipelineState.steps.tests_green.metrics = metric;
+          try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* non-fatal */ }
+        }
         this.emit('step_done', { ticket: ticket.id, step: 'tests_green', artifacts: finalArtifacts, metrics: metric });
         continue;
       }
+
+      // Per-step aggregators for cache tokens, per-model split, per-tool counts.
+      let stepCacheReadTokens = 0;
+      let stepCacheCreationTokens = 0;
+      const stepTokensByModel = {};
+      const stepToolCallsByName = {};
+      const stepSessionRotateCountBefore = this.sessionRotateCount || 0;
 
       // Run step with self-healing: execute → auto-populate → validate → heal → retry
       const stepResult = await this.runStepWithHealing(ticket, stepConfig, pipelineState, stepStartTime, {
         onTokens: (usage) => {
           if (usage.input_tokens) { this.lastInputTokens = usage.input_tokens; stepInputTokens = usage.input_tokens; }
           if (usage.output_tokens) stepOutputTokens += usage.output_tokens;
+          if (usage.cache_read_input_tokens) stepCacheReadTokens = usage.cache_read_input_tokens;
+          if (usage.cache_creation_input_tokens) stepCacheCreationTokens = usage.cache_creation_input_tokens;
+          if (usage.modelUsage && typeof usage.modelUsage === 'object') {
+            for (const [model, mu] of Object.entries(usage.modelUsage)) {
+              const slot = stepTokensByModel[model] || { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+              slot.inputTokens = Math.max(slot.inputTokens, mu.inputTokens || 0);
+              slot.outputTokens = Math.max(slot.outputTokens, mu.outputTokens || 0);
+              slot.cacheReadTokens = Math.max(slot.cacheReadTokens, mu.cacheReadInputTokens || 0);
+              slot.cacheCreationTokens = Math.max(slot.cacheCreationTokens, mu.cacheCreationInputTokens || 0);
+              stepTokensByModel[model] = slot;
+            }
+          }
         },
-        onToolCall: () => { stepToolCalls++; },
+        onToolCall: (name) => {
+          stepToolCalls++;
+          if (name) stepToolCallsByName[name] = (stepToolCallsByName[name] || 0) + 1;
+        },
       });
       pipelineState = stepResult.pipelineState;
 
@@ -323,27 +432,55 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       }
 
       // Collect step metrics with cost
-      const stepDurationMs = Date.now() - stepStartTime;
+      const stepWallMs = Date.now() - stepStartTime;
+      const stepWaitedMs = this.currentStepWaitMs || 0;
+      const stepDurationMs = Math.max(0, stepWallMs - stepWaitedMs); // working time only
       const stepArtifactsFinal = pipelineState.steps[stepConfig.name] || {};
       const filesChanged = stepArtifactsFinal.files_changed?.length || 0;
       const filesUpdated = stepArtifactsFinal.files_updated?.length || 0;
       const stepModel = stepConfig.model || this.config.session.model;
 
+      const attempts = stepResult.attempts || 1;
+      const stepMaxTurnsHit = stepResult.maxTurnsHit || false;
+      const stepGateFailures = stepResult.gateFailuresByAttempt || [];
+      const cacheReadTokens = stepCacheReadTokens;
+      const cacheCreationTokens = stepCacheCreationTokens;
+      const cacheDenom = cacheReadTokens + cacheCreationTokens + stepInputTokens;
+      const cacheHitRatio = cacheDenom > 0 ? Number((cacheReadTokens / cacheDenom).toFixed(3)) : null;
+      const sessionRotations = Math.max(0, (this.sessionRotateCount || 0) - stepSessionRotateCountBefore);
       const metric = {
         step: stepConfig.name,
         model: stepModel,
         startedAt: new Date(stepStartTime).toISOString(),
         durationMs: stepDurationMs,
         durationFormatted: formatDuration(stepDurationMs),
+        wallMs: stepWallMs,
+        waitedMs: stepWaitedMs,
         inputTokens: stepInputTokens,
         outputTokens: stepOutputTokens,
+        cacheReadTokens,
+        cacheCreationTokens,
+        cacheHitRatio,
+        tokensByModel: stepTokensByModel,
         toolCalls: stepToolCalls,
+        toolCallsByName: stepToolCallsByName,
+        attempts,
+        maxTurnsHit: stepMaxTurnsHit,
+        gate: attempts > 1 ? 'failed-then-healed' : 'pass',
+        gateFailures: stepGateFailures,
+        sessionRotations,
         filesChanged: filesChanged || filesUpdated,
-        gate: 'pass',
         status: stepArtifactsFinal.status || 'done',
         usagePercent: this.getUsagePercent().percent,
       };
       stepMetrics.push(metric);
+
+      // Persist metrics onto the ticket's step record so they survive crashes
+      // and are readable from the reports API.
+      if (pipelineState.steps[stepConfig.name] && typeof pipelineState.steps[stepConfig.name] === 'object') {
+        pipelineState.steps[stepConfig.name].metrics = metric;
+        try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* non-fatal */ }
+      }
 
       console.log(`${logPrefix(this.getUsagePercent().percent)} [step] ${ticket.id}/${stepConfig.name} | ${stepModel} | ${formatDuration(stepDurationMs)} | ${stepInputTokens.toLocaleString()} in / ${stepOutputTokens.toLocaleString()} out | ${stepToolCalls} tools`);
 
@@ -426,12 +563,30 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     }
 
     // Build and emit ticket summary report
-    const ticketDurationMs = Date.now() - ticketStartTime;
+    const ticketWallMs = Date.now() - ticketStartTime;
+    const ticketWaitedMs = stepMetrics.reduce((s, m) => s + (m.waitedMs || 0), 0);
+    const ticketDurationMs = Math.max(0, ticketWallMs - ticketWaitedMs);
     const totalInputTokens = stepMetrics.reduce((s, m) => s + m.inputTokens, 0);
     const totalOutputTokens = stepMetrics.reduce((s, m) => s + m.outputTokens, 0);
+    const totalCacheReadTokens = stepMetrics.reduce((s, m) => s + (m.cacheReadTokens || 0), 0);
+    const totalCacheCreationTokens = stepMetrics.reduce((s, m) => s + (m.cacheCreationTokens || 0), 0);
     const totalToolCalls = stepMetrics.reduce((s, m) => s + m.toolCalls, 0);
     const totalFilesChanged = stepMetrics.reduce((s, m) => s + m.filesChanged, 0);
     const usageEnd = this.getUsagePercent();
+
+    // Rework signals: tokens/time consumed by retries beyond the first attempt,
+    // review cycles, and tests_green self-heal (all indicators of first-pass failure).
+    const reworkInputTokens = stepMetrics
+      .filter((m) => (m.attempts || 1) > 1)
+      .reduce((s, m) => s + m.inputTokens, 0);
+    const reworkOutputTokens = stepMetrics
+      .filter((m) => (m.attempts || 1) > 1)
+      .reduce((s, m) => s + m.outputTokens, 0);
+    const reworkTokenRatio = (totalInputTokens + totalOutputTokens) > 0
+      ? Number(((reworkInputTokens + reworkOutputTokens) / (totalInputTokens + totalOutputTokens)).toFixed(3))
+      : 0;
+    const cacheDenom = totalCacheReadTokens + totalCacheCreationTokens + totalInputTokens;
+    const cacheHitRatio = cacheDenom > 0 ? Number((totalCacheReadTokens / cacheDenom).toFixed(3)) : null;
 
     const report = {
       ticket: ticket.id,
@@ -440,10 +595,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       date: new Date().toISOString().split('T')[0],
       totalDurationMs: ticketDurationMs,
       totalDurationFormatted: formatDuration(ticketDurationMs),
+      totalWallMs: ticketWallMs,
+      totalWaitedMs: ticketWaitedMs,
       totalInputTokens,
       totalOutputTokens,
+      totalCacheReadTokens,
+      totalCacheCreationTokens,
+      cacheHitRatio,
       totalToolCalls,
       totalFilesChanged,
+      reviewCycles: pipelineState._reviewCycles || 0,
+      reworkInputTokens,
+      reworkOutputTokens,
+      reworkTokenRatio,
+      maxTurnsHitSteps: stepMetrics.filter((m) => m.maxTurnsHit).map((m) => m.step),
+      sessionRotations: stepMetrics.reduce((s, m) => s + (m.sessionRotations || 0), 0),
       usagePercent: usageEnd.percent,
       resetsAt: usageEnd.resetTime,
       steps: stepMetrics,
@@ -523,6 +689,349 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     await writeFile(path, JSON.stringify(state, null, 2));
   }
 
+  // --- File tracking: dirty snapshot, rollback, auto-commit ---
+
+  // Union of files_changed across every step's artifacts. Pipeline state
+  // files (memory/pipeline/*.json) are excluded — they're bookkeeping, not
+  // ticket output. Paths are relative to project_dir, matching git.
+  collectDeclaredFiles(pipelineState) {
+    const out = new Set();
+    for (const step of Object.values(pipelineState.steps || {})) {
+      if (!step || typeof step !== 'object') continue;
+      for (const fc of (step.files_changed || [])) {
+        const p = typeof fc === 'object' ? fc.path : fc;
+        if (!p || typeof p !== 'string') continue;
+        if (p.startsWith('memory/pipeline/')) continue;
+        out.add(p);
+      }
+    }
+    return out;
+  }
+
+  // Authoritative "this ticket touched" set: union of LLM-declared files
+  // AND git-observed changes since ticket start. Catches silent writes
+  // (LLM forgot to list a file, step wrote a sibling config, crash mid-
+  // step). Files already dirty at ticket start are never attributed here —
+  // they belong to earlier uncommitted work or manual edits.
+  collectTicketFiles(pipelineState) {
+    const out = this.collectDeclaredFiles(pipelineState);
+    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
+    const nowDirty = this.getDirtyFiles(this.config.project_dir);
+    for (const path of nowDirty.keys()) {
+      if (dirtyAtStart.has(path)) continue;
+      if (path.startsWith('memory/pipeline/')) continue;
+      out.add(path);
+    }
+    return out;
+  }
+
+  // `git status --porcelain` snapshot keyed by path. Values: 'M' (modified),
+  // 'A' (added), 'D' (deleted), '??' (untracked), etc. Best-effort: returns
+  // empty map on git error so downstream code degrades gracefully.
+  getDirtyFiles(projectDir) {
+    const map = new Map();
+    try {
+      const porcelain = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8', timeout: 10000 });
+      for (const line of porcelain.split('\n')) {
+        if (!line) continue;
+        const code = line.slice(0, 2).trim();
+        const path = line.slice(3).trim();
+        if (path) map.set(path, code || 'M');
+      }
+    } catch { /* best effort */ }
+    return map;
+  }
+
+  // Record which files were already dirty/untracked at ticket start so
+  // rollback and auto-commit can ignore them — they belong to earlier
+  // uncommitted tickets or manual edits, not to this ticket.
+  async snapshotDirtyAtStart(ticket, pipelineState) {
+    if (Array.isArray(pipelineState.dirty_at_start)) return; // already captured
+    const dirty = this.getDirtyFiles(this.config.project_dir);
+    pipelineState.dirty_at_start = Array.from(dirty.keys());
+    pipelineState.dirty_at_start_captured_at = new Date().toISOString();
+    await this.savePipelineJson(ticket.id, pipelineState);
+    this.emit('dirty_at_start_captured', { ticket: ticket.id, count: pipelineState.dirty_at_start.length });
+  }
+
+  // Revert declared files the ticket authored, leaving everything else
+  // untouched. Only called on terminal failure — blocked tickets keep their
+  // files so the next retry can resume without re-running earlier steps.
+  async rollbackTicketFiles(ticket, pipelineState) {
+    if (pipelineState.rollback?.at) return; // already rolled back — idempotent
+    const projectDir = this.config.project_dir;
+    const touched = this.collectTicketFiles(pipelineState);
+    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
+    const nowDirty = this.getDirtyFiles(projectDir);
+
+    const reverted = [];
+    const deleted = [];
+    const skipped = [];
+    const errors = [];
+
+    for (const path of touched) {
+      if (dirtyAtStart.has(path)) { skipped.push(path); continue; } // not this ticket's
+      const code = nowDirty.get(path);
+      if (!code) continue; // file is not currently changed
+      try {
+        if (code === '??' || code === 'A') {
+          execSync(`rm -f ${JSON.stringify(path)}`, { cwd: projectDir, encoding: 'utf-8', timeout: 5000 });
+          deleted.push(path);
+        } else {
+          execSync(`git checkout HEAD -- ${JSON.stringify(path)}`, { cwd: projectDir, encoding: 'utf-8', timeout: 10000 });
+          reverted.push(path);
+        }
+      } catch (err) {
+        errors.push({ path, error: err.message });
+      }
+    }
+
+    pipelineState.rollback = {
+      at: new Date().toISOString(),
+      reverted, deleted, skipped, errors,
+    };
+    await this.savePipelineJson(ticket.id, pipelineState);
+
+    console.log(`[rollback] ${ticket.id}: reverted ${reverted.length}, deleted ${deleted.length}, skipped ${skipped.length} (not this ticket's), errors ${errors.length}`);
+    this.emit('ticket_rolled_back', {
+      ticket: ticket.id,
+      revertedCount: reverted.length,
+      deletedCount: deleted.length,
+      skippedCount: skipped.length,
+      errorCount: errors.length,
+    });
+  }
+
+  // Commit the ticket's declared files as a single commit tagged with the
+  // ticket ID. Only stages files the ticket declared AND currently dirty —
+  // other uncommitted work in the tree is left alone. No-op if nothing
+  // declared by this ticket is currently dirty (idempotent across retries).
+  async commitTicketFiles(ticket, pipelineState) {
+    const projectDir = this.config.project_dir;
+    const touched = this.collectTicketFiles(pipelineState);
+    const nowDirty = this.getDirtyFiles(projectDir);
+
+    const toCommit = [];
+    for (const path of touched) {
+      if (nowDirty.has(path)) toCommit.push(path);
+    }
+    if (toCommit.length === 0) {
+      this.emit('auto_commit_skipped', { ticket: ticket.id, reason: 'no declared files currently dirty' });
+      return;
+    }
+
+    const title = (ticket.title || '').slice(0, 72);
+    const subject = `[${ticket.id}] ${title}`.trim();
+    const bodyLines = [''];
+    const plan = pipelineState.steps?.plan;
+    if (plan?.summary) bodyLines.push(plan.summary);
+    else if (ticket.description) bodyLines.push(ticket.description.slice(0, 500));
+    bodyLines.push('', '🤖 toshelabs-pipeline');
+    const body = bodyLines.join('\n');
+    const message = `${subject}\n${body}`;
+
+    try {
+      // Stage only the declared files — never `git add -A`.
+      const quoted = toCommit.map((p) => JSON.stringify(p)).join(' ');
+      execSync(`git add -- ${quoted}`, { cwd: projectDir, encoding: 'utf-8', timeout: 15000 });
+
+      // Detect whether there's anything actually staged by this ticket
+      // (files may have been identical to HEAD → git add is a no-op).
+      const staged = execSync('git diff --cached --name-only', { cwd: projectDir, encoding: 'utf-8', timeout: 10000 }).trim();
+      if (!staged) {
+        this.emit('auto_commit_skipped', { ticket: ticket.id, reason: 'no diff after staging' });
+        return;
+      }
+
+      // Escape single quotes in message for shell safety.
+      const safeMsg = message.replace(/'/g, "'\\''");
+      execSync(`git commit -m '${safeMsg}' -- ${quoted}`, { cwd: projectDir, encoding: 'utf-8', timeout: 30000 });
+
+      const sha = execSync('git rev-parse HEAD', { cwd: projectDir, encoding: 'utf-8', timeout: 5000 }).trim();
+      pipelineState.auto_commit = { at: new Date().toISOString(), sha, files: toCommit };
+      await this.savePipelineJson(ticket.id, pipelineState);
+
+      console.log(`[auto-commit] ${ticket.id}: committed ${toCommit.length} files as ${sha.slice(0, 7)}`);
+      this.emit('auto_commit_done', { ticket: ticket.id, sha, fileCount: toCommit.length });
+    } catch (err) {
+      const tail = (err.stderr || err.stdout || err.message || '').toString().slice(-500);
+      console.error(`[auto-commit] ${ticket.id} failed: ${tail}`);
+      // Persist so reports can list tickets done-but-not-committed and the
+      // user knows they need manual intervention.
+      pipelineState.auto_commit = { status: 'failed', at: new Date().toISOString(), error: tail };
+      try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* best-effort */ }
+      this.emit('auto_commit_failed', { ticket: ticket.id, error: tail });
+    }
+  }
+
+  // --- Dependency-declaration gate ---
+
+  checkDepsDeclared(stepArtifacts, planArtifacts) {
+    const projectDir = this.config.project_dir;
+    // Dart/Flutter packages that are available without being in pubspec:
+    const DART_BUILTIN = new Set(['flutter', 'flutter_test', 'flutter_localizations', 'flutter_driver']);
+    // Node built-ins (not exhaustive — covers the common ones):
+    const NODE_BUILTIN = new Set([
+      'fs', 'path', 'os', 'url', 'util', 'crypto', 'http', 'https', 'child_process',
+      'events', 'stream', 'buffer', 'readline', 'zlib', 'net', 'tls', 'dns', 'assert',
+      'fs/promises',
+    ]);
+
+    const changed = (stepArtifacts.files_changed || [])
+      .map((f) => (typeof f === 'object' ? f.path : f))
+      .filter(Boolean);
+    const planned = (planArtifacts?.files_to_change || [])
+      .map((f) => (typeof f === 'object' ? f.path : f))
+      .filter(Boolean);
+    const planSet = new Set(planned);
+
+    const missing = [];
+
+    for (const rel of changed) {
+      const ext = rel.slice(rel.lastIndexOf('.'));
+      if (!['.dart', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) continue;
+      const abs = resolve(projectDir, rel);
+      if (!existsSync(abs)) continue;
+      let src = '';
+      try { src = readFileSync(abs, 'utf-8'); } catch { continue; }
+
+      const imported = new Set();
+      if (ext === '.dart') {
+        for (const m of src.matchAll(/import\s+['"]package:([^/'"]+)/g)) imported.add(m[1]);
+      } else {
+        // ES module + CJS: capture first path segment; scoped packages keep @scope/name
+        const addJsPkg = (spec) => {
+          if (!spec || spec.startsWith('.') || spec.startsWith('/')) return;
+          if (spec.startsWith('node:')) return;
+          const parts = spec.split('/');
+          imported.add(spec.startsWith('@') ? `${parts[0]}/${parts[1]}` : parts[0]);
+        };
+        for (const m of src.matchAll(/import\s+(?:[^'"`;]+?from\s+)?['"]([^'"]+)['"]/g)) addJsPkg(m[1]);
+        for (const m of src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)) addJsPkg(m[1]);
+      }
+      if (imported.size === 0) continue;
+
+      const manifest = this.findNearestManifest(abs, ext === '.dart' ? 'pubspec.yaml' : 'package.json');
+      if (!manifest) continue;
+
+      const declared = ext === '.dart'
+        ? this.parseDartDeps(manifest)
+        : this.parseNodeDeps(manifest);
+      const builtins = ext === '.dart' ? DART_BUILTIN : NODE_BUILTIN;
+      const manifestRel = manifest.startsWith(projectDir + '/') ? manifest.slice(projectDir.length + 1) : manifest;
+
+      for (const pkg of imported) {
+        if (declared.has(pkg)) continue;
+        if (builtins.has(pkg)) continue;
+        // If the ticket explicitly planned to change the manifest, the implement
+        // step may still be mid-way — but it must have added it by now or the
+        // gate fires. planSet tells us they acknowledged it; we still require
+        // the manifest to contain the dep.
+        missing.push({ file: rel, pkg, manifest: manifestRel, manifestInPlan: planSet.has(manifestRel) });
+      }
+    }
+
+    return missing;
+  }
+
+  findNearestManifest(startFile, name) {
+    let dir = startFile.slice(0, startFile.lastIndexOf('/'));
+    const root = this.config.project_dir;
+    while (dir.startsWith(root)) {
+      const candidate = resolve(dir, name);
+      if (existsSync(candidate)) return candidate;
+      const parent = dir.slice(0, dir.lastIndexOf('/'));
+      if (parent === dir) break;
+      dir = parent;
+    }
+    return null;
+  }
+
+  parseDartDeps(pubspecPath) {
+    const out = new Set();
+    try {
+      const src = readFileSync(pubspecPath, 'utf-8');
+      // The package's own name is implicitly importable (`package:<name>/…`).
+      const nameMatch = src.match(/^name:\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*$/m);
+      if (nameMatch) out.add(nameMatch[1]);
+      // Collect entries under dependencies / dev_dependencies / overrides.
+      let inDeps = false;
+      for (const line of src.split('\n')) {
+        if (/^(dependencies|dev_dependencies|dependency_overrides):\s*$/.test(line)) { inDeps = true; continue; }
+        if (/^\S/.test(line)) { inDeps = false; continue; }
+        if (!inDeps) continue;
+        const m = line.match(/^\s{2}([a-zA-Z_][a-zA-Z0-9_]*):/);
+        if (m) out.add(m[1]);
+      }
+    } catch { /* best-effort */ }
+    return out;
+  }
+
+  parseNodeDeps(pkgJsonPath) {
+    const out = new Set();
+    try {
+      const json = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
+      for (const section of ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies']) {
+        const obj = json[section];
+        if (obj && typeof obj === 'object') Object.keys(obj).forEach((k) => out.add(k));
+      }
+    } catch { /* best-effort */ }
+    return out;
+  }
+
+  async syncDepsIfManifestChanged(pipelineState, projectDir, env) {
+    const declared = (pipelineState.steps?.implement?.files_changed || [])
+      .map((f) => (typeof f === 'object' ? f.path : f))
+      .filter(Boolean);
+
+    // Also pick up any manifest that git sees as modified/untracked — the
+    // pipeline's implement sometimes edits pubspec/package.json without
+    // recording it in files_changed. Without this, a tests_green retry on
+    // a stranded ticket would skip the sync.
+    const gitDirty = [];
+    try {
+      const porcelain = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8', timeout: 10000 });
+      for (const line of porcelain.split('\n')) {
+        const path = line.slice(3).trim();
+        if (!path) continue;
+        const base = path.slice(path.lastIndexOf('/') + 1);
+        if (base === 'pubspec.yaml' || base === 'package.json') gitDirty.push(path);
+      }
+    } catch { /* best-effort */ }
+
+    const allChanged = Array.from(new Set([...declared, ...gitDirty]));
+
+    // Build unique (cwd, cmd) pairs — one per manifest directory.
+    const syncs = new Map();
+    for (const rel of allChanged) {
+      const base = rel.slice(rel.lastIndexOf('/') + 1);
+      if (base === 'pubspec.yaml') {
+        const dir = rel.slice(0, rel.lastIndexOf('/')) || '.';
+        syncs.set(`flutter:${dir}`, { cwd: resolve(projectDir, dir), cmd: 'flutter pub get' });
+      } else if (base === 'package.json') {
+        const dir = rel.slice(0, rel.lastIndexOf('/')) || '.';
+        // `npm install` picks up new deps AND updates the lockfile.
+        syncs.set(`npm:${dir}`, { cwd: resolve(projectDir, dir), cmd: 'npm install --no-audit --no-fund --silent' });
+      }
+    }
+    if (syncs.size === 0) return;
+
+    for (const { cwd, cmd } of syncs.values()) {
+      console.log(`[deps-sync] ${cmd} (cwd=${cwd})`);
+      this.emit('deps_sync_start', { cmd, cwd });
+      try {
+        execSync(`${cmd} 2>&1`, { cwd, encoding: 'utf-8', env, timeout: 300000, maxBuffer: 20 * 1024 * 1024 });
+        this.emit('deps_sync_done', { cmd, cwd });
+      } catch (err) {
+        const tail = (err.stdout || err.stderr || err.message || '').toString().slice(-500);
+        console.error(`[deps-sync] FAILED: ${cmd} — ${tail}`);
+        this.emit('deps_sync_failed', { cmd, cwd, tail });
+        // Non-fatal: tests_green will expose the resulting compile errors, and
+        // self-heal has the dep-aware hint. Don't abort the step here.
+      }
+    }
+  }
+
   // --- Crash recovery ---
 
   async checkCrashedPipelines() {
@@ -584,6 +1093,8 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
   async runStepWithHealing(ticket, stepConfig, pipelineState, stepStartTime, callbacks) {
     const maxAttempts = 3; // original + 2 heal attempts
+    const gateFailuresByAttempt = [];
+    let lastMaxTurnsHit = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const isRetry = attempt > 1;
 
@@ -623,12 +1134,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           env: this.config.environment || {},
           onData: (event) => {
             const usage = event.message?.usage || event.usage;
-            if (usage?.input_tokens) { attemptInputTokens = usage.input_tokens; callbacks.onTokens({ input_tokens: usage.input_tokens }); }
-            if (usage?.output_tokens) { attemptOutputTokens += usage.output_tokens; callbacks.onTokens({ output_tokens: usage.output_tokens }); }
+            if (usage) {
+              if (usage.input_tokens) { attemptInputTokens = usage.input_tokens; callbacks.onTokens({ input_tokens: usage.input_tokens }); }
+              if (usage.output_tokens) { attemptOutputTokens += usage.output_tokens; callbacks.onTokens({ output_tokens: usage.output_tokens }); }
+              if (usage.cache_read_input_tokens || usage.cache_creation_input_tokens || usage.modelUsage) {
+                callbacks.onTokens({
+                  cache_read_input_tokens: usage.cache_read_input_tokens,
+                  cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                  modelUsage: usage.modelUsage,
+                });
+              }
+            }
             // stream-json emits tool_use inside assistant messages, not as content_block_start
             if (event.type === 'assistant' && event.message?.content) {
               for (const block of event.message.content) {
-                if (block.type === 'tool_use') { attemptToolCalls++; callbacks.onToolCall(); }
+                if (block.type === 'tool_use') { attemptToolCalls++; callbacks.onToolCall(block.name); }
               }
             }
             this.emit('claude_event', { ticket: ticket.id, step: stepConfig.name, event });
@@ -643,6 +1163,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
       // Log per-attempt usage
       const maxTurnsHit = result.maxTurnsHit || false;
+      lastMaxTurnsHit = maxTurnsHit;
       if (maxTurnsHit) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: max turns (${stepConfig.max_turns || 30}) reached`);
       console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/${stepConfig.name} (${attemptLabel}) | ${attemptModel} | ${formatDuration(Date.now() - attemptStartTime)} | ${attemptInputTokens.toLocaleString()} in / ${attemptOutputTokens.toLocaleString()} out | ${attemptToolCalls} tools${maxTurnsHit ? ' | MAX TURNS HIT' : ''}`);
       this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit });
@@ -659,6 +1180,25 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const planArtifacts = pipelineState.steps.plan || {};
       const validation = validateStep(stepArtifacts, stepConfig, planArtifacts);
 
+      // Post-implement dependency check: every package imported by new/modified
+      // source or test files must be declared in the project's manifest. Catches
+      // the T-333-class bug where a planner introduces `fake_cloud_firestore`
+      // imports but forgets to add it to pubspec.yaml, which load-errors every
+      // subsequent ticket's tests_green run.
+      if (stepConfig.name === 'implement') {
+        try {
+          const missing = this.checkDepsDeclared(stepArtifacts, planArtifacts);
+          if (missing.length > 0) {
+            validation.pass = false;
+            validation.failures.push(
+              `undeclared dependencies (${missing.length}): ${missing.map((m) => `${m.pkg} imported in ${m.file} but missing from ${m.manifest}`).join(' | ')}`,
+            );
+          }
+        } catch (err) {
+          console.warn(`[deps-check] skipped for ${ticket.id}: ${err.message}`);
+        }
+      }
+
       this.emit('step_gate', {
         ticket: ticket.id,
         step: stepConfig.name,
@@ -668,12 +1208,14 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       });
 
       if (validation.pass) {
-        return { pipelineState, lastResult: result.result };
+        return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
+      // Remember the failures this attempt produced before deciding what to do next.
+      gateFailuresByAttempt.push({ attempt, failures: validation.failures });
 
       // Blocked steps are intentional — don't heal
       if (stepArtifacts.status === 'blocked') {
-        return { pipelineState, lastResult: result.result };
+        return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
 
       // Review with findings = feedback loop, not self-heal.
@@ -682,7 +1224,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // Ensure status is 'blocked' so the feedback loop picks it up
         pipelineState.steps.review.status = 'blocked';
         await this.savePipelineJson(ticket.id, pipelineState);
-        return { pipelineState, lastResult: result.result };
+        return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
 
       // Max turns with no tool calls = step couldn't do any work, healing won't help
@@ -954,16 +1496,24 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     }
   }
 
-  // --- tests_green: run flutter test + analyze directly ---
+  // --- Shared test-suite runner: used by baseline capture and tests_green ---
 
-  async runTestsGreen(ticket, pipelineState) {
+  // Runs unit + analyzer + extras and parses the output. Returns the raw
+  // failure data without any baseline comparison or step-result framing —
+  // callers decide what to do with it. Extracted so baseline capture and
+  // tests_green don't duplicate the test-harness plumbing.
+  //
+  // runAllExtras=true unconditionally runs every configured extras phase
+  // (used for baseline, where we don't yet know which phases this ticket
+  // will trigger). runAllExtras=false keeps the trigger_file_prefix filter
+  // driven by the current implement files_changed.
+  async runTestSuite(pipelineState, { runAllExtras = false } = {}) {
     const projectDir = this.config.project_dir;
     const env = { ...process.env };
     for (const [k, v] of Object.entries(this.config.environment || {})) {
       env[k] = String(v).replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '');
     }
 
-    const baseline = pipelineState.steps.tests_red?.baseline_failures || [];
     const profile = this.config.project_profile || {};
     const tc = profile.test_commands || {};
 
@@ -979,14 +1529,19 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     };
 
+    // Sync dependencies when a manifest changed in implement. A pubspec /
+    // package.json edit doesn't take effect until pub get / npm install
+    // refreshes the lockfile + resolved packages. Without this, tests fail
+    // with "uri doesn't exist" even though the dep is declared.
+    await this.syncDepsIfManifestChanged(pipelineState, projectDir, env);
+
     // --- Unit tests ---
-    this.emit('tests_green_run', { ticket: ticket.id, phase: 'unit_tests' });
     if (!tc.unit) {
-      console.warn(`[tests_green] WARNING: project_profile.test_commands.unit is not configured — no unit tests will run for ${ticket.id}.`);
+      console.warn(`[test-suite] WARNING: project_profile.test_commands.unit is not configured — no unit tests will run.`);
     } else {
-      console.log(`[tests_green] Running unit tests (${tc.unit.cmd})...`);
+      console.log(`[test-suite] Running unit tests (${tc.unit.cmd})...`);
     }
-    const { output: testOutput, exitCode: testExitCode, skipped: unitSkipped } = runPhase(tc.unit);
+    const { output: testOutput, exitCode: unitExitCode, skipped: unitSkipped } = runPhase(tc.unit);
 
     let passed = 0, failed = 0;
     const statsRe = tc.unit?.stats_pattern ? new RegExp(tc.unit.stats_pattern, 'g') : /\+(\d+)\s+-(\d+):\s/g;
@@ -1007,24 +1562,19 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     }
 
-    const baselineSet = new Set(baseline);
-    const newFailures = failedTests.filter((t) => !baselineSet.has(t)).length;
-
-    // Detect silent failures: non-zero exit with no parseable stats ⇒ the
-    // runner crashed before producing a summary. Don't let that slip through
-    // as a green pass.
-    let unitCrashed = false;
-    if (!unitSkipped && testExitCode !== 0 && matches.length === 0) {
-      unitCrashed = true;
-      console.error(`[tests_green] unit runner crashed (exit ${testExitCode}) with no parseable stats. Output head: ${testOutput.slice(0, 500)}`);
-    }
+    // Silent failure: non-zero exit with no parseable stats ⇒ the runner
+    // crashed before producing a summary. Don't let that slip through as
+    // a green pass.
+    const unitCrashed = !unitSkipped && unitExitCode !== 0 && matches.length === 0;
+    // Suspicious: ran unit but saw zero tests total (command ran but no
+    // results). Common cause: wrong cwd, wrong test path, empty glob.
+    const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed;
 
     // --- Analyzer ---
-    this.emit('tests_green_run', { ticket: ticket.id, phase: 'analyzer' });
     let analyzeOutput = '';
     let analyzerErrors = 0;
     if (tc.analyzer) {
-      console.log(`[tests_green] Running analyzer (${tc.analyzer.cmd})...`);
+      console.log(`[test-suite] Running analyzer (${tc.analyzer.cmd})...`);
       analyzeOutput = runPhase(tc.analyzer).output;
       const ok = tc.analyzer.success_marker || 'No issues found';
       if (analyzeOutput.includes(ok)) {
@@ -1036,55 +1586,118 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     }
 
-    // --- Extra phases (e.g. backend, integration), each conditional on file-path prefix ---
-    const implFiles = pipelineState.steps.implement?.files_changed || [];
+    // --- Extras (e.g. backend, integration) ---
+    const implFiles = pipelineState.steps?.implement?.files_changed || [];
     const implPaths = implFiles.map((f) => (typeof f === 'object' ? f.path : f));
     let extraOutput = '';
     const extraFailures = [];
     for (const [phase, spec] of Object.entries(tc.extras || {})) {
       const prefix = spec.trigger_file_prefix;
-      if (prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
-      console.log(`[tests_green] Running ${phase} (${spec.cmd})...`);
+      if (!runAllExtras && prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
+      console.log(`[test-suite] Running ${phase} (${spec.cmd})...`);
       const r = runPhase(spec);
       // Keep per-phase tail in the summary (don't truncate after concat).
       const phaseTail = r.output.split('\n').slice(-8).join('\n');
       extraOutput += `--- ${phase} (exit ${r.exitCode}) ---\n${phaseTail}\n`;
-      // Non-zero extras must fail the step — no silent greens. Users who
-      // truly want an optional phase can guard it via trigger_file_prefix.
       if (r.exitCode !== 0) extraFailures.push({ phase, exitCode: r.exitCode });
     }
 
-    // Suspicious: ran unit but saw zero tests total (command ran but no
-    // results). Common cause: wrong cwd, wrong test path, empty glob.
-    const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed;
-    if (unitRanNothing) {
-      console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${testExitCode}. Tail: ${testOutput.slice(-500)}`);
+    return {
+      passed, failed, failedTests, unitCrashed, unitExitCode, unitRanNothing, unitSkipped,
+      analyzerErrors, analyzeOutput,
+      extraFailures, extraOutput,
+      testOutput,
+    };
+  }
+
+  // --- Baseline capture: runs at ticket start, records preexisting failures ---
+
+  // Without this, tests_green has no honest way to tell "failure I introduced"
+  // from "failure that was already on disk". The LLM-authored tests_red
+  // baseline was unreliable — captured the wrong test suite, never refreshed
+  // on crash recovery, left every preexisting red test to be healed by later
+  // tickets. Deterministic capture here is the single change that stops that.
+  async captureBaseline(ticket, pipelineState) {
+    if (pipelineState.baseline_captured_at) return; // already captured; survives crash recovery
+    const start = Date.now();
+    this.emit('baseline_capture_start', { ticket: ticket.id });
+    console.log(`[baseline] ${ticket.id}: capturing test failures before any changes...`);
+
+    const res = await this.runTestSuite(pipelineState, { runAllExtras: true });
+
+    pipelineState.baseline_failures = res.failedTests;
+    pipelineState.baseline_analyzer_errors = res.analyzerErrors;
+    pipelineState.baseline_extra_failures = res.extraFailures.map((e) => e.phase);
+    pipelineState.baseline_captured_at = new Date().toISOString();
+    await this.savePipelineJson(ticket.id, pipelineState);
+
+    const durMs = Date.now() - start;
+    console.log(`[baseline] ${ticket.id}: ${res.failedTests.length} failing tests, ${res.analyzerErrors} analyzer errors, ${res.extraFailures.length} extras failing — captured in ${formatDuration(durMs)}`);
+    this.emit('baseline_captured', {
+      ticket: ticket.id,
+      failingTestCount: res.failedTests.length,
+      analyzerErrors: res.analyzerErrors,
+      extraFailureCount: res.extraFailures.length,
+      durationMs: durMs,
+    });
+  }
+
+  // --- tests_green: compare current failures against baseline ---
+
+  async runTestsGreen(ticket, pipelineState) {
+    // Prefer the deterministic baseline captured at ticket start. Fall back
+    // to the legacy LLM-authored tests_red.baseline_failures for older
+    // pipeline JSONs that predate baseline_capture.
+    const baseline = pipelineState.baseline_failures
+      || pipelineState.steps.tests_red?.baseline_failures
+      || [];
+    const baselineExtras = new Set(pipelineState.baseline_extra_failures || []);
+
+    this.emit('tests_green_run', { ticket: ticket.id, phase: 'unit_tests' });
+    const res = await this.runTestSuite(pipelineState, { runAllExtras: false });
+    this.emit('tests_green_run', { ticket: ticket.id, phase: 'analyzer' });
+
+    const baselineSet = new Set(baseline);
+    const newFailedTests = res.failedTests.filter((t) => !baselineSet.has(t));
+    const newFailures = newFailedTests.length;
+
+    // An extras phase that was already failing at baseline isn't this
+    // ticket's fault — only count newly-broken phases.
+    const newExtraFailures = res.extraFailures.filter((e) => !baselineExtras.has(e.phase));
+
+    if (res.unitCrashed) {
+      console.error(`[tests_green] unit runner crashed (exit ${res.unitExitCode}) with no parseable stats. Output head: ${res.testOutput.slice(0, 500)}`);
+    }
+    if (res.unitRanNothing) {
+      console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${res.unitExitCode}. Tail: ${res.testOutput.slice(-500)}`);
     }
 
-    const failed_ = (newFailures > 0) || unitCrashed || extraFailures.length > 0;
+    const failed_ = (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0;
     const step = {
       status: failed_ ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: failed === 0 && !unitCrashed && extraFailures.length === 0,
-      unit_tests: { passed, failed, skipped: 0 },
-      unit_crashed: unitCrashed,
-      unit_exit_code: testExitCode,
-      unit_ran_nothing: unitRanNothing,
-      analyzer_errors: analyzerErrors,
-      failed_tests: failedTests,
+      all_pass: res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0,
+      unit_tests: { passed: res.passed, failed: res.failed, skipped: 0 },
+      unit_crashed: res.unitCrashed,
+      unit_exit_code: res.unitExitCode,
+      unit_ran_nothing: res.unitRanNothing,
+      analyzer_errors: res.analyzerErrors,
+      failed_tests: res.failedTests,
+      new_failed_tests: newFailedTests,
       baseline_failures: baseline,
       new_failures: newFailures,
-      extra_failures: extraFailures,
-      test_output_summary: testOutput.split('\n').slice(-5).join('\n').trim(),
-      analyze_output_summary: analyzeOutput.split('\n').slice(-3).join('\n').trim(),
-      extra_output_summary: extraOutput ? extraOutput.trim() : undefined,
+      extra_failures: res.extraFailures,
+      new_extra_failures: newExtraFailures,
+      test_output_summary: res.testOutput.split('\n').slice(-5).join('\n').trim(),
+      analyze_output_summary: res.analyzeOutput.split('\n').slice(-3).join('\n').trim(),
+      extra_output_summary: res.extraOutput ? res.extraOutput.trim() : undefined,
       native_step: true,
     };
 
     pipelineState.steps.tests_green = step;
     await this.savePipelineJson(ticket.id, pipelineState);
 
-    console.log(`[tests_green] ${passed} passed, ${failed} failed (${newFailures} new), ${analyzerErrors} analyzer errors`);
+    console.log(`[tests_green] ${res.passed} passed, ${res.failed} failed (${newFailures} new), ${res.analyzerErrors} analyzer errors`);
     this.emit('tests_green_done', { ticket: ticket.id, ...step });
 
     return step;
@@ -1111,6 +1724,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     this.emit('usage_check', { percent: pct, used: this.lastInputTokens, total: contextLimit });
 
     if (pct >= rotatePct) {
+      this.sessionRotateCount = (this.sessionRotateCount || 0) + 1;
       this.emit('session_rotate', {
         ticket: ticket.id,
         reason: `context at ${pct}% (${this.lastInputTokens} tokens)`,
@@ -1178,8 +1792,12 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
 
         await new Promise(r => setTimeout(r, waitMs));
 
+        // Accumulate so the step/ticket duration can subtract idle wait time.
+        this.currentStepWaitMs = (this.currentStepWaitMs || 0) + waitMs;
+        this.totalRateLimitWaitMs = (this.totalRateLimitWaitMs || 0) + waitMs;
+
         console.log(`[rate-limit] Resuming ${ticketId}/${stepName}`);
-        this.emit('rate_limit_resume', { ticket: ticketId, step: stepName });
+        this.emit('rate_limit_resume', { ticket: ticketId, step: stepName, waitedMs: waitMs });
         // Fresh session after wait
         this.sessionId = null;
       }
