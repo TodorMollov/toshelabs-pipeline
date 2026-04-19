@@ -18,9 +18,15 @@ export async function startServer(config) {
   // Pipeline state
   let activePipeline = null;
 
-  // Store all events for new clients to catch up
+  // Ring buffer for SSE backfill. Byte-capped because event sizes span
+  // ~200× (p50 ~1KB, max ~200KB during heal) — a count cap lets a big-event
+  // run blow memory, and a tiny-event run truncate backfill to minutes.
+  // V8 string/object overhead is ~3× serialized JSON, so 150MB of JSON
+  // sits around ~450MB RSS. Count cap is a secondary guardrail.
   const eventLog = [];
-  const MAX_LOG = 5000;
+  const MAX_LOG_BYTES = 150 * 1024 * 1024;
+  const MAX_LOG_COUNT = 50_000;
+  let eventLogBytes = 0;
 
   // Persistent ops log (NDJSON, one file per day in ops/). Survives restarts
   // and is the authoritative source for the reports page.
@@ -32,8 +38,14 @@ export async function startServer(config) {
   const originalEmit = emitter.emit.bind(emitter);
   emitter.emit = (event, data) => {
     const entry = { event, data, timestamp: new Date().toISOString() };
+    const size = Buffer.byteLength(JSON.stringify(entry), 'utf8');
+    Object.defineProperty(entry, '_size', { value: size, enumerable: false });
     eventLog.push(entry);
-    if (eventLog.length > MAX_LOG) eventLog.shift();
+    eventLogBytes += size;
+    while (eventLog.length > MAX_LOG_COUNT || eventLogBytes > MAX_LOG_BYTES) {
+      const dropped = eventLog.shift();
+      eventLogBytes -= dropped._size || 0;
+    }
     opsLogger.write(event, data);
     originalEmit(event, data);
     originalEmit('_sse', entry);
@@ -46,6 +58,19 @@ export async function startServer(config) {
     node: process.version,
     argv: process.argv.slice(2),
   });
+
+  // Memory sampler — lets us correlate a crashed pipeline.log cut-off with
+  // RSS/heap just before the crash. Samples every 30s.
+  const memSampler = setInterval(() => {
+    const m = process.memoryUsage();
+    emitter.emit('memory_sample', {
+      rssMB: Math.round(m.rss / 1048576),
+      heapUsedMB: Math.round(m.heapUsed / 1048576),
+      heapTotalMB: Math.round(m.heapTotal / 1048576),
+      externalMB: Math.round(m.external / 1048576),
+    });
+  }, 30000);
+  memSampler.unref();
 
   // Record the signal and then exit — don't swallow the signal, otherwise
   // start.sh's `kill` won't actually stop the process.
@@ -285,7 +310,29 @@ export async function startServer(config) {
             const started = s.started_at ? new Date(s.started_at).getTime() : null;
             const completed = s.completed_at ? new Date(s.completed_at).getTime() : null;
             const stepStatuses = {};
-            for (const [name, st] of Object.entries(s.steps || {})) stepStatuses[name] = st.status || 'unknown';
+            const stepMetrics = {};
+            let totalWaitedMs = 0;
+            for (const [name, st] of Object.entries(s.steps || {})) {
+              stepStatuses[name] = st.status || 'unknown';
+              if (st && typeof st === 'object' && st.metrics) {
+                const m = st.metrics;
+                totalWaitedMs += m.waitedMs ?? 0;
+                stepMetrics[name] = {
+                  model: m.model || null,
+                  durationMs: m.durationMs ?? null,
+                  durationFormatted: m.durationFormatted || null,
+                  wallMs: m.wallMs ?? null,
+                  waitedMs: m.waitedMs ?? 0,
+                  inputTokens: m.inputTokens ?? 0,
+                  outputTokens: m.outputTokens ?? 0,
+                  toolCalls: m.toolCalls ?? 0,
+                  filesChanged: m.filesChanged ?? 0,
+                  usagePercent: m.usagePercent ?? null,
+                  startedAt: m.startedAt || null,
+                };
+              }
+            }
+            const rep = s.report || {};
             results.push({
               id: s.ticket,
               title: s.title || '',
@@ -295,7 +342,32 @@ export async function startServer(config) {
               started_at: s.started_at || null,
               completed_at: s.completed_at || null,
               duration_sec: (started && completed) ? Math.round((completed - started) / 1000) : null,
+              // working_sec = ticket wall time minus accumulated rate-limit idle waits
+              // (5h-window resets are downtime, not pipeline effort).
+              working_sec: (started && completed)
+                ? Math.max(0, Math.round(((completed - started) - totalWaitedMs) / 1000))
+                : null,
+              waited_sec: Math.round(totalWaitedMs / 1000),
               steps: stepStatuses,
+              step_metrics: stepMetrics,
+              // Ticket-level rollups from the run report (present after completion).
+              totals: rep.totalInputTokens != null ? {
+                inputTokens: rep.totalInputTokens,
+                outputTokens: rep.totalOutputTokens,
+                cacheReadTokens: rep.totalCacheReadTokens,
+                cacheCreationTokens: rep.totalCacheCreationTokens,
+                cacheHitRatio: rep.cacheHitRatio,
+                toolCalls: rep.totalToolCalls,
+                filesChanged: rep.totalFilesChanged,
+              } : null,
+              rework: rep.reworkTokenRatio != null ? {
+                inputTokens: rep.reworkInputTokens || 0,
+                outputTokens: rep.reworkOutputTokens || 0,
+                tokenRatio: rep.reworkTokenRatio,
+                reviewCycles: rep.reviewCycles || 0,
+                maxTurnsHitSteps: rep.maxTurnsHitSteps || [],
+                sessionRotations: rep.sessionRotations || 0,
+              } : null,
               archived: isArchive,
             });
           } catch { /* skip malformed */ }

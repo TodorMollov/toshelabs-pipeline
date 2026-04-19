@@ -1217,7 +1217,11 @@ function handleEvent(ev, d) {
       cs.textContent = 'converged'; cs.className = 'converge-status converging';
       break;
     case 'claude_event': {
-      const style = d.step === 'tests_green' ? 'haiku' : 'opus';
+      const rawModel = d.event?.message?.model || '';
+      const style = rawModel.includes('opus') ? 'opus'
+        : rawModel.includes('sonnet') ? 'sonnet'
+        : rawModel.includes('haiku') ? 'haiku'
+        : (d.step === 'tests_green' ? 'haiku' : 'system');
       const evt = d.event;
       if (evt?.type === 'raw' && evt?.text) {
         appendTerminal(evt.text, style);
