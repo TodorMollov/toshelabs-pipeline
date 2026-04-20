@@ -1385,6 +1385,22 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const prompt = isRetry
         ? await this.buildHealPrompt(stepConfig, ticket, pipelineState, attempt)
         : await buildPrompt(stepConfig, ticket, pipelineState, this.config);
+
+      // Session-preservation escape hatch. Resuming the prior session helps
+      // when the last attempt produced PARTIAL output that just needs
+      // amending. It HURTS when the last attempt produced no substantive
+      // output at all — Claude sees "I already wrote this" in the session
+      // history and takes shortcuts (BUG-202: opus heal-3 ran 21s / 2 tools
+      // / 918 out because the session context made it think the work was
+      // done, when in fact every required field was undefined). When the
+      // prior retry_reason indicates undefined/empty required fields, null
+      // the session so the heal starts cold.
+      if (isRetry) {
+        const prevReason = (pipelineState.steps[stepConfig.name] || {}).retry_reason || '';
+        if (/\bgot undefined\b|\bgot null\b|\bgot \[\]\b/.test(prevReason)) {
+          this.sessionId = null;
+        }
+      }
       const result = await this.runWithRateLimitRetry(
         () => spawnClaude({
           prompt,
@@ -1395,16 +1411,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
           workingDir: this.config.project_dir,
-          // Preserve the session across heal attempts. The old behaviour
-          // nulled this on every retry, so heal-2 and heal-3 started cold
-          // — re-reading all the spec files, re-writing things their own
-          // way, repeating work the first attempt had already done. With
-          // the session preserved, the heal prompt ("your last attempt
-          // failed: X. Fix.") lands as a fresh user message on top of the
-          // existing conversation. Model may change across heals (the
-          // escalation ladder); Claude CLI honours the new --model for
-          // the next turn while keeping message history. Same phase, same
-          // session — consistent with the multi-phase architecture.
+          // Preserve session across heal attempts so amendment cases don't
+          // re-read spec files. Escape hatch above nulls sessionId when the
+          // prior attempt produced no substantive output (undefined required
+          // fields) — in that case a cold start beats a warm "I already
+          // finished" session context.
           sessionId: this.sessionId,
           env: this.config.environment || {},
           onData: (event) => {
