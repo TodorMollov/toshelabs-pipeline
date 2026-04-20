@@ -9,6 +9,7 @@ export function spawnClaude({
   model = 'opus',
   tools = [],
   maxTurns = 30,
+  maxSeconds = null,
   systemPromptFile = null,
   workingDir = null,
   sessionId = null,
@@ -73,65 +74,95 @@ export function spawnClaude({
     proc.stdin.write(prompt);
     proc.stdin.end();
 
-    let stdout = '';
+    // Wall-clock budget. When `maxSeconds` is set, SIGTERM the process on
+    // expiry and escalate to SIGKILL after a short grace period. The close
+    // handler sees `timedOutFlag` and resolves with timedOut:true instead of
+    // rejecting — so the pipeline can treat timeout like maxTurnsHit (fail
+    // fast, don't heal) rather than as an error.
+    let timedOutFlag = false;
+    let killTimer = null;
+    let graceTimer = null;
+    if (maxSeconds && maxSeconds > 0) {
+      killTimer = setTimeout(() => {
+        timedOutFlag = true;
+        console.log(`[runner] wall-clock budget ${maxSeconds}s exceeded — SIGTERM`);
+        try { proc.kill('SIGTERM'); } catch { /* noop */ }
+        graceTimer = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch { /* noop */ }
+        }, 5000);
+      }, maxSeconds * 1000);
+    }
+    const clearTimers = () => {
+      if (killTimer) clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+    };
+
+    const STDOUT_TAIL_CAP = 64 * 1024;
+    let stdoutTail = '';
+    let lineBuf = '';
     let stderr = '';
     let sessionIdParsed = null;
     let result = '';
     let rateLimitInfo = null;
 
-    proc.stdout.on('data', (chunk) => {
-      const text = chunk.toString();
-      stdout += text;
+    const appendTail = (text) => {
+      stdoutTail += text;
+      if (stdoutTail.length > STDOUT_TAIL_CAP) {
+        stdoutTail = stdoutTail.slice(-STDOUT_TAIL_CAP);
+      }
+    };
 
-      // Parse stream-json lines
-      for (const line of text.split('\n')) {
-        if (!line.trim()) continue;
-        try {
-          const event = JSON.parse(line);
-          if (onData) onData(event);
+    const processLine = (line) => {
+      if (!line.trim()) return;
+      try {
+        const event = JSON.parse(line);
+        if (onData) onData(event);
 
-          // Log assistant text and tool use to stdout
-          if (event.type === 'assistant' && event.message?.content) {
-            for (const block of event.message.content) {
-              if (block.type === 'text' && block.text) {
-                process.stdout.write(block.text);
-              } else if (block.type === 'tool_use') {
-                const summary = block.name === 'Read' ? block.input?.file_path
-                  : block.name === 'Edit' ? block.input?.file_path
-                  : block.name === 'Bash' ? block.input?.command?.slice(0, 150)
-                  : block.name === 'Grep' ? `"${block.input?.pattern}" ${block.input?.path || ''}`
-                  : block.name === 'Glob' ? block.input?.pattern
-                  : block.name === 'Write' ? block.input?.file_path
-                  : block.name === 'Agent' ? block.input?.description
-                  : JSON.stringify(block.input).slice(0, 150);
-                console.log(`\n[tool] ${block.name}: ${summary}`);
-              }
+        // Log assistant text and tool use to stdout
+        if (event.type === 'assistant' && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block.type === 'text' && block.text) {
+              process.stdout.write(block.text);
+            } else if (block.type === 'tool_use') {
+              const summary = block.name === 'Read' ? block.input?.file_path
+                : block.name === 'Edit' ? block.input?.file_path
+                : block.name === 'Bash' ? block.input?.command?.slice(0, 150)
+                : block.name === 'Grep' ? `"${block.input?.pattern}" ${block.input?.path || ''}`
+                : block.name === 'Glob' ? block.input?.pattern
+                : block.name === 'Write' ? block.input?.file_path
+                : block.name === 'Agent' ? block.input?.description
+                : JSON.stringify(block.input).slice(0, 150);
+              console.log(`\n[tool] ${block.name}: ${summary}`);
             }
           }
-
-          // Capture rate limit info from stream events
-          if (event.type === 'rate_limit_event' && event.rate_limit_info) {
-            rateLimitInfo = event.rate_limit_info;
-          }
-
-          // Capture session ID
-          if (event.session_id) {
-            sessionIdParsed = event.session_id;
-          }
-
-          // Capture final result
-          if (event.result) {
-            result = event.result;
-          }
-
-          // Capture from content blocks
-          if (event.type === 'content_block_delta' && event.delta?.text) {
-            result += event.delta.text;
-          }
-        } catch {
-          // Not JSON — raw output
-          if (onData) onData({ type: 'raw', text: line });
         }
+
+        if (event.type === 'rate_limit_event' && event.rate_limit_info) {
+          rateLimitInfo = event.rate_limit_info;
+        }
+        if (event.session_id) {
+          sessionIdParsed = event.session_id;
+        }
+        if (event.result) {
+          result = event.result;
+        }
+        if (event.type === 'content_block_delta' && event.delta?.text) {
+          result += event.delta.text;
+        }
+      } catch {
+        if (onData) onData({ type: 'raw', text: line });
+      }
+    };
+
+    proc.stdout.on('data', (chunk) => {
+      const text = chunk.toString();
+      appendTail(text);
+      lineBuf += text;
+      let nl;
+      while ((nl = lineBuf.indexOf('\n')) >= 0) {
+        const line = lineBuf.slice(0, nl);
+        lineBuf = lineBuf.slice(nl + 1);
+        processLine(line);
       }
     });
 
@@ -140,8 +171,29 @@ export function spawnClaude({
     });
 
     proc.on('close', (code) => {
+      clearTimers();
+      // Flush any trailing partial line
+      if (lineBuf.length > 0) {
+        processLine(lineBuf);
+        lineBuf = '';
+      }
+      // Wall-clock timeout path — we killed the process, so a non-zero exit
+      // is expected. Resolve with timedOut:true; the gate refuses to heal
+      // and the ticket is blocked (see shouldHeal() in retry-policy.js).
+      if (timedOutFlag) {
+        resolve({
+          sessionId: sessionIdParsed,
+          result,
+          stdout: stdoutTail,
+          stderr,
+          exitCode: code,
+          timedOut: true,
+          rateLimitInfo,
+        });
+        return;
+      }
       // Detect rate limit / usage limit
-      const allOutput = stdout + stderr + result;
+      const allOutput = stdoutTail + stderr + result;
       const limitMatch = allOutput.match(/(?:hit your limit|rate.?limit|usage.?limit).*?resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:\(([^)]+)\))?/i);
       if (limitMatch || allOutput.includes('hit your limit')) {
         const err = new Error(`claude rate limited: ${result || stderr}`);
@@ -160,7 +212,7 @@ export function spawnClaude({
           resolve({
             sessionId: sessionIdParsed,
             result,
-            stdout,
+            stdout: stdoutTail,
             stderr,
             exitCode: code,
             maxTurnsHit: true,
@@ -176,7 +228,7 @@ export function spawnClaude({
           const errorMatch = allOutput.match(/"error"\s*:\s*"([^"]+)"/);
           const resultMatch = allOutput.match(/"result"\s*:\s*"([^"]{1,200})/);
           const isErrorMatch = allOutput.match(/"is_error"\s*:\s*true/);
-          errorMsg = errorMatch?.[1] || resultMatch?.[1] || result?.slice(0, 200) || stdout?.slice(-500) || 'unknown error';
+          errorMsg = errorMatch?.[1] || resultMatch?.[1] || result?.slice(0, 200) || stdoutTail?.slice(-500) || 'unknown error';
           if (isErrorMatch && resultMatch) {
             errorMsg = `[is_error] ${resultMatch[1]}`;
           }
@@ -192,7 +244,7 @@ export function spawnClaude({
       resolve({
         sessionId: sessionIdParsed,
         result,
-        stdout,
+        stdout: stdoutTail,
         stderr,
         exitCode: code,
         rateLimitInfo,
@@ -200,6 +252,7 @@ export function spawnClaude({
     });
 
     proc.on('error', (err) => {
+      clearTimers();
       reject(new Error(`Failed to spawn claude: ${err.message}`));
     });
   });

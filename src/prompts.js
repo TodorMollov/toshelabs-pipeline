@@ -130,6 +130,7 @@ Write {{pipeline_dir}}/{{ticket_id}}.json with steps.plan.status = "done" and AL
 - callers_traced: [{function, callers: ["file:line"]}] — just file:line refs, not grep output
 - edge_cases: ["short description"] — one line each
 - test_strategy: "one paragraph max"
+- TEST-SHAPE BUDGET: prefer cheap tests. Pure-function unit tests on the smallest testable logic (a label→mode mapper, a date-window calculator, a status guard). Avoid widget tests with live data streams (Drift/StreamProvider/StreamBuilder) — they take 30-60s per pumpAndSettle and will blow the implement step's wall-clock budget. If the bug is genuinely a UI routing/rendering concern, use one widget test with a seeded in-memory DB + explicit pump() sequences, not pumpAndSettle. If the plan's test_strategy authorizes ≥3 widget tests, STOP — split out the mapping logic, unit-test that, add at most one integration smoke test.
 - risk: "low|medium|high"
 
 If you are running low on turns, STOP investigating and write the JSON with what you have.`,

@@ -49,6 +49,35 @@ export function pickAttemptModel(stepConfig, attempt, ladder) {
  * Callers: processTicket catches the heal-exhaustion throw, calls
  * this to decide whether to mutate its loop counter and re-enter.
  */
+/**
+ * Decide whether a failed step attempt should heal (re-run) or fail fast.
+ *
+ * Rule: heal when the LLM produced something the gate rejected (wrong
+ * values we can tell it about). Refuse to heal when the LLM couldn't
+ * converge at all — max turns exhausted or wall-clock timeout fired —
+ * because spawning another attempt with the same budget will most
+ * likely produce the same non-result and burn time.
+ *
+ * Review step with findings is NOT a heal case — it's a feedback loop
+ * handled elsewhere — so callers should short-circuit before us.
+ *
+ * Returns { shouldHeal: boolean, reason: string }. On refusal, `reason`
+ * is machine-readable (no_tool_calls | max_turns | timeout) so the
+ * caller can emit it verbatim to the event log.
+ */
+export function shouldHeal({ maxTurnsHit, timedOut, toolCalls }) {
+  if (timedOut) {
+    return { shouldHeal: false, reason: 'timeout' };
+  }
+  if (maxTurnsHit && (toolCalls ?? 0) === 0) {
+    return { shouldHeal: false, reason: 'no_tool_calls' };
+  }
+  if (maxTurnsHit) {
+    return { shouldHeal: false, reason: 'max_turns' };
+  }
+  return { shouldHeal: true, reason: 'gate_failed' };
+}
+
 export function decideRestart({
   currentStepIndex,
   restartCount,

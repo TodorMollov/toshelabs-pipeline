@@ -16,7 +16,7 @@ import {
   mergeToMaster as checkpointMergeToMaster,
   CheckpointError,
 } from './checkpoint.js';
-import { pickAttemptModel, decideRestart } from './retry-policy.js';
+import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -1391,6 +1391,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           model: attemptModel,
           tools: stepConfig.tools || [],
           maxTurns: stepConfig.max_turns || 30,
+          maxSeconds: stepConfig.max_seconds || null,
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
           workingDir: this.config.project_dir,
@@ -1427,10 +1428,12 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
       // Log per-attempt usage
       const maxTurnsHit = result.maxTurnsHit || false;
+      const timedOut = result.timedOut || false;
       lastMaxTurnsHit = maxTurnsHit;
       if (maxTurnsHit) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: max turns (${stepConfig.max_turns || 30}) reached`);
-      console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/${stepConfig.name} (${attemptLabel}) | ${attemptModel} | ${formatDuration(Date.now() - attemptStartTime)} | ${attemptInputTokens.toLocaleString()} in / ${attemptOutputTokens.toLocaleString()} out | ${attemptToolCalls} tools${maxTurnsHit ? ' | MAX TURNS HIT' : ''}`);
-      this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit });
+      if (timedOut) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: wall-clock budget (${stepConfig.max_seconds}s) exceeded`);
+      console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/${stepConfig.name} (${attemptLabel}) | ${attemptModel} | ${formatDuration(Date.now() - attemptStartTime)} | ${attemptInputTokens.toLocaleString()} in / ${attemptOutputTokens.toLocaleString()} out | ${attemptToolCalls} tools${maxTurnsHit ? ' | MAX TURNS HIT' : ''}${timedOut ? ' | TIMEOUT' : ''}`);
+      this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit, timedOut });
 
       if (result.sessionId) this.sessionId = result.sessionId;
       pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
@@ -1522,9 +1525,18 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
 
-      // Max turns with no tool calls = step couldn't do any work, healing won't help
-      if (maxTurnsHit && attemptToolCalls === 0) {
-        const reason = `max turns hit with 0 tool calls — step could not execute`;
+      // Non-convergence is not healable. If the LLM burned its turn budget
+      // or exceeded the wall-clock budget, spawning another attempt with
+      // the same budget reliably reproduces the non-result. Fail fast,
+      // rewind via checkpoints if enabled, surface to human.
+      const healDecision = shouldHeal({ maxTurnsHit, timedOut, toolCalls: attemptToolCalls });
+      if (!healDecision.shouldHeal) {
+        const reasonByCode = {
+          timeout: `wall-clock budget (${stepConfig.max_seconds}s) exceeded — step did not converge`,
+          max_turns: `max turns (${stepConfig.max_turns || 30}) hit — step did not converge`,
+          no_tool_calls: `max turns hit with 0 tool calls — step could not execute`,
+        };
+        const reason = reasonByCode[healDecision.reason] || `heal refused (${healDecision.reason})`;
         pipelineState.steps[stepConfig.name] = {
           ...pipelineState.steps[stepConfig.name],
           status: 'crashed',
@@ -1534,6 +1546,16 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         await this.savePipelineJson(ticket.id, pipelineState);
         this.emit('step_gate_failed', { ticket: ticket.id, step: stepConfig.name, failures: [reason], attempts: attempt });
         console.error(`[skip-heal] ${ticket.id}/${stepConfig.name}: ${reason}`);
+
+        // Rewind to the previous snapshot so partial work doesn't leak.
+        if (this.config.checkpoints?.enabled) {
+          try {
+            await checkpointRevert(ticket.id, this.config.project_dir);
+            this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
+          } catch (err) {
+            console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: revert failed — ${err.message}`);
+          }
+        }
         throw new Error(`Step failed for ${ticket.id}/${stepConfig.name}: ${reason}`);
       }
 

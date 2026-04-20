@@ -7,7 +7,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { pickAttemptModel, decideRestart } from '../src/retry-policy.js';
+import { pickAttemptModel, decideRestart, shouldHeal } from '../src/retry-policy.js';
 
 const DEFAULT_LADDER = ['haiku', 'sonnet', 'opus'];
 
@@ -138,5 +138,44 @@ describe('decideRestart — walk back to step N-1 on heal exhaustion', () => {
     assert.ok('shouldRestart' in result);
     assert.ok('newStepIndex' in result);
     assert.ok('nextRestartCount' in result);
+  });
+});
+
+describe('shouldHeal — non-convergence is not healable', () => {
+  test('clean gate failure with tool calls → heal allowed', () => {
+    const d = shouldHeal({ maxTurnsHit: false, timedOut: false, toolCalls: 5 });
+    assert.equal(d.shouldHeal, true);
+    assert.equal(d.reason, 'gate_failed');
+  });
+
+  test('wall-clock timeout → refuse heal (spawning again would also time out)', () => {
+    const d = shouldHeal({ maxTurnsHit: false, timedOut: true, toolCalls: 42 });
+    assert.equal(d.shouldHeal, false);
+    assert.equal(d.reason, 'timeout');
+  });
+
+  test('max turns hit with tool calls → refuse (budget doubled would not converge either)', () => {
+    const d = shouldHeal({ maxTurnsHit: true, timedOut: false, toolCalls: 30 });
+    assert.equal(d.shouldHeal, false);
+    assert.equal(d.reason, 'max_turns');
+  });
+
+  test('max turns hit with 0 tool calls → refuse (step never got started)', () => {
+    const d = shouldHeal({ maxTurnsHit: true, timedOut: false, toolCalls: 0 });
+    assert.equal(d.shouldHeal, false);
+    assert.equal(d.reason, 'no_tool_calls');
+  });
+
+  test('timeout wins over max_turns when both are set', () => {
+    // If we killed for wall-clock, that's the more accurate reason to log.
+    const d = shouldHeal({ maxTurnsHit: true, timedOut: true, toolCalls: 1 });
+    assert.equal(d.shouldHeal, false);
+    assert.equal(d.reason, 'timeout');
+  });
+
+  test('missing toolCalls treated as 0', () => {
+    const d = shouldHeal({ maxTurnsHit: true, timedOut: false });
+    assert.equal(d.shouldHeal, false);
+    assert.equal(d.reason, 'no_tool_calls');
   });
 });
