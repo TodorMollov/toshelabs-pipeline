@@ -123,15 +123,24 @@
 
   <div class="tiles" id="tiles"></div>
 
+  <div style="margin-bottom:12px;padding:10px 14px;background:var(--panel);border:1px solid var(--border);border-radius:6px;font-size:12px;color:var(--text-dim);">
+    <label style="cursor:pointer;display:flex;align-items:center;gap:8px;">
+      <input type="checkbox" id="hideLegacy" checked />
+      <span>Hide legacy tickets (pre-baseline-capture — lack metrics and skew the view)</span>
+    </label>
+  </div>
+
   <section>
     <h2>Operations timeline</h2>
-    <div class="body timeline" id="timeline">
+    <div class="body" style="padding-top:8px;padding-bottom:4px;font-size:11px;color:var(--text-muted)">Recent pipeline events — ticket starts/stops, baselines, rollbacks, auto-commits, rate limits, crashes. Newest first.</div>
+    <div class="body timeline" id="timeline" style="padding-top:0">
       <div class="empty">loading…</div>
     </div>
   </section>
 
   <section>
     <h2>Step status distribution</h2>
+    <div class="body" style="padding-bottom:0;font-size:11px;color:var(--text-muted)">How each pipeline step ended across all tickets. One row per step (plan → docs_update). Bar widths are proportions, counts on the right show done/total.</div>
     <div class="body" id="stepDist">
       <div class="empty">loading…</div>
     </div>
@@ -184,7 +193,7 @@ const fmtDate = (iso) => {
   if (!iso) return '—';
   const d = new Date(iso);
   if (isNaN(d)) return '—';
-  return d.toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+  return d.toLocaleString('en-GB', { timeZone: 'Europe/London', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
 };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
@@ -254,6 +263,20 @@ function renderStepMetricsTable(t) {
   </table>`;
 }
 
+// Only-new-tickets filter. A ticket is "new" if it ran under the
+// baseline-capture pipeline (baseline_captured_at set). Legacy tickets
+// lack most metrics and drag down every average/distribution.
+function isNewTicket(t) {
+  return !!t.baseline_captured_at;
+}
+function visibleTickets() {
+  if (state.hideLegacy === false) return state.tickets;
+  return state.tickets.filter(isNewTicket);
+}
+function visibleTicketIds() {
+  return new Set(visibleTickets().map((t) => t.id));
+}
+
 async function refreshAll() {
   await Promise.all([loadTickets(), loadEvents(), loadUsage()]);
   renderTiles();
@@ -287,11 +310,12 @@ async function loadUsage() {
 }
 
 function renderTiles() {
-  const total = state.tickets.length;
-  const done = state.tickets.filter(t => t.status === 'done').length;
-  const inProg = state.tickets.filter(t => t.status === 'in_progress').length;
-  const blocked = state.tickets.filter(t => t.status === 'blocked' || t.status === 'failed').length;
-  const durs = state.tickets.filter(t => t.duration_sec != null).map(t => t.duration_sec);
+  const tickets = visibleTickets();
+  const total = tickets.length;
+  const done = tickets.filter(t => t.status === 'done').length;
+  const inProg = tickets.filter(t => t.status === 'in_progress').length;
+  const blocked = tickets.filter(t => t.status === 'blocked' || t.status === 'failed').length;
+  const durs = tickets.filter(t => t.duration_sec != null).map(t => t.duration_sec);
   const totalDur = durs.reduce((a, b) => a + b, 0);
   const avgDur = durs.length ? Math.round(totalDur / durs.length) : null;
   const crashes = state.events.filter(e => e.event === 'pipeline_crashed_detected').length;
@@ -304,7 +328,7 @@ function renderTiles() {
     { label: 'Total runtime', value: fmtDuration(totalDur), sub: avgDur != null ? `avg ${fmtDuration(avgDur)}/ticket` : '' },
     { label: 'Crashes (7d)', value: crashes, sub: crashes ? 'from ops log' : 'none recorded' },
     { label: 'Rate-limit hits (7d)', value: rateLimits, sub: rateLimits ? 'from ops log' : 'none recorded' },
-    { label: '5h window now', value: fh != null ? Math.round(fh) + '%' : '—', sub: currentUsage?.five_hour?.resets_at ? 'resets ' + new Date(currentUsage.five_hour.resets_at * 1000).toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) : '' },
+    { label: '5h window now', value: fh != null ? Math.round(fh) + '%' : '—', sub: currentUsage?.five_hour?.resets_at ? 'resets ' + new Date(currentUsage.five_hour.resets_at * 1000).toLocaleTimeString('en-GB', {timeZone:'Europe/London', hour:'numeric', minute:'2-digit'}) : '' },
   ];
   document.getElementById('tiles').innerHTML = tiles.map(t =>
     `<div class="tile"><div class="label">${t.label}</div><div class="value">${t.value}</div><div class="sub">${t.sub || ''}</div></div>`
@@ -322,13 +346,23 @@ function renderTimeline() {
     'ticket_rolled_back', 'auto_commit_done', 'auto_commit_failed', 'auto_commit_skipped',
     'ticket_blocked_escalated',
   ]);
-  const rows = state.events.filter(e => interesting.has(e.event)).slice(-100).reverse();
+  // When hiding legacy tickets, drop timeline rows scoped to legacy ticket
+  // ids. Events without a ticket id (server_started, pipeline_*, etc.)
+  // always pass through — they're global.
+  const okIds = state.hideLegacy === false ? null : visibleTicketIds();
+  const rows = state.events.filter(e => {
+    if (!interesting.has(e.event)) return false;
+    if (!okIds) return true;
+    const tid = e.data?.ticket;
+    if (!tid) return true;
+    return okIds.has(tid);
+  }).slice(-100).reverse();
   if (!rows.length) {
     document.getElementById('timeline').innerHTML = '<div class="empty">No operational events yet. Restart the pipeline to start capturing.</div>';
     return;
   }
   document.getElementById('timeline').innerHTML = rows.map(e => {
-    const ts = new Date(e.ts).toLocaleString([], { month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+    const ts = new Date(e.ts).toLocaleString('en-GB', { timeZone: 'Europe/London', month:'short', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit' });
     const d = e.data || {};
     let summary = '';
     if (e.event === 'pipeline_crashed_detected') summary = `${d.ticket} stranded at ${d.last_step} (${d.last_step_status}) for ${fmtDuration(d.stranded_duration_sec)}`;
@@ -356,7 +390,7 @@ function renderStepDist() {
   // Per-step status histogram
   const counts = {};
   for (const step of STEP_ORDER) counts[step] = { done: 0, failed: 0, blocked: 0, pending: 0, skipped: 0, not_applicable: 0 };
-  for (const t of state.tickets) {
+  for (const t of visibleTickets()) {
     for (const [step, st] of Object.entries(t.steps || {})) {
       if (!counts[step]) counts[step] = { done: 0, failed: 0, blocked: 0, pending: 0, skipped: 0, not_applicable: 0 };
       counts[step][st] = (counts[step][st] || 0) + 1;
@@ -388,7 +422,7 @@ function renderTickets() {
   const ft = document.getElementById('filterText').value.toLowerCase();
   const fs = document.getElementById('filterStatus').value;
   const fp = document.getElementById('filterPri').value;
-  let rows = state.tickets.filter(t => {
+  let rows = visibleTickets().filter(t => {
     if (ft && !(t.id.toLowerCase().includes(ft) || (t.title || '').toLowerCase().includes(ft))) return false;
     if (fs && t.status !== fs) return false;
     if (fp && t.priority !== fp) return false;
@@ -490,6 +524,17 @@ document.querySelectorAll('th[data-sort]').forEach(th => {
 // Filter listeners
 ['filterText', 'filterStatus', 'filterPri'].forEach(id =>
   document.getElementById(id).addEventListener('input', renderTickets));
+
+// Hide-legacy toggle re-renders every view at once (tiles, timeline, step
+// distribution, tickets). State stored on `state` so filter helpers see it.
+state.hideLegacy = true;
+document.getElementById('hideLegacy').addEventListener('change', (ev) => {
+  state.hideLegacy = ev.target.checked;
+  renderTiles();
+  renderTimeline();
+  renderStepDist();
+  renderTickets();
+});
 
 // Live refresh via SSE — refresh when ticket events fire
 const es = new EventSource('/events');

@@ -1125,9 +1125,12 @@ let scrollPauseCount = 0;
 
 function appendTerminal(html, tag = 'system', opts = {}) {
   const terminal = document.getElementById('terminal');
-  const pad = n => String(n).padStart(2, '0');
   const now = new Date();
-  const wall = opts.time || `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  // Always render in Europe/London regardless of the browser's local TZ —
+  // WSL browsers often report UTC even on a BST host, producing an hour
+  // offset in the timeline. An explicit timeZone makes the display
+  // deterministic and matches what the operator expects.
+  const wall = opts.time || now.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour12: false });
   const base = state.stepStartTime || state.startTime || Date.now();
   const dur = opts.duration || formatElapsed(Date.now() - base);
   let pctStr = '—';
@@ -1174,7 +1177,7 @@ function updateUsageWidget() {
       if (pctEl) { pctEl.textContent = `${pct}%`; pctEl.style.color = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--text-dim)'; }
       if (fill) { fill.style.width = pct + '%'; fill.style.background = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--green)'; }
       if (resetEl && fh.resets_at) {
-        const t = new Date(fh.resets_at * 1000).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+        const t = new Date(fh.resets_at * 1000).toLocaleTimeString('en-GB', {timeZone:'Europe/London', hour:'numeric', minute:'2-digit'});
         resetEl.textContent = `Resets ${t}`;
       }
       // Update sidebar stat
@@ -1338,7 +1341,7 @@ function handleEvent(ev, d) {
       } else if (evt?.type === 'rate_limit_event') {
         const info = evt.rate_limit_info;
         if (info?.resetsAt) {
-          state.resetsAt = new Date(info.resetsAt * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+          state.resetsAt = new Date(info.resetsAt * 1000).toLocaleTimeString('en-GB', {timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit'});
           state.resetsTz = info.timezone || info.tz || null;
         }
         // Defensively extract 5h utilization from a few known/likely fields.
