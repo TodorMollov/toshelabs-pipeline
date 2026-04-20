@@ -112,8 +112,9 @@ partial work never leaks onto disk.
 ```yaml
 # pipeline.config.yaml
 checkpoints:
-  enabled: true               # opt-in, default false
+  enabled: true                   # opt-in, default false
   keep_branch_on_success: false   # delete branch + step tags when done
+  merge_to_master: true           # squash-merge at clean completion (Phase 4)
 ```
 
 ### How it works
@@ -131,10 +132,31 @@ checkpoints:
    resets the working tree to the most recent step tag, or to the
    branch base if no snapshots exist. `git clean -fd` drops any
    untracked files the failed step wrote.
-4. **Ticket completes successfully** — unless
-   `keep_branch_on_success: true`, the branch and all its step tags
-   are deleted. Phase 4 (not yet shipped) will squash-merge into
-   master before this cleanup.
+4. **Ticket completes successfully** — if `merge_to_master: true`
+   (default when checkpoints are enabled), the ticket branch is
+   squash-merged into master as ONE commit per ticket. The commit
+   subject is `[{ticketId}] {title}`; the body lists the step tags
+   for audit. After the merge, unless `keep_branch_on_success: true`,
+   the branch and all its step tags are deleted.
+
+### Squash-merge semantics (Phase 4)
+
+- **Replaces** `reconcile-graveyard.js` for projects with checkpoints
+  enabled. Each pipeline run produces its own commits atomically;
+  no batch attribution step runs after the fact.
+- **Conflict handling**: if master has moved under the pipeline and
+  the merge conflicts, the attempt is aborted (`git merge --abort`),
+  master is left at its current tip, and the ticket branch is
+  preserved untouched. The orchestrator emits
+  `ticket_merge_conflict { ticket, code, message }` and proceeds to
+  the next ticket. Operator runs
+  `git checkout pipeline/{id} && git rebase master` then re-runs the
+  ticket (which will skip directly to the merge step).
+- **Dirty master**: the merge refuses if master has uncommitted
+  local changes (same event, code `DIRTY_TREE`). Commit or stash
+  first.
+- **Empty branch** (every step was a no-op): no commit, no error.
+  Branch is cleaned up as usual.
 
 ### What this prevents
 
@@ -151,6 +173,8 @@ checkpoints on, those files are gone the moment the step fails.
 - `checkpoint_refused { ticket, reason }` — dirty tree at ticket start
 - `checkpoint_step_committed { ticket, step, sha }`
 - `checkpoint_reverted { ticket, step }`
+- `checkpoint_merged_to_master { ticket, sha }` — Phase 4, on successful squash-merge
+- `ticket_merge_conflict { ticket, code, message }` — Phase 4, merge aborted; branch preserved
 - `checkpoint_branch_cleaned { ticket }`
 
 ### Testing

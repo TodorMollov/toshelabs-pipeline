@@ -13,6 +13,7 @@ import {
   commitStepSnapshot as checkpointCommitStep,
   revertToLastSnapshot as checkpointRevert,
   deleteBranch as checkpointDeleteBranch,
+  mergeToMaster as checkpointMergeToMaster,
   CheckpointError,
 } from './checkpoint.js';
 
@@ -712,19 +713,57 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       pipelineState.completed_at = new Date().toISOString();
       await this.savePipelineJson(ticket.id, pipelineState);
 
-      // META-001 Phase 3: ticket completed cleanly — delete the per-ticket
-      // branch and its step tags unless the operator opted to keep them for
-      // post-mortem inspection. Phase 4 will merge the branch back to master
-      // before this cleanup; for now the branch is simply discarded and all
-      // commits are squashed into whatever merge the operator performs.
-      if (this.config.checkpoints?.enabled && !this.config.checkpoints.keep_branch_on_success) {
-        try {
-          // Check out master first — can't delete the current branch.
-          execSync('git checkout master', { cwd: this.config.project_dir, stdio: 'pipe' });
-          await checkpointDeleteBranch(ticket.id, this.config.project_dir);
-          this.emit('checkpoint_branch_cleaned', { ticket: ticket.id });
-        } catch (err) {
-          console.warn(`[checkpoint] ${ticket.id}: cleanup failed — ${err.message}`);
+      // META-001 Phase 3+4: ticket completed cleanly.
+      //   Phase 4 (merge_to_master, default ON when checkpoints.enabled):
+      //     squash-merge the ticket branch into master so the pipeline's
+      //     output lands as exactly ONE commit per ticket, eliminating the
+      //     reconcile-graveyard.js step.
+      //   Phase 3 (keep_branch_on_success, default OFF): delete the branch
+      //     + step tags unless the operator opted to keep them for audit.
+      //
+      // Error policy: a merge conflict is an operator problem (master moved
+      // under the pipeline). Surface it as ticket_merge_conflict, keep the
+      // branch intact for manual rebase, and skip the delete. The ticket's
+      // own status is already 'done' on disk — the only thing missing is
+      // integration.
+      if (this.config.checkpoints?.enabled) {
+        const shouldMerge = this.config.checkpoints.merge_to_master !== false;
+        let mergedSha = null;
+        if (shouldMerge) {
+          try {
+            mergedSha = await checkpointMergeToMaster(ticket.id, {
+              title: ticket.title,
+              cwd: this.config.project_dir,
+            });
+            if (mergedSha) {
+              this.emit('checkpoint_merged_to_master', { ticket: ticket.id, sha: mergedSha });
+              console.log(`[checkpoint] ${ticket.id}: squash-merged to master (${mergedSha.slice(0, 7)})`);
+            }
+          } catch (err) {
+            this.emit('ticket_merge_conflict', {
+              ticket: ticket.id,
+              code: err.code || 'UNKNOWN',
+              message: err.message,
+            });
+            console.error(`[checkpoint] ${ticket.id}: merge to master FAILED — ${err.message}`);
+            // Skip branch cleanup — operator needs the branch to resolve.
+            return;
+          }
+        }
+
+        if (!this.config.checkpoints.keep_branch_on_success) {
+          try {
+            // After a successful merge we're already on master; otherwise
+            // checkout defensively before deleting.
+            const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
+            if (currentBranch !== 'master') {
+              execSync('git checkout master', { cwd: this.config.project_dir, stdio: 'pipe' });
+            }
+            await checkpointDeleteBranch(ticket.id, this.config.project_dir);
+            this.emit('checkpoint_branch_cleaned', { ticket: ticket.id });
+          } catch (err) {
+            console.warn(`[checkpoint] ${ticket.id}: cleanup failed — ${err.message}`);
+          }
         }
       }
     }

@@ -120,6 +120,91 @@ export async function deleteBranch(ticketId, cwd) {
   git(`branch -D ${branch}`, cwd);
 }
 
+// Squash-merge the ticket branch into master. Intended to run at the end
+// of a successful ticket, replacing the external graveyard reconciliation
+// script. Produces ONE commit on master with a message that keeps the
+// ticket-id provenance and lists the step tags for audit.
+//
+// On conflict or dirty master the merge is aborted and a CheckpointError
+// is thrown with code MERGE_CONFLICT or DIRTY_TREE. Master and the ticket
+// branch are left untouched so the operator can resolve manually.
+//
+// opts:
+//   title          — human ticket title (appears in commit subject/body)
+//   cwd            — project git root
+//   masterBranch   — name of the trunk branch (default 'master')
+export async function mergeToMaster(ticketId, opts) {
+  const { title = '', cwd, masterBranch = 'master' } = opts || {};
+  if (!cwd) throw new CheckpointError('mergeToMaster: cwd is required');
+
+  const branch = branchName(ticketId);
+  const branchExists = git(`rev-parse --verify ${branch}`, cwd, { tolerateFailure: true }) !== null;
+  if (!branchExists) return null;
+
+  // Move to master before checking dirtiness so we don't flag the ticket
+  // branch's own in-progress state as "dirty master".
+  git(`checkout ${masterBranch}`, cwd);
+  if (isDirty(cwd)) {
+    throw new CheckpointError(
+      `master has uncommitted changes — refusing to squash-merge ${ticketId}. ` +
+        `Commit or stash first (git status).`,
+      { code: 'DIRTY_TREE' },
+    );
+  }
+
+  // If the ticket branch points at the same commit as master, nothing to do.
+  const branchSha = git(`rev-parse ${branch}`, cwd);
+  const masterSha = git(`rev-parse ${masterBranch}`, cwd);
+  if (branchSha === masterSha) return null;
+
+  // Attempt squash merge. `git merge --squash` stages changes but doesn't
+  // commit — so we can inspect the result before committing. On conflict,
+  // `git merge --squash` exits non-zero and leaves conflict markers in the
+  // index; we abort immediately to keep master pristine.
+  const mergeResult = git(`merge --squash ${branch}`, cwd, { tolerateFailure: true });
+  if (mergeResult === null) {
+    // Merge failed — could be conflict. Abort to restore clean state.
+    git('merge --abort', cwd, { tolerateFailure: true });
+    // Also reset the index in case --abort didn't handle it (shouldn't happen,
+    // but merge --squash sometimes leaves unstaged conflicts differently).
+    git('reset --hard HEAD', cwd, { tolerateFailure: true });
+    throw new CheckpointError(
+      `squash-merge of ${branch} into ${masterBranch} conflicted. ` +
+        `Ticket branch preserved for manual resolution. ` +
+        `Run: git checkout ${branch} && git rebase ${masterBranch} to integrate.`,
+      { code: 'MERGE_CONFLICT' },
+    );
+  }
+
+  const staged = git('diff --cached --name-only', cwd);
+  if (!staged) {
+    // Squash-merge of a branch whose changes are already in master (e.g.
+    // same commits cherry-picked earlier). Nothing to commit.
+    return null;
+  }
+
+  const snapshots = await listStepSnapshots(ticketId, cwd);
+  const stepSummary = snapshots.length > 0
+    ? snapshots.map((s) => `  - step-${s.index}-${s.step}`).join('\n')
+    : '  (no step snapshots — direct commit)';
+  const subject = title
+    ? `[${ticketId}] ${title}`
+    : `[${ticketId}]`;
+  const body = `Pipeline steps committed:\n${stepSummary}`;
+
+  // Use a temp file for the commit message to avoid shell-escaping hazards
+  // when the title contains quotes, backticks, or other special chars.
+  const msgPath = `/tmp/.pipeline-commit-msg-${ticketId}-${Date.now()}`;
+  execSync(`printf %s ${JSON.stringify(`${subject}\n\n${body}\n`)} > ${msgPath}`, { cwd });
+  try {
+    git(`commit -F ${msgPath}`, cwd);
+  } finally {
+    execSync(`rm -f ${msgPath}`, { cwd });
+  }
+
+  return git('rev-parse HEAD', cwd);
+}
+
 export async function listStepSnapshots(ticketId, cwd) {
   const out = git(`tag -l "pipeline/${ticketId}/step-*"`, cwd) || '';
   const tags = out.split('\n').filter(Boolean);

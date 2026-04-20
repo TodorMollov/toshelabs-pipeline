@@ -13,6 +13,7 @@ import {
   revertToLastSnapshot,
   deleteBranch,
   listStepSnapshots,
+  mergeToMaster,
   CheckpointError,
 } from '../src/checkpoint.js';
 
@@ -182,5 +183,109 @@ describe('listStepSnapshots', () => {
   test('returns empty array when ticket has no snapshots', async () => {
     const snapshots = await listStepSnapshots('TEST-13-no-work', repoDir);
     assert.deepEqual(snapshots, []);
+  });
+});
+
+describe('mergeToMaster', () => {
+  test('squashes all step commits into one commit on master', async () => {
+    await ensureBranch('TEST-14', repoDir);
+    writeFileSync(join(repoDir, 'a.txt'), 'alpha');
+    await commitStepSnapshot('TEST-14', 'plan', repoDir);
+    writeFileSync(join(repoDir, 'b.txt'), 'beta');
+    await commitStepSnapshot('TEST-14', 'implement', repoDir);
+
+    const masterBeforeSha = git('rev-parse master');
+    const sha = await mergeToMaster('TEST-14', { title: 'Test ticket', cwd: repoDir });
+
+    assert.match(sha, /^[0-9a-f]{40}$/);
+    assert.equal(git('rev-parse --abbrev-ref HEAD'), 'master');
+    assert.notEqual(git('rev-parse master'), masterBeforeSha);
+    // Master advanced by exactly one commit
+    const masterLog = git('log master --format=%H').split('\n');
+    const beforeLog = git(`log ${masterBeforeSha} --format=%H`).split('\n');
+    assert.equal(masterLog.length, beforeLog.length + 1);
+    // Both files landed in the squash
+    assert.equal(readFileSync(join(repoDir, 'a.txt'), 'utf-8'), 'alpha');
+    assert.equal(readFileSync(join(repoDir, 'b.txt'), 'utf-8'), 'beta');
+  });
+
+  test('commit message contains ticket id, title, and step tag list', async () => {
+    await ensureBranch('TEST-15', repoDir);
+    writeFileSync(join(repoDir, 'a.txt'), 'a');
+    await commitStepSnapshot('TEST-15', 'plan', repoDir);
+    writeFileSync(join(repoDir, 'a.txt'), 'aa');
+    await commitStepSnapshot('TEST-15', 'implement', repoDir);
+
+    await mergeToMaster('TEST-15', { title: 'Some ticket title', cwd: repoDir });
+
+    const msg = git('log master -1 --format=%B');
+    assert.match(msg, /TEST-15/);
+    assert.match(msg, /Some ticket title/);
+    assert.match(msg, /plan/);
+    assert.match(msg, /implement/);
+  });
+
+  test('returns null when branch has no commits beyond master', async () => {
+    await ensureBranch('TEST-16', repoDir);
+    // No commitStepSnapshot calls — branch tip == master tip.
+    const masterBefore = git('rev-parse master');
+    const sha = await mergeToMaster('TEST-16', { title: 'Empty', cwd: repoDir });
+
+    assert.equal(sha, null);
+    assert.equal(git('rev-parse master'), masterBefore);
+    assert.equal(git('rev-parse --abbrev-ref HEAD'), 'master');
+  });
+
+  test('aborts cleanly on conflict; master unchanged; working tree clean', async () => {
+    await ensureBranch('TEST-17', repoDir);
+    writeFileSync(join(repoDir, 'README.md'), 'branch-version\n');
+    await commitStepSnapshot('TEST-17', 'implement', repoDir);
+
+    // Move master forward with a conflicting edit
+    git('checkout master');
+    writeFileSync(join(repoDir, 'README.md'), 'master-version\n');
+    git('add README.md');
+    git('commit -m "master conflicting edit"');
+    const masterAfterConflict = git('rev-parse master');
+
+    await assert.rejects(
+      () => mergeToMaster('TEST-17', { title: 'Conflict case', cwd: repoDir }),
+      (err) => err instanceof CheckpointError && err.code === 'MERGE_CONFLICT',
+    );
+
+    // Master tip unchanged (abort worked)
+    assert.equal(git('rev-parse master'), masterAfterConflict);
+    // Working tree clean — not stuck in a half-merge
+    assert.equal(git('status --porcelain'), '');
+    // Ticket branch preserved for manual resolution
+    assert.ok(git('rev-parse pipeline/TEST-17'));
+  });
+
+  test('refuses when master has uncommitted local changes', async () => {
+    await ensureBranch('TEST-18', repoDir);
+    writeFileSync(join(repoDir, 'a.txt'), 'branch-work');
+    await commitStepSnapshot('TEST-18', 'implement', repoDir);
+
+    git('checkout master');
+    writeFileSync(join(repoDir, 'README.md'), 'uncommitted-local-change\n');
+
+    await assert.rejects(
+      () => mergeToMaster('TEST-18', { title: 'Dirty master', cwd: repoDir }),
+      (err) => err instanceof CheckpointError && err.code === 'DIRTY_TREE',
+    );
+  });
+
+  test('full lifecycle: merge then delete branch leaves master with squashed commit and no ticket branch', async () => {
+    await ensureBranch('TEST-19', repoDir);
+    writeFileSync(join(repoDir, 'a.txt'), 'a');
+    await commitStepSnapshot('TEST-19', 'plan', repoDir);
+
+    const masterBefore = git('rev-parse master');
+    await mergeToMaster('TEST-19', { title: 'Lifecycle', cwd: repoDir });
+    await deleteBranch('TEST-19', repoDir);
+
+    assert.notEqual(git('rev-parse master'), masterBefore);
+    assert.throws(() => git('rev-parse pipeline/TEST-19'));
+    assert.equal(git('tag -l "pipeline/TEST-19/*"'), '');
   });
 });
