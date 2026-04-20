@@ -8,6 +8,13 @@ import { thinkLoop } from './think-loop.js';
 import { validateStep } from './validator.js';
 import { buildPrompt } from './prompts.js';
 import { acquireLock, releaseLock } from './lock.js';
+import {
+  ensureBranch as checkpointEnsureBranch,
+  commitStepSnapshot as checkpointCommitStep,
+  revertToLastSnapshot as checkpointRevert,
+  deleteBranch as checkpointDeleteBranch,
+  CheckpointError,
+} from './checkpoint.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -180,6 +187,26 @@ export class Pipeline {
 
     // Start usage monitoring
     this.startUsageMonitor();
+
+    // META-001 Phase 3: per-ticket git branch + step snapshots. Opt-in via
+    // `checkpoints.enabled: true` in pipeline.config.yaml. When disabled (the
+    // default during rollout), the legacy same-branch flow is preserved.
+    if (!this.dryRun && this.config.checkpoints?.enabled) {
+      try {
+        const res = await checkpointEnsureBranch(ticket.id, this.config.project_dir);
+        this.emit('checkpoint_branch_ready', { ticket: ticket.id, ...res });
+        console.log(`[checkpoint] ${ticket.id}: on branch ${res.branch}${res.recoveredFromExisting ? ' (recovered stale)' : ''}`);
+      } catch (err) {
+        if (err instanceof CheckpointError) {
+          // DIRTY_TREE is operator error, not pipeline failure — surface
+          // clearly and refuse to start so we don't smash their work.
+          this.emit('checkpoint_refused', { ticket: ticket.id, reason: err.message });
+          console.error(`[checkpoint] ${ticket.id}: REFUSED — ${err.message}`);
+          throw err;
+        }
+        throw err;
+      }
+    }
 
     // Capture test-suite baseline before any work on this ticket. Skipped on
     // crash recovery (already captured) and in dry-run (plan only). This is
@@ -684,6 +711,22 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       pipelineState.status = 'done';
       pipelineState.completed_at = new Date().toISOString();
       await this.savePipelineJson(ticket.id, pipelineState);
+
+      // META-001 Phase 3: ticket completed cleanly — delete the per-ticket
+      // branch and its step tags unless the operator opted to keep them for
+      // post-mortem inspection. Phase 4 will merge the branch back to master
+      // before this cleanup; for now the branch is simply discarded and all
+      // commits are squashed into whatever merge the operator performs.
+      if (this.config.checkpoints?.enabled && !this.config.checkpoints.keep_branch_on_success) {
+        try {
+          // Check out master first — can't delete the current branch.
+          execSync('git checkout master', { cwd: this.config.project_dir, stdio: 'pipe' });
+          await checkpointDeleteBranch(ticket.id, this.config.project_dir);
+          this.emit('checkpoint_branch_cleaned', { ticket: ticket.id });
+        } catch (err) {
+          console.warn(`[checkpoint] ${ticket.id}: cleanup failed — ${err.message}`);
+        }
+      }
     }
   }
 
@@ -1322,6 +1365,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       });
 
       if (validation.pass) {
+        // META-001 Phase 3: snapshot the step's output to the ticket branch
+        // so a later step's failure can be rewound to this exact state.
+        if (this.config.checkpoints?.enabled) {
+          try {
+            const sha = await checkpointCommitStep(ticket.id, stepConfig.name, this.config.project_dir);
+            if (sha) {
+              this.emit('checkpoint_step_committed', { ticket: ticket.id, step: stepConfig.name, sha });
+            }
+          } catch (err) {
+            // Snapshot failure shouldn't block the step — log and continue.
+            // Worst case: a later revert can't find this step; it just walks
+            // further back or to the branch base.
+            console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: snapshot failed — ${err.message}`);
+          }
+        }
         return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
       // Remember the failures this attempt produced before deciding what to do next.
@@ -1371,6 +1429,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
         this.emit('step_gate_failed', { ticket: ticket.id, step: stepConfig.name, failures: validation.failures, attempts: maxAttempts });
         console.error(`Gate failed for ${ticket.id}/${stepConfig.name} after ${maxAttempts} attempts:`, validation.failures);
+
+        // META-001 Phase 3: rewind the working tree to the previous step's
+        // snapshot so the failed step's partial work doesn't leak onto disk.
+        // If no prior snapshot exists (first step failed), resets to branch
+        // base (= master tip at ticket start).
+        if (this.config.checkpoints?.enabled) {
+          try {
+            await checkpointRevert(ticket.id, this.config.project_dir);
+            this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
+            console.log(`[checkpoint] ${ticket.id}/${stepConfig.name}: working tree reverted to last snapshot`);
+          } catch (err) {
+            console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: revert failed — ${err.message}`);
+          }
+        }
+
         throw new Error(`Gate failed for ${ticket.id}/${stepConfig.name}: ${validation.failures.join(', ')}`);
       }
 

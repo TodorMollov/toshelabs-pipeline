@@ -102,6 +102,63 @@ Tickets move through statuses as the pipeline runs. `done` / `v2` / `deferred` /
 - `POST /api/run/all` — run the whole actionable queue
 - `POST /api/stop` — stop after current step (releases code lock)
 
+## Checkpoints (META-001 Phase 3)
+
+Opt-in per-ticket git branch + per-step snapshot commits. When enabled,
+the pipeline makes every step atomic at the git layer: success → commit
++ tag; failure → working tree rewound to the previous snapshot so
+partial work never leaks onto disk.
+
+```yaml
+# pipeline.config.yaml
+checkpoints:
+  enabled: true               # opt-in, default false
+  keep_branch_on_success: false   # delete branch + step tags when done
+```
+
+### How it works
+
+1. **Ticket start** — `ensureBranch` creates `pipeline/{ticketId}` branched
+   off `master`. Refuses if the working tree is dirty (commit or stash
+   first). Recovers stale branches from crashed runs by resetting to
+   master tip and cleaning untracked files.
+2. **After each passing step** — `commitStepSnapshot` stages everything
+   under `project_dir`, commits with message
+   `[pipeline] {ticketId} step-{N}-{stepName}`, and tags the commit
+   `pipeline/{ticketId}/step-{N}-{stepName}`. Zero-change steps are a
+   no-op (no commit, no tag).
+3. **Step failure (after heal exhaustion)** — `revertToLastSnapshot`
+   resets the working tree to the most recent step tag, or to the
+   branch base if no snapshots exist. `git clean -fd` drops any
+   untracked files the failed step wrote.
+4. **Ticket completes successfully** — unless
+   `keep_branch_on_success: true`, the branch and all its step tags
+   are deleted. Phase 4 (not yet shipped) will squash-merge into
+   master before this cleanup.
+
+### What this prevents
+
+The class of defect seen in BUG-206, BUG-211, T-343 on 2026-04-17..19:
+a step that blocks on `_maxTurnsHit` or a failed gate leaves partial
+files on disk. The next ticket's baseline treats those files as
+pre-existing; graveyard reconciliation later commits them under
+whichever ticket's plan happens to name overlapping paths. With
+checkpoints on, those files are gone the moment the step fails.
+
+### Events emitted
+
+- `checkpoint_branch_ready { ticket, branch, createdFromMaster, recoveredFromExisting }`
+- `checkpoint_refused { ticket, reason }` — dirty tree at ticket start
+- `checkpoint_step_committed { ticket, step, sha }`
+- `checkpoint_reverted { ticket, step }`
+- `checkpoint_branch_cleaned { ticket }`
+
+### Testing
+
+`npm test` runs the Node built-in test runner against
+`test/checkpoint.test.js`. Each case spins up an isolated repo in
+`/tmp` — the real project tree is never touched.
+
 ## Known limits
 
 - Single-project per config — the pipeline runs against one `project_dir`.
