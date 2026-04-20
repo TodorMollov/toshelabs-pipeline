@@ -1125,12 +1125,10 @@ let scrollPauseCount = 0;
 
 function appendTerminal(html, tag = 'system', opts = {}) {
   const terminal = document.getElementById('terminal');
-  const now = new Date();
-  // Always render in Europe/London regardless of the browser's local TZ —
-  // WSL browsers often report UTC even on a BST host, producing an hour
-  // offset in the timeline. An explicit timeZone makes the display
-  // deterministic and matches what the operator expects.
-  const wall = opts.time || now.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour12: false });
+  // Prefer: explicit opts.time > server-stamped _currentEventTs > now.
+  // Europe/London is explicit so WSL browsers on UTC still render BST.
+  const eventDate = _currentEventTs ? new Date(_currentEventTs) : new Date();
+  const wall = opts.time || eventDate.toLocaleTimeString('en-GB', { timeZone: 'Europe/London', hour12: false });
   const base = state.stepStartTime || state.startTime || Date.now();
   const dur = opts.duration || formatElapsed(Date.now() - base);
   let pctStr = '—';
@@ -1217,12 +1215,18 @@ function formatElapsed(ms) {
 function connectSSE() {
   const es = new EventSource('/events');
   es.onmessage = (e) => {
-    try { const entry = JSON.parse(e.data); handleEvent(entry.event, entry.data); } catch {}
+    try { const entry = JSON.parse(e.data); handleEvent(entry.event, entry.data, entry.timestamp); } catch {}
   };
   es.onerror = () => setTimeout(connectSSE, 3000);
 }
 
-function handleEvent(ev, d) {
+// Set by handleEvent on each dispatch; appendTerminal reads it as the
+// default wall-clock when opts.time is not provided. Lets replayed events
+// on reload render at the time they actually happened, not render time.
+let _currentEventTs = null;
+
+function handleEvent(ev, d, serverTs) {
+  _currentEventTs = serverTs || null;
   switch (ev) {
     case 'run_requested': setRunning(true); break;
     case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); break;
