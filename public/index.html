@@ -831,6 +831,14 @@
     <button onclick="forceUnlock()" id="btnUnlock" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Force-release code lock">&#128275;</button>
   </div>
 
+  <!-- Search: matches by ticket id (substring), title (substring), or description -->
+  <div style="padding:6px 10px;border-bottom:1px solid var(--border);position:relative">
+    <input id="ticketSearch" placeholder="Search tickets (id, title, text)…" autocomplete="off"
+      style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);font-size:12px;padding:6px 26px 6px 8px;border-radius:4px;font-family:inherit" />
+    <button id="ticketSearchClear" title="Clear"
+      style="position:absolute;right:14px;top:50%;transform:translateY(-50%);background:transparent;border:0;color:var(--text-muted);font-size:14px;cursor:pointer;display:none;padding:0 4px">&times;</button>
+  </div>
+
   <div class="ticket-list" id="ticketList">
     <div style="padding:20px;text-align:center;color:var(--text-muted);font-size:11px">Loading backlog...</div>
   </div>
@@ -887,14 +895,48 @@
 const STEPS = ['plan','tests_red','implement','tests_green','review','root_cause','docs_update'];
 const state = { running: false, activeTicket: null, startTime: null, completed: 0, thinkRounds: 0 };
 let allTickets = [];
+let currentActionable = [];
+let ticketQuery = ''; // lowercased search text; empty = no filter
+
+// Match by id substring, title substring, and description substring.
+// Match is AND across whitespace-separated tokens so "BUG 210 mot" finds
+// BUG-210 (which has "MOT" in the title). Case-insensitive throughout.
+function ticketMatchesQuery(t, tokens) {
+  if (!tokens.length) return true;
+  const hay = [
+    (t.id || ''),
+    (t.title || ''),
+    (t.description || ''),
+    (t.acceptance_criteria || ''),
+    (t.type || ''),
+    (t.status || ''),
+    (t.priority || ''),
+  ].join(' ').toLowerCase();
+  return tokens.every((tok) => hay.includes(tok));
+}
+
+function applyTicketFilter(all, actionable) {
+  const tokens = ticketQuery.split(/\s+/).filter(Boolean);
+  if (!tokens.length) return { all, actionable };
+  return {
+    all: all.filter((t) => ticketMatchesQuery(t, tokens)),
+    actionable: actionable.filter((t) => ticketMatchesQuery(t, tokens)),
+  };
+}
+
+function rerenderTicketList() {
+  const { all, actionable } = applyTicketFilter(allTickets, currentActionable);
+  renderTicketList(all, actionable);
+}
 
 // ─── API calls ───
 async function refreshBacklog() {
   const r = await fetch('/api/backlog/refresh', { method: 'POST' });
   const data = await r.json();
   allTickets = data.all || [];
-  renderTicketList(data.all, data.actionable);
-  appendTerminal(`Backlog refreshed: ${data.total} total, ${data.actionable?.length || 0} actionable`, 'system');
+  currentActionable = data.actionable || [];
+  rerenderTicketList();
+  appendTerminal(`Backlog refreshed: ${data.total} total, ${currentActionable.length} actionable`, 'system');
 }
 
 async function runTicket(id) {
@@ -971,7 +1013,14 @@ function renderTicketItem(t, actionIds) {
 function renderTicketList(all, actionable) {
   const list = document.getElementById('ticketList');
   const actionIds = new Set((actionable||[]).map(t => t.id));
-  document.getElementById('ticketCount').textContent = `${all.length} (${actionIds.size} actionable)`;
+  const totalUnfiltered = allTickets.length;
+  document.getElementById('ticketCount').textContent = ticketQuery
+    ? `${all.length}/${totalUnfiltered} (${actionIds.size} actionable)`
+    : `${all.length} (${actionIds.size} actionable)`;
+  if (all.length === 0 && ticketQuery) {
+    list.innerHTML = `<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:11px">No tickets match "${esc(ticketQuery)}".</div>`;
+    return;
+  }
 
   const groups = { actionable: [], manual: [], v2: [], other: [] };
   // Actionable group follows server sort order (respects explicit `order` field)
@@ -1314,9 +1363,11 @@ function handleEvent(ev, d) {
           state._rlSampleLogged = true;
         }
         updateUsageWidget();
-        if (info?.status !== 'allowed') {
-          appendTerminal(`RATE LIMITED — resets at ${state.resetsAt || 'unknown'}`, 'system');
-        }
+        // Don't log a terminal banner on every rate_limit_event — they fire
+        // ~once per turn for usage tracking, many with status !== 'allowed'
+        // (warnings, near-limit) that are NOT actual blocks. The real block
+        // is handled by the `rate_limited` case below, which fires only
+        // when the pipeline actually pauses and has the correct resume time.
       }
       break;
     }
@@ -1491,7 +1542,8 @@ async function reorderTicket(ticketId, direction) {
     if (!res.ok) return;
     const data = await res.json();
     allTickets = data.all || [];
-    renderTicketList(data.all, data.actionable);
+    currentActionable = data.actionable || [];
+    rerenderTicketList();
   } catch (e) {
     console.error('Reorder failed:', e);
   }
@@ -1566,8 +1618,27 @@ connectSSE();
 updateUsageWidget();
 fetch('/api/backlog').then(r=>r.json()).then(data => {
   allTickets = data.all || [];
-  renderTicketList(data.all, data.actionable);
+  currentActionable = data.actionable || [];
+  rerenderTicketList();
 });
+
+// ─── Ticket search wiring ───
+(function initTicketSearch() {
+  const input = document.getElementById('ticketSearch');
+  const clearBtn = document.getElementById('ticketSearchClear');
+  if (!input) return;
+  const onChange = () => {
+    ticketQuery = input.value.trim().toLowerCase();
+    clearBtn.style.display = ticketQuery ? 'inline-block' : 'none';
+    rerenderTicketList();
+  };
+  input.addEventListener('input', onChange);
+  // Esc clears
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { input.value = ''; onChange(); }
+  });
+  clearBtn.addEventListener('click', () => { input.value = ''; onChange(); input.focus(); });
+})();
 </script>
 </body>
 </html>
