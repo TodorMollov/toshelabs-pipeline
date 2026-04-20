@@ -1711,7 +1711,13 @@ PRIORITY: Write the pipeline JSON FIRST, then investigate. Do not spend turns re
           const backlogFile = this.config.backlog_file || 'memory/backlog.json';
           if (touchedFiles.some((f) => f.includes(backlogFile) || f.includes('backlog'))) step.backlog_updated = true;
         }
-        step.status = step.status === 'pending' ? 'done' : step.status;
+        // Promote pending OR missing-status to 'done'. Missing status means
+        // Claude wrote step artifacts but no top-level status field (e.g.
+        // docs_update frequently writes {files_updated, metrics:{status:'done'}}
+        // but forgets the outer status). Without this clause the post-loop
+        // check (pipeline.js:~762) flags the step as incomplete and blocks
+        // a ticket whose work is actually done.
+        if (step.status === 'pending' || step.status == null) step.status = 'done';
         step.completed_at = step.completed_at || new Date().toISOString();
         step.auto_populated = true;
         pipelineState.steps[stepConfig.name] = step;
