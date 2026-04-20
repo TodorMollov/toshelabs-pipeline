@@ -101,16 +101,31 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
           const testable = [];
           for (const planned of planArtifacts.files_to_change) {
             const desc = (typeof planned === 'object' ? planned.what_to_do : planned) || '';
+            const path = (typeof planned === 'object' ? planned.path : '') || '';
             if (!desc) continue;
             if (/^\s*\[no-test\]/i.test(desc)) continue; // explicitly skipped
-            testable.push(desc);
+            testable.push({ desc, path });
           }
           const unmapped = [];
-          for (const desc of testable) {
-            const descLower = desc.toLowerCase();
-            const covered = mappedCriteria.some((c) =>
-              c.includes(descLower.slice(0, 30)) || descLower.includes(c.slice(0, 30))
-            );
+          for (const { desc, path } of testable) {
+            const descTokens = significantTokens(desc);
+            const pathLower = path.toLowerCase();
+            // Keyword-overlap match. A test's criterion "covers" a plan
+            // deliverable when ≥30% of the deliverable's significant tokens
+            // appear in the criterion. Prefix matching (the previous rule)
+            // fails whenever the plan uses procedural prose like
+            // "1) Add `custom` value to _RangeMode enum" because no test
+            // description will ever literally contain that 30-char prefix —
+            // even when the test clearly exercises the enum value. Path
+            // match stays as an escape hatch for tooling tickets whose
+            // criterion is expressed by file path.
+            const covered = mappedCriteria.some((c) => {
+              if (pathLower && c.includes(pathLower)) return true;
+              if (descTokens.length === 0) return false;
+              const cTokens = new Set(significantTokens(c));
+              const matched = descTokens.filter((t) => cTokens.has(t)).length;
+              return matched / descTokens.length >= 0.3;
+            });
             if (!covered) unmapped.push(desc.slice(0, 80));
           }
           const tolerance = Math.max(2, Math.ceil(testable.length * 0.2));
@@ -157,4 +172,40 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
 
 function getNestedField(obj, path) {
   return path.split('.').reduce((o, k) => (o ? o[k] : undefined), obj);
+}
+
+// Stopwords deliberately excluded from coverage matching — they'd produce
+// spurious matches ("add" and "to" appear in almost every plan bullet).
+// The set is tuned for English imperative plan prose + code fragments.
+const STOPWORDS = new Set([
+  'a','an','and','or','but','if','then','the','this','that','these','those',
+  'is','are','was','were','be','been','being','to','of','in','on','at','by',
+  'for','with','without','from','as','it','its','will','should','must','not',
+  'add','new','change','update','make','set','use','using','do','does','done',
+  'pass','call','calls','take','takes','via','into','onto','one','two','three',
+  'file','files','code','value','values','line','lines','step','steps','case',
+  'cases','field','fields','method','methods','function','functions','class',
+  'classes','test','tests','check','checks',
+]);
+
+// Extract "meaningful" lowercase tokens: words, identifiers, numbers. Punctuation
+// and enum-style bullet markers ("1)", "2.") are stripped. Tokens that are pure
+// numbers or shorter than 3 chars are dropped. Used by covers_plan_criteria to
+// compare plan prose against test criteria via keyword overlap rather than
+// brittle prefix matching.
+function significantTokens(s) {
+  if (!s) return [];
+  const raw = s
+    .toLowerCase()
+    .replace(/[`'"]/g, ' ')
+    .split(/[^a-z0-9_]+/)
+    .filter(Boolean);
+  const out = [];
+  for (const t of raw) {
+    if (t.length < 3) continue;
+    if (/^\d+$/.test(t)) continue;
+    if (STOPWORDS.has(t)) continue;
+    out.push(t);
+  }
+  return out;
 }

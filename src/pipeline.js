@@ -1395,7 +1395,17 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
           workingDir: this.config.project_dir,
-          sessionId: isRetry ? null : this.sessionId,
+          // Preserve the session across heal attempts. The old behaviour
+          // nulled this on every retry, so heal-2 and heal-3 started cold
+          // — re-reading all the spec files, re-writing things their own
+          // way, repeating work the first attempt had already done. With
+          // the session preserved, the heal prompt ("your last attempt
+          // failed: X. Fix.") lands as a fresh user message on top of the
+          // existing conversation. Model may change across heals (the
+          // escalation ladder); Claude CLI honours the new --model for
+          // the next turn while keeping message history. Same phase, same
+          // session — consistent with the multi-phase architecture.
+          sessionId: this.sessionId,
           env: this.config.environment || {},
           onData: (event) => {
             const usage = event.message?.usage || event.usage;
@@ -1605,7 +1615,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         _maxTurnsHit: maxTurnsHit,
       };
       await this.savePipelineJson(ticket.id, pipelineState);
-      this.sessionId = null; // fresh session for heal attempt
+      // Keep this.sessionId — heal attempt will resume the same session so
+      // it has the previous attempt's context. Cross-phase boundaries still
+      // null sessionId elsewhere (per architecture rationale: fresh view per
+      // phase). Within a step's heal loop, staying in the session is what
+      // lets us land small fixes without re-doing discovery.
     }
 
     return { pipelineState };
