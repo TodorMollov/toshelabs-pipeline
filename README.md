@@ -173,9 +173,60 @@ checkpoints on, those files are gone the moment the step fails.
 - `checkpoint_refused { ticket, reason }` — dirty tree at ticket start
 - `checkpoint_step_committed { ticket, step, sha }`
 - `checkpoint_reverted { ticket, step }`
+- `checkpoint_reverted_for_restart { ticket, from, to }` — Phase 5B, git state rewound for restart
 - `checkpoint_merged_to_master { ticket, sha }` — Phase 4, on successful squash-merge
 - `ticket_merge_conflict { ticket, code, message }` — Phase 4, merge aborted; branch preserved
+- `ticket_restart_triggered { ticket, failedStep, restartFromStep, restartCount, maxRestarts }` — Phase 5B
+- `ticket_restart_declined { ticket, failedStep, reason, restartCount, maxRestarts }` — Phase 5B
 - `checkpoint_branch_cleaned { ticket }`
+
+## Retry escalation + restart-from-N-1 (META-001 Phase 5)
+
+Two independent mechanisms that compose with checkpoints.
+
+### Escalation ladder (Phase 5A)
+
+Heal attempts within a single step now climb a model-capability ladder
+rather than spinning Sonnet twice. Attempt 1 honours `stepConfig.model`
+(explicit per-step pins like "plan always on opus" are preserved);
+heals 2+ walk the ladder:
+
+```yaml
+restart:
+  escalation_ladder:
+    - haiku    # attempt 2 (first heal)
+    - sonnet   # attempt 3
+    - opus     # attempt 4+ (clamped to top)
+```
+
+### Restart-from-step-N-1 (Phase 5B)
+
+When a step exhausts all heal attempts, the pipeline optionally walks
+back one step and re-runs it — on the theory that a weak plan or weak
+tests_red causes downstream steps to fail, and retrying the downstream
+step with a smarter model can't rescue the upstream gap.
+
+```yaml
+restart:
+  enabled: true         # opt-in, default false
+  max_restarts: 1       # how many walk-backs per ticket
+```
+
+Walk-back steps:
+
+1. Emit `ticket_restart_triggered` with failed step + restart-from step.
+2. Reset both steps' pipeline-state status to `pending`.
+3. If checkpoints are enabled: revert the working tree to the N-2
+   snapshot so the prior step re-runs with the same inputs it had
+   originally.
+4. Decrement the step-loop index; the prior step re-executes.
+5. The failing step then re-executes in sequence with fresh upstream
+   output.
+
+If `restart.enabled: false` or budget is exhausted, the heal-exhausted
+throw propagates up as before and the ticket is marked blocked.
+`ticket_restart_declined` records the "would have restarted but..."
+case for audit.
 
 ### Testing
 

@@ -16,6 +16,7 @@ import {
   mergeToMaster as checkpointMergeToMaster,
   CheckpointError,
 } from './checkpoint.js';
+import { pickAttemptModel, decideRestart } from './retry-policy.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -229,7 +230,16 @@ export class Pipeline {
       }
     }
 
-    for (const stepConfig of steps) {
+    // Phase 5B: ticket-level restart counter. When runStepWithHealing
+    // throws (heal exhausted), we may walk `i` back by one step and
+    // re-run from the prior step — prior output may have been too weak
+    // for the failing step to make progress. Capped at max_restarts.
+    let restartCount = 0;
+    const restartEnabled = !!this.config.restart?.enabled;
+    const maxRestarts = this.config.restart?.max_restarts ?? 1;
+
+    for (let i = 0; i < steps.length; i++) {
+      const stepConfig = steps[i];
       // Session sharing: reuse previous session when configured.
       // Groups: tests_red→implement, tests_green→review, root_cause→docs_update
       const prevSessionId = this.sessionId;
@@ -429,7 +439,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const stepSessionRotateCountBefore = this.sessionRotateCount || 0;
 
       // Run step with self-healing: execute → auto-populate → validate → heal → retry
-      const stepResult = await this.runStepWithHealing(ticket, stepConfig, pipelineState, stepStartTime, {
+      // Phase 5B: catch heal-exhaustion throws so we can optionally restart
+      // from step N-1 instead of bailing the whole ticket.
+      let stepResult;
+      try {
+        stepResult = await this.runStepWithHealing(ticket, stepConfig, pipelineState, stepStartTime, {
         onTokens: (usage) => {
           if (usage.input_tokens) { this.lastInputTokens = usage.input_tokens; stepInputTokens = usage.input_tokens; }
           if (usage.output_tokens) stepOutputTokens += usage.output_tokens;
@@ -451,6 +465,71 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           if (name) stepToolCallsByName[name] = (stepToolCallsByName[name] || 0) + 1;
         },
       });
+      } catch (err) {
+        // Phase 5B: heal exhausted on this step. Consider walking back to
+        // step N-1 and re-running from there — the prior step's output
+        // may have been too weak for this step to make progress, and
+        // retrying the same step with a better model (Phase 5A) already
+        // failed. Capped at max_restarts per ticket.
+        if (restartEnabled) {
+          const decision = decideRestart({
+            currentStepIndex: i,
+            restartCount,
+            maxRestarts,
+          });
+          if (decision.shouldRestart) {
+            restartCount = decision.nextRestartCount;
+            const prevStepName = steps[decision.newStepIndex].name;
+            // Reset prior step's recorded status so the loop re-executes it.
+            pipelineState.steps[prevStepName] = {
+              status: 'pending',
+              restart_triggered_at: new Date().toISOString(),
+              restart_reason: `downstream step ${stepConfig.name} exhausted heals`,
+            };
+            // Reset current step's status too — we'll re-enter it after N-1.
+            pipelineState.steps[stepConfig.name] = {
+              status: 'pending',
+              awaiting_restart_from: prevStepName,
+            };
+            await this.savePipelineJson(ticket.id, pipelineState);
+
+            // When Phase 3 checkpoints are on, rewind the working tree to
+            // step N-2's snapshot so the prior step re-runs on the same
+            // inputs as originally. Without checkpoints we only reset the
+            // pipeline-state layer.
+            if (this.config.checkpoints?.enabled) {
+              try {
+                await checkpointRevert(ticket.id, this.config.project_dir);
+                this.emit('checkpoint_reverted_for_restart', { ticket: ticket.id, from: stepConfig.name, to: prevStepName });
+              } catch (revertErr) {
+                console.warn(`[restart] ${ticket.id}: git revert failed — ${revertErr.message}`);
+              }
+            }
+
+            this.emit('ticket_restart_triggered', {
+              ticket: ticket.id,
+              failedStep: stepConfig.name,
+              restartFromStep: prevStepName,
+              restartCount,
+              maxRestarts,
+            });
+            console.log(`[restart] ${ticket.id}: ${stepConfig.name} exhausted heals — walking back to ${prevStepName} (restart ${restartCount}/${maxRestarts})`);
+
+            i = decision.newStepIndex - 1; // for-loop will ++ back to newStepIndex
+            continue;
+          } else {
+            this.emit('ticket_restart_declined', {
+              ticket: ticket.id,
+              failedStep: stepConfig.name,
+              reason: decision.reason,
+              restartCount,
+              maxRestarts,
+            });
+            console.log(`[restart] ${ticket.id}: no restart — ${decision.reason}`);
+          }
+        }
+        throw err; // legacy behaviour — let run() mark ticket blocked
+      }
       pipelineState = stepResult.pipelineState;
 
       // Think loop (if configured for this step) — skip for low-risk tickets
@@ -1295,7 +1374,12 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       let attemptOutputTokens = 0;
       let attemptToolCalls = 0;
       const attemptStartTime = Date.now();
-      const attemptModel = isRetry ? 'sonnet' : (stepConfig.model || this.config.session.model);
+      // Phase 5A: escalation ladder replaces the fixed Sonnet-on-every-heal
+      // behaviour so heals climb capability (Haiku → Sonnet → Opus by
+      // default). The step's explicit stepConfig.model is still honoured
+      // for attempt 1; heals always walk the ladder.
+      const ladder = this.config.restart?.escalation_ladder || ['haiku', 'sonnet', 'opus'];
+      const attemptModel = pickAttemptModel(stepConfig, attempt, ladder);
 
       // Build and execute
       const prompt = isRetry
