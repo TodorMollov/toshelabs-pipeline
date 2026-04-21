@@ -916,10 +916,15 @@ function ticketMatchesQuery(t, tokens) {
 }
 
 function applyTicketFilter(all, actionable) {
+  // v2-backlog tickets live in memory/backlog-v2.json — future queue, not
+  // runnable from this pipeline. Hide them from the main list so they
+  // don't sit next to actionable tickets and mislead the operator into
+  // thinking they can be run from here.
+  const runnable = all.filter((t) => t.backlog !== 'v2');
   const tokens = ticketQuery.split(/\s+/).filter(Boolean);
-  if (!tokens.length) return { all, actionable };
+  if (!tokens.length) return { all: runnable, actionable };
   return {
-    all: all.filter((t) => ticketMatchesQuery(t, tokens)),
+    all: runnable.filter((t) => ticketMatchesQuery(t, tokens)),
     actionable: actionable.filter((t) => ticketMatchesQuery(t, tokens)),
   };
 }
@@ -1527,8 +1532,10 @@ function showTicketDetail(id) {
     }
   }
 
-  // Run button at bottom for actionable tickets
-  const actionable = !['done','v2','deferred','manual','moot','decided'].includes(t.status);
+  // Run button at bottom for actionable tickets. v2-backlog tickets live
+  // in memory/backlog-v2.json and are NOT schedulable here — suppress the
+  // Run button (clicking it would fail at the pipeline's exclude filter).
+  const actionable = t.backlog !== 'v2' && !['done','v2','deferred','manual','moot','decided'].includes(t.status);
   if (actionable) {
     sections.push(`<div style="padding:8px"><button onclick="runTicket('${t.id}')" style="width:100%;background:var(--green-dim);border:1px solid var(--green);color:var(--green);font-size:12px;font-weight:600;padding:10px 0;border-radius:6px;cursor:pointer;font-family:inherit">&#9654; Run ${t.id}</button></div>`);
   }

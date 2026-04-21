@@ -53,10 +53,12 @@ export async function startServer(config) {
 
   // First event of every process: server boot. Reports page pairs this with
   // the stranded tickets detected at pipeline start to infer crash causes.
+  const serverStartedAt = new Date().toISOString();
   emitter.emit('server_started', {
     pid: process.pid,
     node: process.version,
     argv: process.argv.slice(2),
+    startedAt: serverStartedAt,
   });
 
   // Memory sampler — lets us correlate a crashed pipeline.log cut-off with
@@ -122,6 +124,11 @@ export async function startServer(config) {
       running: activePipeline !== null,
       eventCount: eventLog.length,
       lastEvent: eventLog[eventLog.length - 1] || null,
+      server: {
+        startedAt: serverStartedAt,
+        uptimeSec: Math.round(process.uptime()),
+        pid: process.pid,
+      },
     });
   });
 
@@ -131,17 +138,25 @@ export async function startServer(config) {
       const tickets = await loadBacklog(config);
       const actionable = filterAndSort(tickets, config);
 
-      // Also load v2 backlog if it exists
+      // Also load v2 backlog if it exists. Tag each v2 ticket with
+      // backlog:'v2' so the UI can distinguish them — without the marker
+      // they merge into the same list as runnable tickets and the UI
+      // shows a "Run" button on v2 items whose status isn't in its own
+      // exclude list (e.g. T-250 status:'open' is not actionable here
+      // but looks actionable to the UI).
       let v2Tickets = [];
       try {
         const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
-        v2Tickets = JSON.parse(v2Raw).tickets || [];
+        const parsed = JSON.parse(v2Raw).tickets || [];
+        v2Tickets = parsed.map((t) => ({ ...t, backlog: 'v2' }));
       } catch {}
 
-      const all = [...tickets, ...v2Tickets];
+      const taggedPrimary = tickets.map((t) => ({ ...t, backlog: 'primary' }));
+      const all = [...taggedPrimary, ...v2Tickets];
       res.json({
         all,
         actionable,
+        v2: v2Tickets,
         total: all.length,
         actionableCount: actionable.length,
       });
@@ -369,6 +384,10 @@ export async function startServer(config) {
                 sessionRotations: rep.sessionRotations || 0,
               } : null,
               archived: isArchive,
+              // Presence of baseline_captured_at is how the reports page
+              // tells new (post-atomicity) tickets from legacy ones whose
+              // metrics would skew the view.
+              baseline_captured_at: s.baseline_captured_at || null,
             });
           } catch { /* skip malformed */ }
         }
