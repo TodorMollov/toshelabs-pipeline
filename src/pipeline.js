@@ -1401,13 +1401,22 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           this.sessionId = null;
         }
       }
+      // Per-ticket step override: a ticket may declare
+      //   step_overrides: { tests_red: { max_turns: 35 }, implement: { ... } }
+      // in its backlog.json entry to override this step's defaults. Used
+      // when a ticket is known to need more budget than the global config
+      // (e.g. BUG-202's storage-quota scope spanning Dart + backend in a
+      // single step). Falls back to stepConfig's value when absent.
+      const override = (ticket.step_overrides || {})[stepConfig.name] || {};
+      const effectiveMaxTurns = override.max_turns || stepConfig.max_turns || 30;
+      const effectiveMaxSeconds = override.max_seconds || stepConfig.max_seconds || null;
       const result = await this.runWithRateLimitRetry(
         () => spawnClaude({
           prompt,
           model: attemptModel,
           tools: stepConfig.tools || [],
-          maxTurns: stepConfig.max_turns || 30,
-          maxSeconds: stepConfig.max_seconds || null,
+          maxTurns: effectiveMaxTurns,
+          maxSeconds: effectiveMaxSeconds,
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
           workingDir: this.config.project_dir,
@@ -1451,7 +1460,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const maxTurnsHit = result.maxTurnsHit || false;
       const timedOut = result.timedOut || false;
       lastMaxTurnsHit = maxTurnsHit;
-      if (maxTurnsHit) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: max turns (${stepConfig.max_turns || 30}) reached`);
+      if (maxTurnsHit) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: max turns (${effectiveMaxTurns}) reached`);
       if (timedOut) console.log(`[WARNING] ${ticket.id}/${stepConfig.name}: wall-clock budget (${stepConfig.max_seconds}s) exceeded`);
       console.log(`${logPrefix(this.getUsagePercent().percent)} [usage] ${ticket.id}/${stepConfig.name} (${attemptLabel}) | ${attemptModel} | ${formatDuration(Date.now() - attemptStartTime)} | ${attemptInputTokens.toLocaleString()} in / ${attemptOutputTokens.toLocaleString()} out | ${attemptToolCalls} tools${maxTurnsHit ? ' | MAX TURNS HIT' : ''}${timedOut ? ' | TIMEOUT' : ''}`);
       this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit, timedOut });
@@ -1553,8 +1562,8 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const healDecision = shouldHeal({ maxTurnsHit, timedOut, toolCalls: attemptToolCalls });
       if (!healDecision.shouldHeal) {
         const reasonByCode = {
-          timeout: `wall-clock budget (${stepConfig.max_seconds}s) exceeded — step did not converge`,
-          max_turns: `max turns (${stepConfig.max_turns || 30}) hit — step did not converge`,
+          timeout: `wall-clock budget (${effectiveMaxSeconds}s) exceeded — step did not converge`,
+          max_turns: `max turns (${effectiveMaxTurns}) hit — step did not converge`,
           no_tool_calls: `max turns hit with 0 tool calls — step could not execute`,
         };
         const reason = reasonByCode[healDecision.reason] || `heal refused (${healDecision.reason})`;
