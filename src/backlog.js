@@ -52,32 +52,74 @@ export function filterAndSort(tickets, config, ticketId = null) {
 }
 
 /**
- * Move a ticket from backlog to archive
+ * Move a ticket from backlog to archive. When the ticket is a bug
+ * (type='bug' or id starts with 'BUG-'), also append a compact record
+ * to closed-bugs.json so the closed-bug ledger stays in sync.
+ *
+ * opts.landedCommit — optional sha to record on the archived ticket.
+ *   Useful when the ticket was landed via manual squash-merge rescue
+ *   rather than the pipeline's own success path, so future audits can
+ *   still trace the code change.
+ *
+ * Returns the archived ticket, or null when the id isn't in backlog.
  */
-export async function archiveTicket(ticketId, config) {
+export async function archiveTicket(ticketId, config, opts = {}) {
   // Read backlog
   const backlogRaw = await readFile(config._resolved.backlog, 'utf-8');
   const backlog = JSON.parse(backlogRaw);
 
   const idx = backlog.tickets.findIndex((t) => t.id === ticketId);
-  if (idx === -1) return;
+  if (idx === -1) return null;
 
   const ticket = backlog.tickets.splice(idx, 1)[0];
   ticket.status = 'done';
-  ticket.completed = new Date().toISOString().split('T')[0];
+  const nowIso = new Date().toISOString();
+  ticket.completed = nowIso.split('T')[0];
+  ticket.completed_at = nowIso;
+  if (opts.landedCommit) ticket.landed_commit = opts.landedCommit;
 
   // Write updated backlog
-  backlog.updated_at = new Date().toISOString().split('T')[0];
+  backlog.updated_at = nowIso.split('T')[0];
   await writeFile(config._resolved.backlog, JSON.stringify(backlog, null, 2));
 
-  // Append to archive
+  // Append to archive. Dedupe by id so repeated archive calls don't
+  // create duplicate archive entries — matches the behaviour of the
+  // manual rescue script.
   const archiveRaw = await readFile(config._resolved.archive, 'utf-8');
   const archive = JSON.parse(archiveRaw);
+  archive.tickets = (archive.tickets || []).filter((t) => t.id !== ticketId);
   archive.tickets.push(ticket);
-  await writeFile(
-    config._resolved.archive,
-    JSON.stringify(archive, null, 2)
-  );
+  await writeFile(config._resolved.archive, JSON.stringify(archive, null, 2));
+
+  // Bug? Also append to the closed-bugs ledger. The ledger is a
+  // separate file in config (closed_bugs_file) — skip gracefully when
+  // the config or the file doesn't exist.
+  const isBug = ticket.type === 'bug' || /^BUG-/.test(ticket.id || '');
+  if (isBug) {
+    try {
+      const cbPath = config._resolved.closedBugs;
+      if (cbPath) {
+        let cb = { tickets: [] };
+        try {
+          cb = JSON.parse(await readFile(cbPath, 'utf-8'));
+          if (!Array.isArray(cb.tickets)) cb.tickets = [];
+        } catch { /* missing/invalid — start fresh */ }
+        cb.tickets = cb.tickets.filter((t) => t.id !== ticketId);
+        cb.tickets.push({
+          id: ticket.id,
+          title: ticket.title || '',
+          fixed_at: nowIso,
+          commit: opts.landedCommit || null,
+        });
+        await writeFile(cbPath, JSON.stringify(cb, null, 2));
+      }
+    } catch (err) {
+      // Archive already succeeded — don't surface the ledger failure.
+      console.warn(`[archive] ${ticketId}: closed-bugs update failed — ${err.message}`);
+    }
+  }
+
+  return ticket;
 }
 
 /**

@@ -1464,6 +1464,31 @@ function showTicketDetail(id) {
     el.classList.toggle('active', el.dataset.id === id);
   });
 
+  // Fetch per-ticket pipeline state async — if the ticket is blocked or
+  // failed, surface the reason + failing step inline so the operator
+  // doesn't have to grep pipeline.log to diagnose. Renders into the
+  // detail panel after the sync body has rendered.
+  (function loadStuckInfo() {
+    fetch(`/api/pipeline/${id}`).then(r => r.ok ? r.json() : null).then(state => {
+      if (!state) return;
+      const status = state.status;
+      if (status !== 'blocked' && status !== 'failed' && status !== 'crashed') return;
+      const step = state.blocked_step || Object.entries(state.steps || {}).find(([, s]) => s && !['done','skipped','not_applicable'].includes(s.status))?.[0];
+      const stepData = step ? state.steps?.[step] || {} : {};
+      const reason = state.blocked_reason || state.failure_reason || stepData.reason || stepData.retry_reason || '—';
+      const html = `<div class="artifact-section" style="border:1px solid var(--red-dim, #7a2a2a)">
+        <div class="artifact-section-header" style="color:var(--red, #e87a7a)"><span>⚠ Stuck — ${esc(status)}${step ? ' at ' + esc(step) : ''}</span></div>
+        <div class="artifact-body">
+          <div style="color:var(--text-dim);line-height:1.5;white-space:pre-wrap">${esc(String(reason).slice(0, 600))}</div>
+          ${stepData._healAttempt ? `<div style="margin-top:6px;color:var(--text-dim);font-size:11px">heal attempt ${esc(stepData._healAttempt)} · last model: ${esc(stepData.last_model || '—')}${stepData._maxTurnsHit ? ' · MAX TURNS HIT' : ''}</div>` : ''}
+        </div>
+      </div>`;
+      // Prepend so it's the first thing the operator sees.
+      const detail = document.getElementById('detailContent');
+      if (detail) detail.insertAdjacentHTML('afterbegin', html);
+    }).catch(() => {});
+  })();
+
   const fields = [
     ['Status', t.status],
     ['Priority', t.priority],

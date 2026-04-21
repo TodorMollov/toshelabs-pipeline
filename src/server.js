@@ -1,9 +1,11 @@
 import express from 'express';
 import { EventEmitter } from 'events';
 import { readFile, readFile as readFileAsync } from 'fs/promises';
+import { watchFile, unwatchFile } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { loadBacklog, filterAndSort, reorderTicket } from './backlog.js';
+import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
+import { reloadConfig } from './config.js';
 import { Pipeline } from './pipeline.js';
 import { EventLogger } from './event-log.js';
 
@@ -60,6 +62,28 @@ export async function startServer(config) {
     argv: process.argv.slice(2),
     startedAt: serverStartedAt,
   });
+
+  // Hot-reload pipeline.config.yaml on change. Without this, every config
+  // edit needs a process restart — the 2026-04-20 `checkpoints.enabled:
+  // true` change lived in the file for 3 hours before the running server
+  // noticed it. watchFile polls every 2s (lighter than fs.watch,
+  // cross-platform). Mutates the shared `config` object in-place so all
+  // closures and new Pipeline instances pick up the change.
+  if (config?._resolved?.configPath) {
+    watchFile(config._resolved.configPath, { interval: 2000 }, async (curr, prev) => {
+      if (curr.mtimeMs === prev.mtimeMs) return;
+      try {
+        await reloadConfig(config);
+        emitter.emit('config_reloaded', { at: new Date().toISOString() });
+        console.log(`[config] reloaded ${config._resolved.configPath}`);
+      } catch (err) {
+        console.error(`[config] reload failed — ${err.message}`);
+      }
+    });
+    process.on('exit', () => {
+      try { unwatchFile(config._resolved.configPath); } catch { /* noop */ }
+    });
+  }
 
   // Memory sampler — lets us correlate a crashed pipeline.log cut-off with
   // RSS/heap just before the crash. Samples every 30s.
@@ -166,6 +190,30 @@ export async function startServer(config) {
         total: all.length,
         actionableCount: actionable.length,
       });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API: manually archive a ticket that landed outside the pipeline's own
+  // run loop (e.g. via operator squash-merge rescue after a merge-to-master
+  // DIRTY_TREE). Moves the ticket from backlog.json → backlog-archive.json,
+  // and appends to closed-bugs.json when the ticket is a bug. Optional
+  // `landedCommit` body param records the sha onto the archived record so
+  // future audits can trace the code change.
+  //
+  // Response: { archived: true, ticket: <archived ticket> } or 404 when
+  // the id isn't in the current backlog.
+  app.post('/api/archive/:ticketId', async (req, res) => {
+    try {
+      const ticketId = req.params.ticketId;
+      const landedCommit = typeof req.body?.landedCommit === 'string' ? req.body.landedCommit : null;
+      const archived = await archiveTicket(ticketId, config, { landedCommit });
+      if (!archived) {
+        return res.status(404).json({ error: `ticket ${ticketId} not found in backlog` });
+      }
+      emitter.emit('ticket_archived_manually', { ticket: ticketId, landedCommit });
+      res.json({ archived: true, ticket: archived });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
