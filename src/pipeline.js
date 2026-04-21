@@ -806,6 +806,24 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       // own status is already 'done' on disk — the only thing missing is
       // integration.
       if (this.config.checkpoints?.enabled) {
+        // Capture pipeline-owned post-loop writes (memory/build-log/usage.jsonl
+        // from appendUsageLog, memory/build-log/YYYY-MM-DD.md from mechanical
+        // docs) into a final snapshot on the ticket branch. Without this, the
+        // subsequent `git checkout master` inside mergeToMaster carries those
+        // writes over as "dirty master" and the merge refuses with DIRTY_TREE
+        // — which is how 4 of 6 tickets on 2026-04-21 ended up stranded on
+        // their branches until manually squash-merged. Bundling the writes
+        // into the ticket's own snapshot makes the merge see a clean master
+        // and lands everything in ONE ticket commit as intended.
+        try {
+          const metaSha = await checkpointCommitStep(ticket.id, 'pipeline-metadata', this.config.project_dir);
+          if (metaSha) {
+            this.emit('checkpoint_step_committed', { ticket: ticket.id, step: 'pipeline-metadata', sha: metaSha });
+          }
+        } catch (err) {
+          console.warn(`[checkpoint] ${ticket.id}/pipeline-metadata: pre-merge snapshot failed — ${err.message}`);
+        }
+
         const shouldMerge = this.config.checkpoints.merge_to_master !== false;
         let mergedSha = null;
         if (shouldMerge) {

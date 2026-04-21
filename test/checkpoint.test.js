@@ -288,4 +288,52 @@ describe('mergeToMaster', () => {
     assert.throws(() => git('rev-parse pipeline/TEST-19'));
     assert.equal(git('tag -l "pipeline/TEST-19/*"'), '');
   });
+
+  test('pipeline-metadata snapshot prevents stranded branch on merge-to-master', async () => {
+    // Regression for the 2026-04-21 pattern: pipeline writes to tracked
+    // metadata files (memory/build-log/usage.jsonl, build-log/YYYY-MM-DD.md)
+    // AFTER the last step snapshot but BEFORE mergeToMaster. Without a
+    // catch-all snapshot those writes carry over to master on checkout and
+    // refuse the merge with DIRTY_TREE. With the snapshot, the merge sees
+    // a clean master and bundles everything into ONE ticket commit.
+    //
+    // Seed a tracked "metadata" file on master so writes to it behave the
+    // same way pipeline.log / build-log writes do in production.
+    writeFileSync(join(repoDir, 'metadata.log'), 'initial\n');
+    git('add metadata.log');
+    git('commit -m "seed metadata"');
+
+    await ensureBranch('TEST-20', repoDir);
+    writeFileSync(join(repoDir, 'code.txt'), 'real work\n');
+    await commitStepSnapshot('TEST-20', 'implement', repoDir);
+
+    // Simulate the pipeline-owned post-loop write (appendUsageLog).
+    writeFileSync(join(repoDir, 'metadata.log'), 'initial\nticket TEST-20 ran\n');
+
+    // Without the pipeline-metadata snapshot, mergeToMaster would refuse here.
+    // With it, the write lands on the ticket branch first and merge proceeds.
+    const metaSha = await commitStepSnapshot('TEST-20', 'pipeline-metadata', repoDir);
+    assert.ok(metaSha, 'expected pipeline-metadata snapshot to be created');
+
+    const mergedSha = await mergeToMaster('TEST-20', { title: 'Stranded fix', cwd: repoDir });
+    assert.ok(mergedSha, 'merge should succeed after metadata snapshot');
+
+    // Master should now contain BOTH the code change and the metadata write.
+    const masterContent = readFileSync(join(repoDir, 'metadata.log'), 'utf-8');
+    assert.match(masterContent, /ticket TEST-20 ran/);
+    const codeContent = readFileSync(join(repoDir, 'code.txt'), 'utf-8');
+    assert.match(codeContent, /real work/);
+  });
+
+  test('pipeline-metadata snapshot is a no-op when nothing is dirty', async () => {
+    // Clean path: no post-loop writes between last step and merge. The
+    // snapshot should return null so the caller doesn't emit a spurious
+    // checkpoint_step_committed event.
+    await ensureBranch('TEST-21', repoDir);
+    writeFileSync(join(repoDir, 'x.txt'), 'x');
+    await commitStepSnapshot('TEST-21', 'implement', repoDir);
+
+    const metaSha = await commitStepSnapshot('TEST-21', 'pipeline-metadata', repoDir);
+    assert.equal(metaSha, null, 'no-op expected when nothing is dirty');
+  });
 });
