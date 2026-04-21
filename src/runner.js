@@ -17,6 +17,8 @@ export function spawnClaude({
   effort = null,
   onData = null,
   env = {},
+  onSpawn = null,  // callback invoked with the ChildProcess right after spawn
+                   // so callers (Pipeline) can track + SIGTERM on /api/stop.
 }) {
   return new Promise((resolve, reject) => {
     const args = ['-p'];
@@ -69,6 +71,9 @@ export function spawnClaude({
       env: { ...process.env, ...expandedEnv },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+    if (typeof onSpawn === 'function') {
+      try { onSpawn(proc); } catch { /* ignore tracker failures */ }
+    }
 
     // Pipe prompt to stdin
     proc.stdin.write(prompt);

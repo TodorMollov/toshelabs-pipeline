@@ -33,6 +33,32 @@ export class Pipeline {
     this.emitter = opts.emitter || null;
     this.sessionId = null;
     this.usageTimer = null;
+    // Reference to the currently-running Claude subprocess, if any. Set
+    // by spawnClaude's onSpawn callback inside runStepWithHealing.
+    // `/api/stop?hard=true` uses this to SIGTERM the step immediately
+    // instead of waiting for Claude to finish naturally.
+    this.activeSubprocess = null;
+  }
+
+  /**
+   * Hard-stop: terminate the currently-running Claude subprocess. The
+   * spawnClaude promise then rejects; the enclosing step throws and
+   * the pipeline winds down through its normal error path. Harmless
+   * no-op when no subprocess is active.
+   */
+  stopActiveSubprocess() {
+    const proc = this.activeSubprocess;
+    if (!proc || proc.killed) return false;
+    try {
+      proc.kill('SIGTERM');
+      // Hard safety: if SIGTERM doesn't land within 5s, escalate.
+      setTimeout(() => {
+        try { if (!proc.killed) proc.kill('SIGKILL'); } catch { /* noop */ }
+      }, 5000).unref();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   emit(event, data) {
@@ -1449,6 +1475,12 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           tools: stepConfig.tools || [],
           maxTurns: effectiveMaxTurns,
           maxSeconds: effectiveMaxSeconds,
+          onSpawn: (proc) => {
+            this.activeSubprocess = proc;
+            proc.on('close', () => {
+              if (this.activeSubprocess === proc) this.activeSubprocess = null;
+            });
+          },
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
           workingDir: this.config.project_dir,

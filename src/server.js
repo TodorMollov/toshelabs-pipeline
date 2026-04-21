@@ -324,15 +324,24 @@ export async function startServer(config) {
       });
   });
 
-  // API: stop pipeline
+  // API: stop pipeline. Default semantics are "stop after current step"
+  // (pipeline winds down when the step's Claude subprocess completes).
+  // Pass `?hard=true` or {"hard": true} body to SIGTERM the subprocess
+  // immediately — fixes the recurring "stop is slow" complaint where a
+  // mid-step /api/stop could wait 5-15 min for Claude to finish.
   app.post('/api/stop', async (req, res) => {
     if (!activePipeline) {
       return res.status(400).json({ error: 'No pipeline running' });
     }
-    emitter.emit('stop_requested', {});
+    const hard = req.query?.hard === 'true' || req.body?.hard === true;
+    emitter.emit('stop_requested', { hard });
+    let killed = false;
+    if (hard && typeof activePipeline.stopActiveSubprocess === 'function') {
+      killed = activePipeline.stopActiveSubprocess();
+    }
     await activePipeline.releaseLock();
     activePipeline = null;
-    res.json({ status: 'stopped' });
+    res.json({ status: 'stopped', hard, subprocessKilled: killed });
   });
 
   // API: force-release code lock
