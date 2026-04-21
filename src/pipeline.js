@@ -81,7 +81,21 @@ export class Pipeline {
 
       // Process tickets one at a time
       for (let i = 0; i < queue.length; i++) {
-        const ticket = queue[i];
+        const queuedTicket = queue[i];
+        // Re-read the ticket from backlog.json at ticket start rather than
+        // using the snapshot captured at run() entry. Fixes the 2026-04-21
+        // gotcha where editing backlog.json mid-run (e.g. adding
+        // step_overrides) had no effect until the pipeline was restarted —
+        // run() had already cached the stale ticket. Fall back to the
+        // queued snapshot if the ticket has since been removed (edge case
+        // but avoids a crash).
+        let ticket = queuedTicket;
+        try {
+          const fresh = await loadBacklog(this.config);
+          const match = fresh.find((t) => t.id === queuedTicket.id);
+          if (match) ticket = match;
+        } catch { /* keep queuedTicket */ }
+
         this.emit('ticket_start', { ticket: ticket.id, title: ticket.title, index: i, total: queue.length });
 
         // Fresh session per ticket

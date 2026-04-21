@@ -76,4 +76,34 @@ describe('acquireLock — auto-ignore via .git/info/exclude', () => {
     assert.match(second.holder, /first-holder/);
     await releaseLock(lockPath);
   });
+
+  test('acquire steals a stale lock whose pid is dead', async () => {
+    // Regression for the 2026-04-21 SIGKILL path: pipeline gets killed
+    // ungracefully, code.lock persists, next start reports "Code lock held"
+    // forever. Now a dead PID means the lock is stolen transparently.
+    const repo = makeRepo();
+    const lockPath = join(repo, 'code.lock');
+    // Write a lock file claiming PID 1 (kernel, definitely alive) — should NOT be stolen.
+    const { writeFileSync, readFileSync } = await import('fs');
+    writeFileSync(lockPath, 'toshelabs-pipeline: live run pid=1\n');
+    const blocked = await acquireLock(lockPath, 'me');
+    assert.equal(blocked.acquired, false, 'live pid=1 should block');
+    // Now replace with a pid that can never be alive (max int).
+    writeFileSync(lockPath, 'toshelabs-pipeline: zombie run pid=2147483647\n');
+    const stolen = await acquireLock(lockPath, 'me');
+    assert.equal(stolen.acquired, true, 'dead pid should be stolen');
+    const contents = readFileSync(lockPath, 'utf-8');
+    assert.match(contents, new RegExp(`pid=${process.pid}`));
+    await releaseLock(lockPath);
+  });
+
+  test('new locks write the current process pid into the file', async () => {
+    const repo = makeRepo();
+    const lockPath = join(repo, 'code.lock');
+    await acquireLock(lockPath, 'test');
+    const { readFileSync } = await import('fs');
+    const contents = readFileSync(lockPath, 'utf-8');
+    assert.match(contents, new RegExp(`pid=${process.pid}`));
+    await releaseLock(lockPath);
+  });
 });

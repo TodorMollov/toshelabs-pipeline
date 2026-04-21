@@ -78,6 +78,12 @@ export async function startServer(config) {
   // start.sh's `kill` won't actually stop the process.
   const gracefulExit = (signal) => {
     emitter.emit('server_stopping', { signal });
+    // Best-effort lock release so the next start doesn't have to detect a
+    // stale lock (the stale-lock path still covers SIGKILL). Fire-and-forget
+    // because we're about to exit anyway.
+    if (activePipeline && typeof activePipeline.releaseLock === 'function') {
+      activePipeline.releaseLock().catch(() => {});
+    }
     opsLogger.close();
     // Small delay so the final write flushes before we exit.
     setTimeout(() => process.exit(0), 50);
