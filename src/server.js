@@ -1,36 +1,75 @@
 import express from 'express';
 import { EventEmitter } from 'events';
 import { readFile, readFile as readFileAsync } from 'fs/promises';
-import { watchFile, unwatchFile } from 'fs';
-import { execSync } from 'child_process';
+import { watchFile, unwatchFile, readFileSync, readdirSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
 import { reloadConfig } from './config.js';
 import { Pipeline } from './pipeline.js';
 import { EventLogger } from './event-log.js';
+import { releaseLock } from './lock.js';
 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 /**
- * List PIDs of claude subprocesses that are children of this node server.
- * Used by /api/stop as a safety net — if Pipeline.run() resolved but its
- * Claude child is still alive (observed 2026-04-21 during T-335 run), the
- * normal `activePipeline.stopActiveSubprocess()` path can't reach it because
- * `activePipeline` has already been nulled. ps on ppid catches the orphan.
+ * Read field 22 (starttime, in clock ticks since boot) from /proc/<pid>/stat.
+ * Used as a stable per-process identity — survives across signals, unaffected
+ * by PID reuse. Returns null when the process doesn't exist or /proc isn't
+ * available (non-Linux). Handles the quirk that the comm field (2) can
+ * contain spaces and parens: always parse after the last `)`.
+ */
+function procStarttime(pid) {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const tailIdx = raw.lastIndexOf(')');
+    if (tailIdx < 0) return null;
+    const fields = raw.slice(tailIdx + 2).split(' ');
+    // After the ')' comes field 3 onward — so field 22 is index (22 - 3) = 19.
+    return fields[19] || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List {pid, starttime} for claude subprocesses that are direct children of
+ * this node server. Used by /api/stop as a safety net: if Pipeline.run()
+ * already resolved but its Claude child is still alive, activePipeline is
+ * null and stopActiveSubprocess() can't reach it. The starttime is captured
+ * here so a follow-up SIGKILL can verify we're signaling the same process,
+ * not a recycled PID.
+ *
+ * Linux-only: reads /proc/<pid>/{comm,stat}. Non-Linux returns [].
+ * Only finds direct children — spawn path is currently synchronous (spawnClaude
+ * in runner.js), so grandchild detection isn't needed. If Claude ever gets
+ * wrapped in a shell, this needs to walk /proc/<pid>/status PPid recursively.
  */
 function findOrphanClaudeChildren() {
+  const parent = process.pid;
+  const results = [];
+  let pids;
   try {
-    const out = execSync(`ps --ppid ${process.pid} -o pid=,comm=`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return out.trim().split('\n')
-      .map((l) => l.trim())
-      .filter((l) => /\bclaude\b/.test(l))
-      .map((l) => parseInt(l.split(/\s+/)[0], 10))
-      .filter((pid) => Number.isFinite(pid));
+    pids = readdirSync('/proc').filter((n) => /^\d+$/.test(n));
   } catch {
     return [];
   }
+  for (const s of pids) {
+    try {
+      const status = readFileSync(`/proc/${s}/status`, 'utf8');
+      const ppidMatch = /^PPid:\s*(\d+)/m.exec(status);
+      if (!ppidMatch || Number(ppidMatch[1]) !== parent) continue;
+      const comm = readFileSync(`/proc/${s}/comm`, 'utf8').trim();
+      // Exact match against comm — `claude-code`, `claude-wrapper`, etc. must
+      // not match, and comm is truncated to 15 chars on Linux so substring
+      // checks are risky.
+      if (comm !== 'claude') continue;
+      const starttime = procStarttime(Number(s));
+      results.push({ pid: Number(s), starttime });
+    } catch { /* proc vanished mid-scan — skip */ }
+  }
+  return results;
 }
 
 export async function startServer(config) {
@@ -352,10 +391,10 @@ export async function startServer(config) {
   // mid-step /api/stop could wait 5-15 min for Claude to finish.
   app.post('/api/stop', async (req, res) => {
     const hard = req.query?.hard === 'true' || req.body?.hard === true;
-    emitter.emit('stop_requested', { hard });
 
     // Happy path: pipeline reference still live.
     if (activePipeline) {
+      emitter.emit('stop_requested', { hard });
       let killed = false;
       if (hard && typeof activePipeline.stopActiveSubprocess === 'function') {
         killed = activePipeline.stopActiveSubprocess();
@@ -365,31 +404,64 @@ export async function startServer(config) {
       return res.json({ status: 'stopped', hard, subprocessKilled: killed });
     }
 
-    // Orphan path: `activePipeline` was nulled (Pipeline.run() resolved/rejected
-    // or Node evented the `.finally`) but a Claude child is still alive. This
-    // was silent before — UI stop would 400 while the subprocess kept editing.
-    // Scan our own children and SIGTERM any `claude -p …` we find. Covers both
-    // a failed-away run and any genuinely orphaned subprocess.
+    // Orphan path: activePipeline was nulled (Pipeline.run() resolved/rejected)
+    // but a Claude child may still be alive editing files. Before this branch
+    // existed the endpoint would 400 and leave the subprocess orphaned.
     const orphans = findOrphanClaudeChildren();
     if (orphans.length === 0) {
       return res.status(400).json({ error: 'No pipeline running' });
     }
-    let killedCount = 0;
-    if (hard) {
-      for (const pid of orphans) {
-        try {
-          process.kill(pid, 'SIGTERM');
-          setTimeout(() => { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }, 5000).unref();
-          killedCount++;
-        } catch { /* already gone */ }
+
+    emitter.emit('stop_requested', { hard, orphans: orphans.length });
+
+    if (!hard) {
+      return res.status(409).json({
+        status: 'orphans_detected',
+        orphansFound: orphans.length,
+        hint: 'pass ?hard=true to SIGTERM the orphan claude subprocess(es)',
+      });
+    }
+
+    let orphansSignaled = 0;
+    for (const { pid, starttime } of orphans) {
+      try {
+        process.kill(pid, 'SIGTERM');
+        orphansSignaled++;
+        // SIGKILL fallback at +5s, gated on starttime match so we don't hit
+        // an unrelated process that recycled the same PID. .unref() lets
+        // the node process exit on SIGTERM without waiting for this timer —
+        // worst case a half-stopped claude survives a server shutdown; that's
+        // better than blocking shutdown indefinitely.
+        setTimeout(() => {
+          const still = procStarttime(pid);
+          if (still && still === starttime) {
+            try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+          }
+        }, 5000).unref();
+      } catch (err) {
+        if (err && err.code !== 'ESRCH') {
+          console.warn(`[stop] SIGTERM ${pid} failed: ${err.code || err.message}`);
+        }
       }
     }
+
+    // Release the code lock — the whole point of /api/stop is to leave the
+    // project in a state where the next run can start. Without this the orphan
+    // kill would still leave a stale busydad/code.lock that blocks acquireLock.
+    let lockReleased = false;
+    try {
+      lockReleased = await releaseLock(config._resolved.codeLock);
+      if (lockReleased) emitter.emit('lock_released', { forced: true, reason: 'orphan_stop' });
+    } catch (err) {
+      console.warn(`[stop] releaseLock failed: ${err.message}`);
+    }
+
     res.json({
       status: 'stopped',
-      hard,
+      hard: true,
       orphansFound: orphans.length,
-      orphansKilled: killedCount,
-      note: hard ? 'no live pipeline; killed orphan claude subprocess(es)' : 'no live pipeline; found orphan subprocesses — pass ?hard=true to kill',
+      orphansSignaled,
+      lockReleased,
     });
   });
 
