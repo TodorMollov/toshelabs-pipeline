@@ -423,6 +423,7 @@ export async function startServer(config) {
     }
 
     let orphansSignaled = 0;
+    let orphansFailed = 0;
     for (const { pid, starttime } of orphans) {
       try {
         process.kill(pid, 'SIGTERM');
@@ -439,27 +440,37 @@ export async function startServer(config) {
           }
         }, 5000).unref();
       } catch (err) {
-        if (err && err.code !== 'ESRCH') {
-          console.warn(`[stop] SIGTERM ${pid} failed: ${err.code || err.message}`);
+        if (err && err.code === 'ESRCH') {
+          // Already exited between scan and kill — count as signaled (the
+          // desired state is reached).
+          orphansSignaled++;
+        } else {
+          orphansFailed++;
+          console.warn(`[stop] SIGTERM ${pid} failed: ${err.code || '?'}: ${err.message || err}`);
         }
       }
     }
 
-    // Release the code lock — the whole point of /api/stop is to leave the
-    // project in a state where the next run can start. Without this the orphan
-    // kill would still leave a stale busydad/code.lock that blocks acquireLock.
-    //
-    // BUT only when we actually signaled something. If every process.kill
-    // threw (EPERM, etc.), the orphan is still alive editing files and
-    // clearing the lock would let the next run clobber its changes.
+    // Release the code lock only when every orphan was signaled. A partial
+    // failure (e.g. one of three EPERM'd) means a survivor is still editing
+    // files; clearing the lock would let the next run clobber its changes.
+    // Callers that hit this state can fall back to /api/unlock explicitly
+    // once they've dealt with the stuck orphan.
     let lockReleased = false;
-    if (orphansSignaled > 0) {
+    const safeToReleaseLock = orphansFailed === 0;
+    if (safeToReleaseLock) {
       try {
         lockReleased = await releaseLock(config._resolved.codeLock);
         if (lockReleased) emitter.emit('lock_released', { forced: true, reason: 'orphan_stop' });
       } catch (err) {
-        console.warn(`[stop] releaseLock(${config._resolved.codeLock}) failed: ${err.code || err.message}`);
+        console.warn(`[stop] releaseLock(${config._resolved.codeLock}) failed: ${err.code || '?'}: ${err.message || err}`);
       }
+    } else {
+      emitter.emit('lock_release_skipped', {
+        reason: 'orphan_signal_failures',
+        orphansSignaled,
+        orphansFailed,
+      });
     }
 
     res.json({
@@ -467,6 +478,7 @@ export async function startServer(config) {
       hard: true,
       orphansFound: orphans.length,
       orphansSignaled,
+      orphansFailed,
       lockReleased,
     });
   });
