@@ -2,6 +2,7 @@ import express from 'express';
 import { EventEmitter } from 'events';
 import { readFile, readFile as readFileAsync } from 'fs/promises';
 import { watchFile, unwatchFile } from 'fs';
+import { execSync } from 'child_process';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
@@ -11,6 +12,26 @@ import { EventLogger } from './event-log.js';
 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * List PIDs of claude subprocesses that are children of this node server.
+ * Used by /api/stop as a safety net — if Pipeline.run() resolved but its
+ * Claude child is still alive (observed 2026-04-21 during T-335 run), the
+ * normal `activePipeline.stopActiveSubprocess()` path can't reach it because
+ * `activePipeline` has already been nulled. ps on ppid catches the orphan.
+ */
+function findOrphanClaudeChildren() {
+  try {
+    const out = execSync(`ps --ppid ${process.pid} -o pid=,comm=`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.trim().split('\n')
+      .map((l) => l.trim())
+      .filter((l) => /\bclaude\b/.test(l))
+      .map((l) => parseInt(l.split(/\s+/)[0], 10))
+      .filter((pid) => Number.isFinite(pid));
+  } catch {
+    return [];
+  }
+}
 
 export async function startServer(config) {
   const app = express();
@@ -330,18 +351,46 @@ export async function startServer(config) {
   // immediately — fixes the recurring "stop is slow" complaint where a
   // mid-step /api/stop could wait 5-15 min for Claude to finish.
   app.post('/api/stop', async (req, res) => {
-    if (!activePipeline) {
-      return res.status(400).json({ error: 'No pipeline running' });
-    }
     const hard = req.query?.hard === 'true' || req.body?.hard === true;
     emitter.emit('stop_requested', { hard });
-    let killed = false;
-    if (hard && typeof activePipeline.stopActiveSubprocess === 'function') {
-      killed = activePipeline.stopActiveSubprocess();
+
+    // Happy path: pipeline reference still live.
+    if (activePipeline) {
+      let killed = false;
+      if (hard && typeof activePipeline.stopActiveSubprocess === 'function') {
+        killed = activePipeline.stopActiveSubprocess();
+      }
+      await activePipeline.releaseLock();
+      activePipeline = null;
+      return res.json({ status: 'stopped', hard, subprocessKilled: killed });
     }
-    await activePipeline.releaseLock();
-    activePipeline = null;
-    res.json({ status: 'stopped', hard, subprocessKilled: killed });
+
+    // Orphan path: `activePipeline` was nulled (Pipeline.run() resolved/rejected
+    // or Node evented the `.finally`) but a Claude child is still alive. This
+    // was silent before — UI stop would 400 while the subprocess kept editing.
+    // Scan our own children and SIGTERM any `claude -p …` we find. Covers both
+    // a failed-away run and any genuinely orphaned subprocess.
+    const orphans = findOrphanClaudeChildren();
+    if (orphans.length === 0) {
+      return res.status(400).json({ error: 'No pipeline running' });
+    }
+    let killedCount = 0;
+    if (hard) {
+      for (const pid of orphans) {
+        try {
+          process.kill(pid, 'SIGTERM');
+          setTimeout(() => { try { process.kill(pid, 0); process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }, 5000).unref();
+          killedCount++;
+        } catch { /* already gone */ }
+      }
+    }
+    res.json({
+      status: 'stopped',
+      hard,
+      orphansFound: orphans.length,
+      orphansKilled: killedCount,
+      note: hard ? 'no live pipeline; killed orphan claude subprocess(es)' : 'no live pipeline; found orphan subprocesses — pass ?hard=true to kill',
+    });
   });
 
   // API: force-release code lock
