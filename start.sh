@@ -23,7 +23,7 @@ case "${1:-start}" in
     sleep 0.5
     # rotate previous log once so we keep one generation
     [ -f pipeline.log ] && mv -f pipeline.log pipeline.log.1
-    node src/index.js --server "$@" >> pipeline.log 2>&1 &
+    NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" >> pipeline.log 2>&1 &
     echo $! > "$PIDFILE"
     echo "Started (PID $(cat "$PIDFILE"))"
     ;;
