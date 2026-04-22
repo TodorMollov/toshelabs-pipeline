@@ -422,7 +422,13 @@ export async function startServer(config) {
       });
     }
 
+    // Three distinct terminal states per orphan:
+    //   signaled     — SIGTERM succeeded (process will exit or get SIGKILLed at +5s)
+    //   alreadyDead  — ESRCH between scan and kill (process had already exited)
+    //   failed       — EPERM or other kill error (orphan is still alive)
+    // Lock release gates on `failed === 0`; alreadyDead counts as resolved.
     let orphansSignaled = 0;
+    let orphansAlreadyDead = 0;
     let orphansFailed = 0;
     for (const { pid, starttime } of orphans) {
       try {
@@ -441,9 +447,7 @@ export async function startServer(config) {
         }, 5000).unref();
       } catch (err) {
         if (err && err.code === 'ESRCH') {
-          // Already exited between scan and kill — count as signaled (the
-          // desired state is reached).
-          orphansSignaled++;
+          orphansAlreadyDead++;
         } else {
           orphansFailed++;
           console.warn(`[stop] SIGTERM ${pid} failed: ${err.code || '?'}: ${err.message || err}`);
@@ -478,6 +482,7 @@ export async function startServer(config) {
       hard: true,
       orphansFound: orphans.length,
       orphansSignaled,
+      orphansAlreadyDead,
       orphansFailed,
       lockReleased,
     });
