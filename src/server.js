@@ -448,12 +448,18 @@ export async function startServer(config) {
     // Release the code lock — the whole point of /api/stop is to leave the
     // project in a state where the next run can start. Without this the orphan
     // kill would still leave a stale busydad/code.lock that blocks acquireLock.
+    //
+    // BUT only when we actually signaled something. If every process.kill
+    // threw (EPERM, etc.), the orphan is still alive editing files and
+    // clearing the lock would let the next run clobber its changes.
     let lockReleased = false;
-    try {
-      lockReleased = await releaseLock(config._resolved.codeLock);
-      if (lockReleased) emitter.emit('lock_released', { forced: true, reason: 'orphan_stop' });
-    } catch (err) {
-      console.warn(`[stop] releaseLock failed: ${err.message}`);
+    if (orphansSignaled > 0) {
+      try {
+        lockReleased = await releaseLock(config._resolved.codeLock);
+        if (lockReleased) emitter.emit('lock_released', { forced: true, reason: 'orphan_stop' });
+      } catch (err) {
+        console.warn(`[stop] releaseLock(${config._resolved.codeLock}) failed: ${err.code || err.message}`);
+      }
     }
 
     res.json({
