@@ -423,7 +423,8 @@ export async function startServer(config) {
     }
 
     // Three distinct terminal states per orphan:
-    //   signaled     — SIGTERM succeeded (process will exit or get SIGKILLed at +5s)
+    //   signaled     — SIGTERM delivered; SIGKILL attempted at +5s if still alive
+    //                  and starttime still matches (guards against PID reuse).
     //   alreadyDead  — ESRCH between scan and kill (process had already exited)
     //   failed       — EPERM or other kill error (orphan is still alive)
     // Lock release gates on `failed === 0`; alreadyDead counts as resolved.
@@ -448,6 +449,7 @@ export async function startServer(config) {
       } catch (err) {
         if (err && err.code === 'ESRCH') {
           orphansAlreadyDead++;
+          console.log(`[stop] ${pid} already exited before SIGTERM`);
         } else {
           orphansFailed++;
           console.warn(`[stop] SIGTERM ${pid} failed: ${err.code || '?'}: ${err.message || err}`);
@@ -455,11 +457,12 @@ export async function startServer(config) {
       }
     }
 
-    // Release the code lock only when every orphan was signaled. A partial
-    // failure (e.g. one of three EPERM'd) means a survivor is still editing
-    // files; clearing the lock would let the next run clobber its changes.
-    // Callers that hit this state can fall back to /api/unlock explicitly
-    // once they've dealt with the stuck orphan.
+    // Release the code lock only when no orphan signal failed. `alreadyDead`
+    // is a success — the process we wanted gone is gone — so it doesn't
+    // block release. A partial `failed` (e.g. one of three EPERM'd) means a
+    // survivor is still editing files; clearing the lock would let the next
+    // run clobber its changes. Callers hitting that state can fall back to
+    // /api/unlock once they've dealt with the stuck orphan.
     let lockReleased = false;
     const safeToReleaseLock = orphansFailed === 0;
     if (safeToReleaseLock) {
@@ -473,6 +476,7 @@ export async function startServer(config) {
       emitter.emit('lock_release_skipped', {
         reason: 'orphan_signal_failures',
         orphansSignaled,
+        orphansAlreadyDead,
         orphansFailed,
       });
     }
