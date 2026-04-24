@@ -102,7 +102,12 @@ OUTPUT RULES — THIS IS A PIPELINE, NOT A CONVERSATION:
 - Do the full investigation (read files, grep, trace callers) but do NOT narrate it.
 - Your ONLY text output is code changes and the pipeline JSON update.
 - No explanations, no commentary, no "Let me check...", no "I found that...".
-- If you must reason, do it silently. Only output actions and results.`;
+- If you must reason, do it silently. Only output actions and results.
+
+TOOL USE — GIT:
+- The pipeline owns commit and rollback. Edit files; do not touch git state — git mutations from inside a step corrupt the pipeline's commit/rollback boundary.
+- Allowed (inspection): \`git log\`, \`diff\`, \`status\`, \`show\`, \`blame\`, \`grep\`, \`rev-parse\`, \`ls-files\`, \`reflog\`.
+- Forbidden: \`add\`, \`commit\`, \`reset\`, \`checkout\`, \`restore\`, \`switch\`, \`merge\`, \`rebase\`, \`cherry-pick\`, \`revert\`, \`stash\`, \`push\`, \`pull\`, \`fetch\`, \`clean\`, \`rm\`, \`mv\`, \`tag\`, \`notes\`, \`remote\`, \`config\`, \`worktree\`.`;
 
   const templates = {
     plan: `Ticket {{ticket_id}}: "{{ticket_title}}"
