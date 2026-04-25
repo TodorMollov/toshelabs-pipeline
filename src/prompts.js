@@ -69,7 +69,6 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
       /\{\{pipeline_state\}\}/g,
       JSON.stringify(relevantState)
     )
-    .replace(/\{\{backlog_path\}\}/g, config._resolved.backlog)
     .replace(/\{\{project_dir\}\}/g, config.project_dir)
     .replace(/\{\{pipeline_dir\}\}/g, config._resolved.pipelineDir)
     .replace(/\{\{tech_stack_hints\}\}/g, config.project_profile?.tech_stack_hints || 'use the project conventions')
@@ -253,10 +252,12 @@ Write {{pipeline_dir}}/{{ticket_id}}.json with steps.root_cause.status = "done":
 PIPELINE STATE: {{pipeline_state}}
 ${EFFICIENCY_RULE}
 
-DOCS UPDATE — edit files directly, then write JSON.
+DOCS UPDATE — edit prose docs only, then write JSON.
 
 ALREADY DONE (do NOT touch these — handled by the pipeline automatically):
-- memory/closed-bugs.json — already updated
+- memory/backlog.json — orchestrator moves the ticket to archive after this step
+- memory/backlog-archive.json — orchestrator appends after this step
+- memory/closed-bugs.json — orchestrator appends for bugs after this step
 - memory/build-log/{today}.md — already appended
 
 Check and update if applicable (skip silently if N/A):
@@ -269,11 +270,8 @@ Check and update if applicable (skip silently if N/A):
 6. Grep for stale hints/tooltips referencing old behavior
 7. memory/code_validation.md — if new coding rule from root_cause
 
-Update ticket status in {{backlog_path}}: set status = "done".
-
 Write {{pipeline_dir}}/{{ticket_id}}.json with steps.docs_update.status = "done":
-- files_updated: [{path}] — path only
-- backlog_updated: true`,
+- files_updated: [{path}] — path only`,
   };
 
   return templates[stepName] || `Execute step "${stepName}" for ticket {{ticket_id}}.`;

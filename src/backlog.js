@@ -1,4 +1,5 @@
 import { readFile, writeFile } from 'fs/promises';
+import { execSync } from 'child_process';
 
 /**
  * Load and filter tickets from backlog.json
@@ -116,6 +117,32 @@ export async function archiveTicket(ticketId, config, opts = {}) {
     } catch (err) {
       // Archive already succeeded — don't surface the ledger failure.
       console.warn(`[archive] ${ticketId}: closed-bugs update failed — ${err.message}`);
+    }
+  }
+
+  // Atomic: commit the ledger writes immediately so the next ticket's
+  // checkpoint guard sees a clean tree. Without this commit the writes
+  // sit dirty in the working directory and the next ensureBranch refuses
+  // with DIRTY_TREE — that's how 10 of 13 tickets were skipped on
+  // 2026-04-25. Only commits the specific ledger files this function
+  // wrote, never `add -A`, so any unrelated dirty work in the tree is
+  // preserved.
+  if (config.project_dir && !opts.skipCommit) {
+    const cwd = config.project_dir;
+    const filesToStage = [config.backlog_file, config.archive_file];
+    if (isBug && config.closed_bugs_file) filesToStage.push(config.closed_bugs_file);
+    try {
+      for (const rel of filesToStage) {
+        if (!rel) continue;
+        execSync(`git add ${JSON.stringify(rel)}`, { cwd, encoding: 'utf-8', timeout: 10000 });
+      }
+      const staged = execSync('git diff --cached --name-only', { cwd, encoding: 'utf-8', timeout: 10000 }).trim();
+      if (staged) {
+        execSync(`git commit -m ${JSON.stringify(`[pipeline] archive ${ticketId}`)}`, { cwd, encoding: 'utf-8', timeout: 10000 });
+      }
+    } catch (err) {
+      const tail = (err.stderr || err.stdout || err.message || '').toString().slice(-300);
+      console.warn(`[archive] ${ticketId}: ledger commit failed — ${tail}`);
     }
   }
 

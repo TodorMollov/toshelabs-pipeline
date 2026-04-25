@@ -14,6 +14,7 @@ import {
   revertToLastSnapshot as checkpointRevert,
   deleteBranch as checkpointDeleteBranch,
   mergeToMaster as checkpointMergeToMaster,
+  autoCommitPaths,
   CheckpointError,
 } from './checkpoint.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
@@ -246,6 +247,27 @@ export class Pipeline {
     // `checkpoints.enabled: true` in pipeline.config.yaml. When disabled (the
     // default during rollout), the legacy same-branch flow is preserved.
     if (!this.dryRun && this.config.checkpoints?.enabled) {
+      // Absorb any pre-existing dirty edits to pipeline-managed ledgers
+      // (the human session's "I added a ticket to the backlog" workflow)
+      // by committing them on master *before* the ticket branch is created.
+      // Without this, DIRTY_TREE refuses and the operator has to commit
+      // by hand each time. Code dirties still trigger DIRTY_TREE — those
+      // are likely WIP and shouldn't be folded into pipeline history.
+      try {
+        const ledgerPaths = [
+          this.config.backlog_file || 'memory/backlog.json',
+          this.config.archive_file || 'memory/backlog-archive.json',
+          this.config.closed_bugs_file || 'memory/closed-bugs.json',
+        ];
+        const sha = autoCommitPaths(this.config.project_dir, ledgerPaths);
+        if (sha) {
+          this.emit('human_backlog_committed', { ticket: ticket.id, sha });
+          console.log(`[checkpoint] ${ticket.id}: absorbed human backlog edits as ${sha.slice(0, 7)}`);
+        }
+      } catch (err) {
+        console.error(`[checkpoint] ${ticket.id}: auto-commit of backlog edits failed: ${err.message}`);
+      }
+
       try {
         const res = await checkpointEnsureBranch(ticket.id, this.config.project_dir);
         this.emit('checkpoint_branch_ready', { ticket: ticket.id, ...res });
@@ -883,6 +905,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             mergedSha = await checkpointMergeToMaster(ticket.id, {
               title: ticket.title,
               cwd: this.config.project_dir,
+              ledgerPaths: [
+                this.config.backlog_file || 'memory/backlog.json',
+                this.config.archive_file || 'memory/backlog-archive.json',
+                this.config.closed_bugs_file || 'memory/closed-bugs.json',
+              ],
             });
             if (mergedSha) {
               this.emit('checkpoint_merged_to_master', { ticket: ticket.id, sha: mergedSha });
@@ -1824,10 +1851,6 @@ PRIORITY: Write the pipeline JSON FIRST, then investigate. Do not spend turns re
       const touchedFiles = [...newFiles, ...editedFiles];
       if (touchedFiles.length > 0) {
         step[fieldName] = touchedFiles.map((path) => ({ path, summary: 'auto-detected' }));
-        if (stepConfig.name === 'docs_update') {
-          const backlogFile = this.config.backlog_file || 'memory/backlog.json';
-          if (touchedFiles.some((f) => f.includes(backlogFile) || f.includes('backlog'))) step.backlog_updated = true;
-        }
         // Promote pending OR missing-status to 'done'. Missing status means
         // Claude wrote step artifacts but no top-level status field (e.g.
         // docs_update frequently writes {files_updated, metrics:{status:'done'}}

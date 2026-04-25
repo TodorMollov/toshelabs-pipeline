@@ -49,6 +49,45 @@ function isDirty(cwd) {
   return status.length > 0;
 }
 
+// Auto-commit dirty edits to a specific allow-list of paths on the current
+// branch. Used at ticket start (and before squash-merge) to absorb the
+// human session's pending edits to pipeline-managed ledgers (backlog.json,
+// backlog-archive.json, closed-bugs.json) so DIRTY_TREE doesn't refuse.
+//
+// Code/doc dirties are intentionally NOT absorbed: those usually indicate
+// WIP that shouldn't be bundled into pipeline history, and surfacing them
+// via DIRTY_TREE forces the operator to handle them deliberately.
+//
+// Past attempts to "park" dirty edits on a side branch (autosave/{id})
+// silently abandoned them when the next pipeline run reset the branch
+// (2026-04-25 incident, 13 tickets lost). Committing on the current branch
+// keeps the edits reachable through normal git history.
+//
+// Returns the new commit sha, or null if no matching dirty paths.
+export function autoCommitPaths(cwd, paths) {
+  // Use execSync directly so we keep the leading space that `git status
+  // --porcelain` emits for unstaged-only changes (` M path`). The shared
+  // git() helper trims the full output, which would shift paths by one
+  // column on the first line.
+  const status = execSync('git status --porcelain', { cwd, encoding: 'utf-8' });
+  if (!status) return null;
+  const allowed = new Set(paths);
+  const matched = [];
+  for (const line of status.split('\n')) {
+    if (!line) continue;
+    // Porcelain v1: cols 0-1 = status, col 2 = space, col 3+ = path.
+    const path = line.slice(3);
+    if (allowed.has(path)) matched.push(path);
+  }
+  if (matched.length === 0) return null;
+  for (const p of matched) git(`add ${JSON.stringify(p)}`, cwd);
+  const staged = git('diff --cached --name-only', cwd);
+  if (!staged) return null;
+  const iso = new Date().toISOString();
+  git(`commit -m ${JSON.stringify(`[human] backlog edits at ${iso}`)}`, cwd);
+  return git('rev-parse HEAD', cwd);
+}
+
 export async function ensureBranch(ticketId, cwd) {
   const branch = branchName(ticketId);
   const existed = git(`rev-parse --verify ${branch}`, cwd, { tolerateFailure: true }) !== null;
@@ -134,7 +173,7 @@ export async function deleteBranch(ticketId, cwd) {
 //   cwd            — project git root
 //   masterBranch   — name of the trunk branch (default 'master')
 export async function mergeToMaster(ticketId, opts) {
-  const { title = '', cwd, masterBranch = 'master' } = opts || {};
+  const { title = '', cwd, masterBranch = 'master', ledgerPaths = [] } = opts || {};
   if (!cwd) throw new CheckpointError('mergeToMaster: cwd is required');
 
   const branch = branchName(ticketId);
@@ -144,6 +183,9 @@ export async function mergeToMaster(ticketId, opts) {
   // Move to master before checking dirtiness so we don't flag the ticket
   // branch's own in-progress state as "dirty master".
   git(`checkout ${masterBranch}`, cwd);
+  // Absorb any human ledger edits made on master during the run before the
+  // dirty-master check fires. Same allow-list as ticket-start auto-commit.
+  if (ledgerPaths.length) autoCommitPaths(cwd, ledgerPaths);
   if (isDirty(cwd)) {
     throw new CheckpointError(
       `master has uncommitted changes — refusing to squash-merge ${ticketId}. ` +

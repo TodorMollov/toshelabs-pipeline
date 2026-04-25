@@ -259,9 +259,6 @@ steps:
     validation:
       - field: files_updated
         rule: non_empty_array
-      - field: backlog_updated
-        rule: equals
-        value: true
 
 # Web UI
 server:
