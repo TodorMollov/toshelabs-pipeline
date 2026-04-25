@@ -57,11 +57,14 @@ describe('ensureBranch', () => {
   });
 
   test('recovers existing stale branch by resetting to master tip', async () => {
-    // Simulate a crashed prior run
+    // Simulate a crashed prior run that left a real pipeline step commit
+    // on the branch. Commit subject must match the [pipeline] {id} step-
+    // shape — anything else triggers STALE_BRANCH_HAS_COMMITS to protect
+    // operator commits (see test/branch-reset-safety.test.js).
     git('checkout -b pipeline/TEST-4');
     writeFileSync(join(repoDir, 'stale.txt'), 'left over');
     git('add stale.txt');
-    git('commit -m "stale crash state"');
+    git('commit -m "[pipeline] TEST-4 step-1-tests_red"');
     git('checkout master');
 
     const result = await ensureBranch('TEST-4', repoDir);

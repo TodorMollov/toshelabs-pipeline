@@ -103,7 +103,33 @@ export async function ensureBranch(ticketId, cwd) {
   }
 
   if (existed) {
-    // Reset the stale branch back to master's tip so the ticket starts clean.
+    // Detect operator commits sitting on this branch — they would be
+    // silently abandoned by `reset --hard master`. Pipeline step commits
+    // have a fixed subject shape (`[pipeline] {ticketId} step-N-{name}`)
+    // so anything else ahead of master is the operator's own work.
+    //
+    // 2026-04-25: `1b68933` ([backlog] Recover 13 tickets …) was committed
+    // by the operator onto pipeline/T-351 to recover from a separate
+    // destruction incident. The next pipeline run reset that branch to
+    // master and the recovery commit was orphaned (only reachable via
+    // reflog). Refusing here keeps the operator's work reachable.
+    const aheadSubjects = (
+      git(`log master..${branch} --pretty=%s`, cwd, { tolerateFailure: true }) || ''
+    ).split('\n').filter(Boolean);
+    const pipelineSubject = new RegExp(`^\\[pipeline\\] ${ticketId} step-`);
+    const nonPipelineCommits = aheadSubjects.filter((s) => !pipelineSubject.test(s));
+    if (nonPipelineCommits.length > 0) {
+      throw new CheckpointError(
+        `branch ${branch} has ${nonPipelineCommits.length} non-pipeline ` +
+          `commit(s) ahead of master — refusing to reset. ` +
+          `Inspect with: git log master..${branch}. ` +
+          `Either merge those commits to master or delete the branch ` +
+          `(git branch -D ${branch}) before retrying this ticket.`,
+        { code: 'STALE_BRANCH_HAS_COMMITS' },
+      );
+    }
+
+    // Pure pipeline step commits (or already at master) — safe to reset.
     git(`checkout ${branch}`, cwd);
     git('reset --hard master', cwd);
     // Clean any untracked files left over from a crashed run.
