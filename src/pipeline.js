@@ -147,7 +147,15 @@ export class Pipeline {
           // Atomic rollback: revert this ticket's declared files so the next
           // ticket's baseline is clean. Skipped on dry-run and when the
           // ticket has no declared files (e.g. crashed before plan).
-          if (!this.dryRun && failedState) {
+          //
+          // Hard skip when the failure is a checkpoint refusal (DIRTY_TREE
+          // and friends): we never wrote a thing, so there is nothing to
+          // revert. Running rollback here would incorrectly attribute the
+          // operator's pre-existing uncommitted edits to this ticket and
+          // `git checkout HEAD --` them out of the tree (this is exactly
+          // how 13 backlog edits were destroyed on 2026-04-25).
+          const skipRollback = err instanceof CheckpointError;
+          if (!this.dryRun && failedState && !skipRollback) {
             try { await this.rollbackTicketFiles(ticket, failedState); }
             catch (rbErr) { console.error(`[rollback] ${ticket.id}: ${rbErr.message}`); }
           }
@@ -169,6 +177,13 @@ export class Pipeline {
           continue;
         }
 
+        // Archive the ticket first so its backlog.json/backlog-archive.json
+        // mutations are dirty in the tree when commitTicketFiles runs and get
+        // folded into the same ticket-tagged commit. Reversing this order
+        // leaves the archive write uncommitted and the next ticket's
+        // checkpoint guard refuses with DIRTY_TREE.
+        await archiveTicket(ticket.id, this.config);
+
         // Auto-commit: successful tickets commit their declared files as a
         // single ticket-tagged commit. Keeps the tree clean so subsequent
         // baseline captures reflect a genuine HEAD, not a pile of
@@ -177,9 +192,6 @@ export class Pipeline {
           try { await this.commitTicketFiles(ticket, finalState); }
           catch (err) { console.error(`[auto-commit] ${ticket.id}: ${err.message}`); }
         }
-
-        // Archive the ticket
-        await archiveTicket(ticket.id, this.config);
 
         // Pause between tickets if requested
         if (this.pause && i < queue.length - 1) {
@@ -1061,9 +1073,30 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // files so the next retry can resume without re-running earlier steps.
   async rollbackTicketFiles(ticket, pipelineState) {
     if (pipelineState.rollback?.at) return; // already rolled back — idempotent
+    // Refuse to roll back when `dirty_at_start` was never captured. Without
+    // that snapshot `collectTicketFiles` cannot tell ticket writes apart
+    // from the operator's pre-existing dirty files, and would attribute
+    // every dirty path in the tree to this ticket. Missing baseline means
+    // we don't know what's safe to touch — so touch nothing. This is the
+    // structural backstop for the BUG-252 / 2026-04-25 incident.
+    if (!Array.isArray(pipelineState.dirty_at_start)) {
+      pipelineState.rollback = {
+        at: new Date().toISOString(),
+        skipped_reason: 'dirty_at_start not captured — refusing to revert',
+        reverted: [], deleted: [], skipped: [], errors: [],
+      };
+      await this.savePipelineJson(ticket.id, pipelineState);
+      console.log(`[rollback] ${ticket.id}: SKIPPED — baseline never captured`);
+      this.emit('ticket_rolled_back', {
+        ticket: ticket.id,
+        revertedCount: 0, deletedCount: 0, skippedCount: 0, errorCount: 0,
+        skippedReason: 'dirty_at_start not captured',
+      });
+      return;
+    }
     const projectDir = this.config.project_dir;
     const touched = this.collectTicketFiles(pipelineState);
-    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
+    const dirtyAtStart = new Set(pipelineState.dirty_at_start);
     const nowDirty = this.getDirtyFiles(projectDir);
 
     const reverted = [];
