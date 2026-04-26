@@ -163,9 +163,13 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     ? ticket
     : { id: ticket.id, title: ticket.title, type: ticket.type, description: ticket.description };
 
-  // Plan-step only: pre-load files mentioned in the ticket description and
-  // fix_plan. Saves the worker the 3-10 Read turns it would otherwise spend
-  // re-fetching the same paths the human session already enumerated.
+  // Pre-load referenced source/test files so the worker doesn't burn LLM
+  // round-trips re-Reading them. Different source per step:
+  //   plan       → ticket description + fix_plan prose (path mentions)
+  //   tests_red  → plan output's files_to_change (already-curated paths)
+  //   implement  → plan output's files_to_change + test_files written by
+  //                tests_red (so the worker has both "what to change" and
+  //                "what tests must pass" already in context)
   let referencedFiles = '';
   if (stepConfig.name === 'plan') {
     const fixPlanText = Array.isArray(ticket.fix_plan) ? ticket.fix_plan.join('\n') : '';
@@ -173,6 +177,18 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
       `${ticket.description || ''}\n${fixPlanText}`,
       config.project_dir,
     );
+  } else if (stepConfig.name === 'tests_red' || stepConfig.name === 'implement') {
+    const planFiles = (relevantState.steps?.plan?.files_to_change || [])
+      .map((f) => (typeof f === 'string' ? f : f.path))
+      .filter(Boolean);
+    const testFiles = stepConfig.name === 'implement'
+      ? (relevantState.steps?.tests_red?.test_files || [])
+      : [];
+    const paths = [...new Set([...planFiles, ...testFiles])];
+    if (paths.length > 0) {
+      // Synthetic text so loadReferencedFiles' regex picks them up.
+      referencedFiles = await loadReferencedFiles(paths.join(' '), config.project_dir);
+    }
   }
 
   // Replace placeholders
@@ -289,6 +305,7 @@ If you are running low on turns, STOP investigating and write the JSON with what
     tests_red: `Ticket {{ticket_id}}: "{{ticket_title}}"
 {{ticket_json}}
 PIPELINE STATE: {{pipeline_state}}
+{{referenced_files}}
 ${EFFICIENCY_RULE}
 
 TESTS RED STEP:
@@ -313,6 +330,7 @@ If blocked: set status = "blocked" with reason.`,
     implement: `Ticket {{ticket_id}}: "{{ticket_title}}"
 {{ticket_json}}
 PIPELINE STATE: {{pipeline_state}}
+{{referenced_files}}
 ${EFFICIENCY_RULE}
 
 IMPLEMENT STEP:
