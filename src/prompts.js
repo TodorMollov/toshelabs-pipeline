@@ -344,6 +344,9 @@ PIPELINE STATE: {{pipeline_state}}
 {{referenced_files}}
 ${EFFICIENCY_RULE}
 
+DO NOT RUN TESTS OR ANALYZER:
+The next pipeline step (tests_green) runs the full suite + analyzer. You running flutter test / npm test / tsc / .claude/run-tests.sh / dart analyze yourself adds 3-5 minutes per invocation and produces nothing tests_green wouldn't. The only thing you do here is edit code and declare files_changed.
+
 IMPLEMENT STEP:
 1. Read plan and test results from PIPELINE STATE
 2. If steps.implement.review_feedback exists — FIX EVERY ITEM FIRST. These are blocking.

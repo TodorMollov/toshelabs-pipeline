@@ -158,7 +158,12 @@ steps:
 
   - name: implement
     prompt_template: prompts/implement.md
-    reuse_session: true   # reuses tests_red session — test files + failure output already in context
+    # reuse_session intentionally OFF: when --resume is passed, Claude Code
+    # inherits the original session's tool allowlist (union with the new
+    # --allowedTools), so tests_red's `Bash(flutter *)` leaks into implement
+    # and the worker can run tests itself — wasting 3-5 minutes per invocation
+    # since tests_green is the test runner. Cold start enforces strict tools.
+    reuse_session: false
     tools:
       - Read
       - Grep
