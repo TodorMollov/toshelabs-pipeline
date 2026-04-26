@@ -181,12 +181,26 @@ export class Pipeline {
         // Dry run: only plan step
         if (this.dryRun) continue;
 
-        // Don't archive blocked tickets — they need another pass. Files
-        // stay on disk so the next retry can resume without re-writing
-        // them; only terminally-failed tickets get rolled back.
+        // Don't archive blocked or failed tickets — they need another pass.
+        // Files stay on disk so the next retry can resume without re-writing
+        // them; only `done` tickets are archived. (2026-04-26: previously only
+        // `blocked` was gated, which meant a crashed-then-recovered ticket
+        // whose pipelineState was left at status:'failed' got archived
+        // without a squash-merge — visible on master as `archive T-X` with
+        // no preceding T-X commit.)
         const finalState = await this.loadPipelineJson(ticket.id);
         if (finalState?.status === 'blocked') {
           this.emit('ticket_blocked_skip_archive', { ticket: ticket.id, step: finalState.blocked_step });
+          continue;
+        }
+        if (finalState?.status === 'failed') {
+          this.emit('ticket_failed_skip_archive', { ticket: ticket.id, reason: finalState.failure_reason || 'status=failed' });
+          continue;
+        }
+        if (finalState?.status !== 'done') {
+          // Anything else (in_progress, pending, missing) is also not
+          // archive-ready. Belt-and-braces — only `done` ships.
+          this.emit('ticket_not_archived', { ticket: ticket.id, status: finalState?.status || 'missing' });
           continue;
         }
 
