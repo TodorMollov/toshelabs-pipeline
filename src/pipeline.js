@@ -15,6 +15,7 @@ import {
   deleteBranch as checkpointDeleteBranch,
   mergeToMaster as checkpointMergeToMaster,
   autoCommitPaths,
+  listStepSnapshots,
   CheckpointError,
 } from './checkpoint.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
@@ -228,6 +229,11 @@ export class Pipeline {
     let pipelineState = await this.loadOrCreatePipelineJson(ticket);
     const ticketStartTime = Date.now();
     const stepMetrics = [];
+    // Steps whose worker actually ran (or whose orchestrator-driven body
+    // executed) in THIS run. Distinct from `pipelineState.steps[X].status`
+    // which a misbehaving worker can write directly. Used at squash-merge
+    // time to refuse "ship" when a step claims done but never executed.
+    const executedThisRun = new Set();
 
     // Blocked-retry escalation: a ticket that keeps getting blocked on the
     // same step consumes LLM budget forever. After N attempts we escalate
@@ -341,6 +347,9 @@ export class Pipeline {
           await this.savePipelineJson(ticket.id, pipelineState);
           this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason: 'condition not met' });
           stepMetrics.push({ step: stepConfig.name, model: '-', durationMs: 0, durationFormatted: '-', inputTokens: 0, outputTokens: 0, toolCalls: 0, filesChanged: 0, gate: '-', status: 'skipped' });
+          // Sanctioned skip: orchestrator deliberately set not_applicable.
+          // Counts as "handled this run" so the merge guard doesn't flag it.
+          executedThisRun.add(stepConfig.name);
           // Restore session — skipped step shouldn't kill session for the next reuse_session step
           this.sessionId = prevSessionId;
           continue;
@@ -352,6 +361,9 @@ export class Pipeline {
       if (existingStep?.status === 'done' || existingStep?.status === 'not_applicable') {
         this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason: 'already done' });
         stepMetrics.push({ step: stepConfig.name, model: '-', durationMs: 0, durationFormatted: '-', inputTokens: 0, outputTokens: 0, toolCalls: 0, filesChanged: 0, gate: '-', status: 'resumed' });
+        // Note: NOT added to executedThisRun. The merge guard will verify
+        // that any "done" status here is backed by a prior-run step tag —
+        // otherwise it's a worker forgery and the merge is refused.
         continue;
       }
 
@@ -392,7 +404,7 @@ export class Pipeline {
 
         while (true) {
           testsGreenResult = await this.runTestsGreen(ticket, pipelineState);
-          pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
+          pipelineState = await this.reloadStepFromDisk(ticket.id, 'tests_green', pipelineState);
           const stepArtifacts = pipelineState.steps.tests_green || {};
 
           // If tests pass (no new failures AND no new analyzer errors) or
@@ -408,7 +420,7 @@ export class Pipeline {
               // Last resort: try self-heal on the gate itself
               const healed = await this.selfHeal(ticket, stepConfig, pipelineState, validation.failures);
               if (healed) {
-                pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
+                pipelineState = await this.reloadStepFromDisk(ticket.id, 'tests_green', pipelineState);
                 const healValidation = validateStep(pipelineState.steps.tests_green || {}, stepConfig, pipelineState.steps.plan || {});
                 if (!healValidation.pass) {
                   this.emit('step_gate_failed', { ticket: ticket.id, step: 'tests_green', failures: healValidation.failures });
@@ -635,9 +647,14 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           });
 
           // Re-read pipeline JSON after think loop (may have been updated)
-          pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
+          pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
         }
       }
+
+      // Step's worker actually executed in this run — record so the
+      // squash-merge guard can refuse to ship a ticket whose pipelineState
+      // claims a step is done but no worker actually ran it.
+      executedThisRun.add(stepConfig.name);
 
       // Collect step metrics with cost
       const stepWallMs = Date.now() - stepStartTime;
@@ -846,23 +863,57 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const incompleteSteps = Object.entries(pipelineState.steps || {})
       .filter(([, step]) => !step || !TERMINAL_OK.has(step.status));
 
+    // F2 + F3 (audit 2026-04-26): every step claiming `done` must either
+    // have actually executed in this run (executedThisRun) OR have a step
+    // tag from a prior run (crash recovery). A worker can't fake a tag —
+    // they're created by the orchestrator after gate pass.
+    let unverifiedSteps = [];
+    if (this.config.checkpoints?.enabled && pipelineState.status !== 'blocked' && pipelineState.status !== 'failed') {
+      let priorRunStepNames = new Set();
+      try {
+        const tags = await listStepSnapshots(ticket.id, this.config.project_dir);
+        priorRunStepNames = new Set(tags.map((t) => t.step));
+      } catch (err) {
+        console.warn(`[merge-guard] ${ticket.id}: tag listing failed — ${err.message}`);
+      }
+      for (const stepCfg of steps) {
+        const stepState = pipelineState.steps?.[stepCfg.name];
+        if (!stepState || stepState.status !== 'done') continue;
+        if (executedThisRun.has(stepCfg.name)) continue;       // ran this run
+        if (priorRunStepNames.has(stepCfg.name)) continue;      // tag from prior run
+        unverifiedSteps.push(stepCfg.name);
+      }
+      // tests_green specifically: even if executed, must have all_pass:true.
+      // Prevents a self-heal worker rewriting tests_green.all_pass=true
+      // without actually running the suite.
+      const tg = pipelineState.steps?.tests_green;
+      if (tg && tg.status === 'done' && executedThisRun.has('tests_green') && tg.all_pass !== true) {
+        unverifiedSteps.push('tests_green:all_pass!=true');
+      }
+    }
+
     if (pipelineState.status === 'blocked' || pipelineState.status === 'failed' || pipelineState.blocked_at) {
       // Loop already halted this ticket with a terminal failure state.
       // NEVER flip status back to 'done'. Just persist the report.
       console.log(`[preserve-blocked] ${ticket.id}: keeping status=${pipelineState.status} (blocked_step=${pipelineState.blocked_step || 'n/a'})`);
       await this.savePipelineJson(ticket.id, pipelineState);
-    } else if (incompleteSteps.length > 0) {
+    } else if (incompleteSteps.length > 0 || unverifiedSteps.length > 0) {
       // Loop completed without setting a terminal state, but some sub-steps
       // never reached done/not_applicable/skipped. Treat the ticket as blocked
-      // rather than silently shipping partial work.
-      const stepList = incompleteSteps
-        .map(([name, s]) => `${name}=${s?.status ?? 'missing'}`)
-        .join(', ');
+      // rather than silently shipping partial work. unverifiedSteps catches the
+      // T-359-class failure: status:done that no worker actually produced.
+      const reasons = [];
+      if (incompleteSteps.length > 0) {
+        reasons.push(`sub-steps not complete: ${incompleteSteps.map(([name, s]) => `${name}=${s?.status ?? 'missing'}`).join(', ')}`);
+      }
+      if (unverifiedSteps.length > 0) {
+        reasons.push(`steps marked done but never executed this run and no prior-run tag: ${unverifiedSteps.join(', ')}`);
+      }
       pipelineState.status = 'blocked';
       pipelineState.blocked_at = new Date().toISOString();
-      pipelineState.blocked_step = incompleteSteps[0][0];
+      pipelineState.blocked_step = (incompleteSteps[0]?.[0]) || unverifiedSteps[0] || 'unknown';
       pipelineState.blocked_reason =
-        `Pipeline loop ended without failure, but sub-steps not complete: ${stepList}`;
+        `Pipeline loop ended without failure, but: ${reasons.join('; ')}`;
       this.emit('ticket_blocked', {
         ticket: ticket.id,
         step: incompleteSteps[0][0],
@@ -1007,6 +1058,27 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     // Sanitize: Claude sometimes writes JS expressions in JSON (e.g. "574 + 27" instead of 601)
     raw = raw.replace(/:\s*(\d+)\s*\+\s*(\d+)/g, (_, a, b) => ': ' + (parseInt(a) + parseInt(b)));
     return JSON.parse(raw);
+  }
+
+  // Scoped reload: take ONLY the named step's slot from disk, keep the rest of
+  // the orchestrator's in-memory state. Used after a worker runs so a worker
+  // that wrote `steps.implement.status='done'` while running tests_red can't
+  // make implement get skipped on the next loop iteration.
+  //
+  // 2026-04-26 incident: T-359's tests_red self-heal worker rewrote the full
+  // pipeline JSON with done-statuses on every downstream step; the
+  // wholesale-reload site at the worker-completion path picked them up; the
+  // step loop skipped implement/tests_green/review/docs_update; squash-merge
+  // landed on master with no implementation verification.
+  async reloadStepFromDisk(ticketId, stepName, prevState) {
+    const fresh = await this.loadPipelineJson(ticketId);
+    if (!fresh) return prevState;
+    const merged = { ...prevState };
+    merged.steps = { ...(prevState.steps || {}) };
+    if (fresh.steps && fresh.steps[stepName] !== undefined) {
+      merged.steps[stepName] = fresh.steps[stepName];
+    }
+    return merged;
   }
 
   async savePipelineJson(ticketId, state) {
@@ -1611,11 +1683,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit, timedOut });
 
       if (result.sessionId) this.sessionId = result.sessionId;
-      pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
+      pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
 
       // Auto-populate files from git
       await this.autoPopulateFiles(stepConfig, pipelineState, ticket, gitSnapshotBefore, stepStartTime);
-      pipelineState = await this.loadPipelineJson(ticket.id) || pipelineState;
+      pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
 
       // Validate
       const stepArtifacts = pipelineState.steps[stepConfig.name] || {};
