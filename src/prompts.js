@@ -32,6 +32,72 @@ function trimPipelineState(pipelineState, stepName) {
   return trimmed;
 }
 
+// Extract project-relative file paths from prose (description + fix_plan).
+// Tickets reference paths like `app/lib/foo.dart`, `backend/.../bar.ts`, or
+// `memory/SPEC.md`, sometimes with a line range suffix `:412-491`. We pre-load
+// these into the plan prompt so the worker never has to spend a Read turn
+// (or three) on files it could have started with already in context.
+//
+// Returns Map<path, [{start,end},...]> — empty array of ranges means "whole file".
+const PATH_REGEX = /\b((?:[\w@-]+\/)+[\w@.-]+\.(?:dart|ts|tsx|js|jsx|md|yaml|yml|json|py|html|css|sh))(?::(\d+)(?:-(\d+))?)?/g;
+function extractFilePaths(text) {
+  const found = new Map();
+  if (!text) return found;
+  let m;
+  while ((m = PATH_REGEX.exec(text)) !== null) {
+    const path = m[1];
+    const start = m[2] ? parseInt(m[2], 10) : null;
+    const end = m[3] ? parseInt(m[3], 10) : (start || null);
+    if (!found.has(path)) found.set(path, []);
+    if (start) found.get(path).push({ start, end });
+  }
+  return found;
+}
+
+// Load each referenced file (or just its requested line range) and render
+// as <file> blocks for direct injection into the plan prompt.
+//
+// Capped at MAX_FILES files total and MAX_BYTES_PER_FILE per file so a long
+// description with 30 path mentions doesn't blow the prompt budget. Larger
+// files get truncated with an explicit marker, so the worker knows to Read
+// the rest if needed (the common case is `:start-end` ranges, which fit).
+async function loadReferencedFiles(text, projectDir) {
+  const MAX_FILES = 8;
+  const MAX_BYTES_PER_FILE = 20_000;
+  const refs = extractFilePaths(text);
+  const blocks = [];
+  let count = 0;
+  for (const [relPath, ranges] of refs) {
+    if (count >= MAX_FILES) break;
+    const abs = resolve(projectDir, relPath);
+    if (!existsSync(abs)) continue;
+    let content;
+    try { content = await readFile(abs, 'utf-8'); }
+    catch { continue; }
+
+    // If the ticket asked for specific line ranges, render only those — saves
+    // tokens and matches what the worker would have read anyway.
+    if (ranges.length > 0) {
+      const lines = content.split('\n');
+      for (const { start, end } of ranges) {
+        const slice = lines.slice(Math.max(0, start - 1), end || start).join('\n');
+        const truncated = slice.length > MAX_BYTES_PER_FILE
+          ? slice.slice(0, MAX_BYTES_PER_FILE) + `\n… [truncated; original ${slice.length}B]`
+          : slice;
+        blocks.push(`<file path="${relPath}" lines="${start}-${end || start}">\n${truncated}\n</file>`);
+      }
+    } else {
+      const truncated = content.length > MAX_BYTES_PER_FILE
+        ? content.slice(0, MAX_BYTES_PER_FILE) + `\n… [truncated; original ${content.length}B]`
+        : content;
+      blocks.push(`<file path="${relPath}">\n${truncated}\n</file>`);
+    }
+    count++;
+  }
+  if (blocks.length === 0) return '';
+  return `\nFILES REFERENCED IN THIS TICKET (pre-loaded — do NOT Read these again unless you need a different section):\n\n${blocks.join('\n\n')}\n`;
+}
+
 /**
  * Build the prompt for a given step, injecting ticket data and context.
  */
@@ -59,12 +125,25 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     ? ticket
     : { id: ticket.id, title: ticket.title, type: ticket.type, description: ticket.description };
 
+  // Plan-step only: pre-load files mentioned in the ticket description and
+  // fix_plan. Saves the worker the 3-10 Read turns it would otherwise spend
+  // re-fetching the same paths the human session already enumerated.
+  let referencedFiles = '';
+  if (stepConfig.name === 'plan') {
+    const fixPlanText = Array.isArray(ticket.fix_plan) ? ticket.fix_plan.join('\n') : '';
+    referencedFiles = await loadReferencedFiles(
+      `${ticket.description || ''}\n${fixPlanText}`,
+      config.project_dir,
+    );
+  }
+
   // Replace placeholders
   template = template
     .replace(/\{\{ticket_id\}\}/g, ticket.id)
     .replace(/\{\{ticket_title\}\}/g, ticket.title)
     .replace(/\{\{ticket_type\}\}/g, ticket.type || 'unknown')
     .replace(/\{\{ticket_json\}\}/g, JSON.stringify(ticketForPrompt))
+    .replace(/\{\{referenced_files\}\}/g, referencedFiles)
     .replace(
       /\{\{pipeline_state\}\}/g,
       JSON.stringify(relevantState)
@@ -108,6 +187,10 @@ TOKEN DISCIPLINE — DO NOT RE-READ:
 - The same applies to test output files (/tmp/test-results.txt, etc.) and Grep results.
 - Re-reading the same file twice in one step is the #1 cause of max_turns exhaustion (T-359 plan re-read parse-input.test.ts 3× → step thrashed and rolled back).
 
+PARALLELISE TOOL CALLS:
+- When you need to gather information from multiple files or run multiple greps, fire them in ONE turn as parallel tool_use blocks (Read A + Read B + Grep C in a single response). One LLM round-trip instead of three.
+- Sequentially dependent calls (Read X to find a path, then Read that path) must stay sequential. But independent investigation should be parallel.
+
 TOOL USE — GIT:
 - The pipeline owns commit and rollback. Edit files; do not touch git state — git mutations from inside a step corrupt the pipeline's commit/rollback boundary.
 - Allowed (inspection): \`git log\`, \`diff\`, \`status\`, \`show\`, \`blame\`, \`grep\`, \`rev-parse\`, \`ls-files\`, \`reflog\`.
@@ -116,6 +199,7 @@ TOOL USE — GIT:
   const templates = {
     plan: `Ticket {{ticket_id}}: "{{ticket_title}}"
 {{ticket_json}}
+{{referenced_files}}
 ${EFFICIENCY_RULE}
 
 PLAN STEP:
