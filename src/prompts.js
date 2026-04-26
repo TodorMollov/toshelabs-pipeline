@@ -103,6 +103,11 @@ OUTPUT RULES — THIS IS A PIPELINE, NOT A CONVERSATION:
 - No explanations, no commentary, no "Let me check...", no "I found that...".
 - If you must reason, do it silently. Only output actions and results.
 
+TOKEN DISCIPLINE — DO NOT RE-READ:
+- Once you Read a file in this session, the content stays in your context. Refer back to it; do NOT Read it again. If you need a specific section, quote the line range from your earlier read instead of re-reading.
+- The same applies to test output files (/tmp/test-results.txt, etc.) and Grep results.
+- Re-reading the same file twice in one step is the #1 cause of max_turns exhaustion (T-359 plan re-read parse-input.test.ts 3× → step thrashed and rolled back).
+
 TOOL USE — GIT:
 - The pipeline owns commit and rollback. Edit files; do not touch git state — git mutations from inside a step corrupt the pipeline's commit/rollback boundary.
 - Allowed (inspection): \`git log\`, \`diff\`, \`status\`, \`show\`, \`blame\`, \`grep\`, \`rev-parse\`, \`ls-files\`, \`reflog\`.
@@ -114,12 +119,11 @@ TOOL USE — GIT:
 ${EFFICIENCY_RULE}
 
 PLAN STEP:
-1. Read ticket description and fix plan
-2. Identify ALL files that need to change (source + tests + docs)
-3. Read every file that will be modified
-4. Trace ALL callers — grep for call sites of every function that will change
-5. Identify edge cases
-6. Define test strategy
+1. Read ticket description and fix_plan. **If fix_plan lists file paths and what-to-do bullets, that IS your starting point** — copy those into files_to_change and validate, do NOT re-derive from scratch.
+2. Open each file in fix_plan ONCE to confirm the path/lines are accurate and the change is feasible. If a file is missing from fix_plan but clearly needs to change (e.g. test file for a new behavior), add it.
+3. Trace callers ONLY for functions whose signature or behavior changes in a non-backward-compatible way. Pure additions (new fields, new logger calls, new tests) do NOT need callers traced — record them as "no_callers_needed: backward-compatible addition" in callers_traced.
+4. Identify edge cases — one line each, max 5.
+5. test_strategy is **one paragraph, high-level** — "unit tests on the parser, one widget test for the X path". Do NOT investigate test infrastructure (mock patterns, fixture loaders) at this step — that's tests_red's job.
 
 For features: {{tech_stack_hints}}
 For schema changes: flag if a numbered migration is needed.
@@ -151,6 +155,8 @@ TESTS RED STEP:
 4. Record test count BEFORE adding tests
 5. Run tests — must FAIL
 6. Run full suite BEFORE changes to capture baseline_failures
+
+ITERATION LIMIT: if you have edited the same test file 3 times and tests still don't fail in the expected way (or fail to compile), STOP and set status = "blocked" with a clear reason. Do NOT keep iterating — that's how BUG-250 burnt 25 turns on widget-test finder fights and rolled back.
 
 Three outcomes: new_test_fails | existing_test_fails | existing_test_covers (→ STOP)
 
