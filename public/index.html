@@ -310,6 +310,18 @@
 
   .ticket-id.bug { color: var(--red); }
   .ticket-id.feature { color: var(--blue); }
+  .ticket-id.test { color: var(--purple); }
+  .ticket-tag.test {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    background: rgba(188, 140, 255, 0.15);
+    color: var(--purple);
+    text-transform: uppercase;
+  }
 
   .ticket-priority {
     font-size: 10px;
@@ -473,6 +485,26 @@
     margin: 0 auto;
   }
   .scroll-badge.visible { display: block; }
+
+  .terminal-clear {
+    position: sticky;
+    top: 0;
+    float: right;
+    margin-left: 8px;
+    z-index: 20;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    font-size: 11px;
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    padding: 0;
+    line-height: 20px;
+  }
+  .terminal-clear:hover { color: var(--text); border-color: var(--text-dim); }
 
   .terminal .line { display: flex; gap: 8px; }
   .terminal .ts { color: var(--text-muted); white-space: nowrap; min-width: 72px; }
@@ -867,6 +899,7 @@
 
   <!-- Terminal -->
   <div class="terminal" id="terminal">
+    <button class="terminal-clear" onclick="clearTerminal()" title="Clear console">&#10005;</button>
     <div class="line"><span class="ts">—</span><span class="tag system">SYSTEM</span><span class="msg">Pipeline ready. Select a ticket or click Run All.</span></div>
     <div class="scroll-badge" id="scrollBadge"></div>
   </div>
@@ -996,17 +1029,20 @@ function setRunning(v) {
 
 // ─── Render ───
 function renderTicketItem(t, actionIds) {
-  const isBug = t.id?.startsWith('BUG') || t.id?.startsWith('DEF') || (t.type||'').includes('bug');
-  const idCls = isBug ? 'bug' : 'feature';
+  const isTest = t.type === 'test-debt' || /testing|maestro/i.test(t.area||'');
+  const isBug = !isTest && (t.id?.startsWith('BUG') || t.id?.startsWith('DEF') || (t.type||'').includes('bug'));
+  const idCls = isTest ? 'test' : (isBug ? 'bug' : 'feature');
   const pCls = (t.priority||'P3').toLowerCase();
   const isActionable = actionIds.has(t.id);
   const dots = STEPS.map(() => '<div class="step-dot"></div>').join('');
   const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
   const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
+  const testTag = isTest ? '<span class="ticket-tag test">test</span>' : '';
   return `<div class="ticket-item" data-id="${t.id}">
     <div class="ticket-top">
       <span class="ticket-id ${idCls}">${t.id}</span>
       <span class="ticket-priority ${pCls}">${t.priority||''}</span>
+      ${testTag}
       ${runBtn}
       ${reorderBtns}
     </div>
@@ -1127,6 +1163,16 @@ let scrollPauseCount = 0;
     }
   });
 })();
+
+function clearTerminal() {
+  const terminal = document.getElementById('terminal');
+  if (!terminal) return;
+  // Keep the floating Clear button + scroll badge; drop everything else.
+  const keep = terminal.querySelectorAll('.terminal-clear, .scroll-badge');
+  terminal.innerHTML = '';
+  keep.forEach((el) => terminal.appendChild(el));
+  appendTerminal('Console cleared', 'system');
+}
 
 function appendTerminal(html, tag = 'system', opts = {}) {
   const terminal = document.getElementById('terminal');
@@ -1424,6 +1470,21 @@ function handleEvent(ev, d, serverTs) {
       setRunning(false);
       document.getElementById('statusPill').className = 'status-pill error';
       document.getElementById('statusPill').textContent = 'Error';
+      break;
+    case 'checkpoint_refused':
+      appendTerminal(`REFUSED: ${d.ticket} — ${d.reason}`, 'system');
+      setRunning(false);
+      document.getElementById('statusPill').className = 'status-pill error';
+      document.getElementById('statusPill').textContent = 'Refused';
+      document.getElementById('statStatus').textContent = 'Refused';
+      document.getElementById('statStatus').style.color = 'var(--red)';
+      break;
+    case 'ticket_failed':
+      appendTerminal(`FAILED: ${d.ticket} — ${d.error}`, 'system');
+      document.getElementById('statusPill').className = 'status-pill error';
+      document.getElementById('statusPill').textContent = 'Failed';
+      document.getElementById('statStatus').textContent = 'Failed';
+      document.getElementById('statStatus').style.color = 'var(--red)';
       break;
     case 'pipeline_blocked': appendTerminal(`BLOCKED: code lock held by ${d.holder}`, 'system'); setRunning(false); break;
     case 'pipeline_empty': appendTerminal('No actionable tickets', 'system'); setRunning(false); break;
