@@ -204,6 +204,21 @@ export class Pipeline {
           continue;
         }
 
+        // Defensive: ensure we're on master before archive runs. archiveTicket
+        // commits to whatever branch is checked out — and a prior step's
+        // bookkeeping may have left us on `pipeline/{id}` (mergeToMaster did
+        // checkout master, but a crash in the merge path can skip it).
+        // Committing the archive to a pipeline branch pollutes it with
+        // non-step commits and trips the next run's branch-reset safety
+        // (2026-04-26 incident, T-359).
+        if (this.config.checkpoints?.enabled) {
+          try {
+            execSync('git checkout master', { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
+          } catch (coErr) {
+            console.error(`[pre-archive-checkout] ${ticket.id}: ${coErr.message?.slice(0, 200)}`);
+          }
+        }
+
         // Archive the ticket first so its backlog.json/backlog-archive.json
         // mutations are dirty in the tree when commitTicketFiles runs and get
         // folded into the same ticket-tagged commit. Reversing this order
