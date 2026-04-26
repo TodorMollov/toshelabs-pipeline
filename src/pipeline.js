@@ -160,6 +160,17 @@ export class Pipeline {
             try { await this.rollbackTicketFiles(ticket, failedState); }
             catch (rbErr) { console.error(`[rollback] ${ticket.id}: ${rbErr.message}`); }
           }
+          // Return the working tree to master so the operator isn't left on
+          // a dead pipeline/{id} branch after a failure. Best-effort: a
+          // dirty tree or detached HEAD here is better than crashing the
+          // whole run loop on cleanup.
+          if (!this.dryRun && this.config.checkpoints?.enabled) {
+            try {
+              execSync('git checkout master', { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
+            } catch (coErr) {
+              console.error(`[checkout-master] ${ticket.id}: ${coErr.message?.slice(0, 200)}`);
+            }
+          }
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
           continue;
         }
