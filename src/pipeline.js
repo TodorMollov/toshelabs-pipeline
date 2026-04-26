@@ -525,6 +525,12 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* non-fatal */ }
         }
         this.emit('step_done', { ticket: ticket.id, step: 'tests_green', artifacts: finalArtifacts, metrics: metric });
+        // tests_green has its own native path that bypasses runStepWithHealing,
+        // so add to executedThisRun explicitly here. Otherwise the F2 guard
+        // sees tests_green's status:done with no execution proof and blocks
+        // the merge — which is exactly what crashed on T-359's first canary
+        // run after F1+F2+F3 landed (16:34 today).
+        executedThisRun.add('tests_green');
         continue;
       }
 
@@ -916,7 +922,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         `Pipeline loop ended without failure, but: ${reasons.join('; ')}`;
       this.emit('ticket_blocked', {
         ticket: ticket.id,
-        step: incompleteSteps[0][0],
+        step: incompleteSteps[0]?.[0] || unverifiedSteps[0] || 'unknown',
         stepStatus: 'post_loop_incomplete',
         reason: pipelineState.blocked_reason,
       });
