@@ -131,14 +131,64 @@ describe('plan prompt — referenced file pre-loader', () => {
     }
   });
 
-  test('plan prompt mentions PARALLELISE TOOL CALLS rule', async () => {
+  test('plan prompt mentions PARALLEL TOOL CALLS rule prominently', async () => {
     const dir = makeProject();
     try {
       const ticket = { id: 'T-P', title: 't', type: 'feature', description: 'd' };
       const prompt = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
-      assert.match(prompt, /PARALLELISE TOOL CALLS/);
+      assert.match(prompt, /CRITICAL RULE — PARALLEL TOOL CALLS/);
+      // The rule must be ahead of the OUTPUT RULES block to be the first
+      // efficiency directive the worker sees.
+      assert.ok(
+        prompt.indexOf('CRITICAL RULE — PARALLEL TOOL CALLS') < prompt.indexOf('OUTPUT RULES'),
+        'parallel rule should come before OUTPUT RULES',
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('multi-range syntax injects every range, not just the first', async () => {
+    const dir = makeProject();
+    try {
+      const ticket = {
+        id: 'T-MR', title: 't', type: 'feature',
+        description: 'See app/lib/features/foo/widget.dart:5-7, 20-22 for both spots.',
+      };
+      const prompt = await buildPrompt(
+        { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
+      );
+      // First range present.
+      assert.match(prompt, /lines="5-7"/);
+      assert.match(prompt, /line 5: code/);
+      // Second range AFTER the comma also present.
+      assert.match(prompt, /lines="20-22"/);
+      assert.match(prompt, /line 20: code/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('bare filename references backfill ranges onto full-path entries', async () => {
+    const dir = makeProject();
+    try {
+      const ticket = {
+        id: 'T-BF', title: 't', type: 'feature',
+        description: 'Modify app/lib/features/foo/widget.dart:5-7.',
+        fix_plan: [
+          'Look at widget.dart:30-32 too — same file, different section.',
+        ],
+      };
+      const prompt = await buildPrompt(
+        { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
+      );
+      // The bare "widget.dart:30-32" mention should backfill onto the same
+      // full-path entry, producing a second <file> block for those lines.
+      assert.match(prompt, /lines="5-7"/);
+      assert.match(prompt, /lines="30-32"/);
+      assert.match(prompt, /line 30: code/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

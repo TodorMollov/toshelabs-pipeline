@@ -34,23 +34,61 @@ function trimPipelineState(pipelineState, stepName) {
 
 // Extract project-relative file paths from prose (description + fix_plan).
 // Tickets reference paths like `app/lib/foo.dart`, `backend/.../bar.ts`, or
-// `memory/SPEC.md`, sometimes with a line range suffix `:412-491`. We pre-load
-// these into the plan prompt so the worker never has to spend a Read turn
-// (or three) on files it could have started with already in context.
+// `memory/SPEC.md`, sometimes with a line range suffix `:412-491` and sometimes
+// with multi-range syntax `:87-160, 870-883`. We pre-load these into the plan
+// prompt so the worker never has to spend a Read turn (or three) on files it
+// could have started with already in context.
 //
-// Returns Map<path, [{start,end},...]> — empty array of ranges means "whole file".
-const PATH_REGEX = /\b((?:[\w@-]+\/)+[\w@.-]+\.(?:dart|ts|tsx|js|jsx|md|yaml|yml|json|py|html|css|sh))(?::(\d+)(?:-(\d+))?)?/g;
+// Two passes:
+//   1) Match paths with at least one slash + range/multi-range suffix.
+//   2) For paths recorded in pass 1, also match bare-filename references
+//      (e.g. fix_plan says "_VehicleInput class (onboarding_screen.dart:755)")
+//      and add their line ranges to the same path entry.
+//
+// Returns Map<fullPath, [{start,end},...]> — empty array means "whole file".
+const FULL_PATH_REGEX = /\b((?:[\w@-]+\/)+[\w@.-]+\.(?:dart|ts|tsx|js|jsx|md|yaml|yml|json|py|html|css|sh))((?::\d+(?:-\d+)?(?:\s*,\s*\d+(?:-\d+)?)*)?)/g;
+function parseRangeList(suffix) {
+  // suffix is e.g. ":87-160, 870-883" or ":471" or ""
+  if (!suffix) return [];
+  const out = [];
+  for (const part of suffix.replace(/^:/, '').split(',')) {
+    const m = part.trim().match(/^(\d+)(?:-(\d+))?$/);
+    if (!m) continue;
+    const start = parseInt(m[1], 10);
+    const end = m[2] ? parseInt(m[2], 10) : start;
+    out.push({ start, end });
+  }
+  return out;
+}
 function extractFilePaths(text) {
   const found = new Map();
   if (!text) return found;
+
+  // Pass 1: full paths with optional multi-range suffix.
   let m;
-  while ((m = PATH_REGEX.exec(text)) !== null) {
+  while ((m = FULL_PATH_REGEX.exec(text)) !== null) {
     const path = m[1];
-    const start = m[2] ? parseInt(m[2], 10) : null;
-    const end = m[3] ? parseInt(m[3], 10) : (start || null);
     if (!found.has(path)) found.set(path, []);
-    if (start) found.get(path).push({ start, end });
+    for (const r of parseRangeList(m[2])) found.get(path).push(r);
   }
+
+  // Pass 2: bare-filename references that match a path already seen — let
+  // fix_plan items like "(onboarding_screen.dart:755)" backfill ranges onto
+  // the full app/lib/.../onboarding_screen.dart entry from pass 1.
+  for (const fullPath of [...found.keys()]) {
+    const basename = fullPath.split('/').pop();
+    const escaped = basename.replace(/[.+]/g, '\\$&');
+    const bareRegex = new RegExp(`(?<![\\w/-])${escaped}((?::\\d+(?:-\\d+)?(?:\\s*,\\s*\\d+(?:-\\d+)?)*)?)`, 'g');
+    let bm;
+    while ((bm = bareRegex.exec(text)) !== null) {
+      // Skip the match that's part of the full path itself.
+      const startIdx = bm.index;
+      const before = text.slice(Math.max(0, startIdx - fullPath.length), startIdx);
+      if (before.endsWith(fullPath.slice(0, -basename.length))) continue;
+      for (const r of parseRangeList(bm[1])) found.get(fullPath).push(r);
+    }
+  }
+
   return found;
 }
 
@@ -176,7 +214,32 @@ function renderTestCommands(config) {
 
 function getDefaultTemplate(stepName) {
   const EFFICIENCY_RULE = `
+========================================================
+CRITICAL RULE — PARALLEL TOOL CALLS (read this first):
+========================================================
+Each LLM round-trip costs ~$0.30-0.50. To minimise cost, EVERY response that needs more than one independent tool call MUST emit them as parallel tool_use blocks in a SINGLE response.
+
+CORRECT (one round-trip, three reads):
+  <response>
+    <tool_use name="Read" input='{"file_path":"a.dart"}'/>
+    <tool_use name="Read" input='{"file_path":"b.dart"}'/>
+    <tool_use name="Grep" input='{"pattern":"foo"}'/>
+  </response>
+
+WRONG (three round-trips, three reads):
+  <response><tool_use name="Read" input='{"file_path":"a.dart"}'/></response>
+  ... wait for result ...
+  <response><tool_use name="Read" input='{"file_path":"b.dart"}'/></response>
+  ... wait for result ...
+  <response><tool_use name="Grep" input='{"pattern":"foo"}'/></response>
+
+The ONLY exception is sequentially-dependent calls (e.g. Read X to find a path mentioned inside, then Read that path). If you can think of the calls as independent — fire them in parallel.
+
+A single 8-tool-call investigation should fit in 2-3 round-trips, not 8.
+
+========================================================
 OUTPUT RULES — THIS IS A PIPELINE, NOT A CONVERSATION:
+========================================================
 - Do the full investigation (read files, grep, trace callers) but do NOT narrate it.
 - Your ONLY text output is code changes and the pipeline JSON update.
 - No explanations, no commentary, no "Let me check...", no "I found that...".
@@ -186,10 +249,6 @@ TOKEN DISCIPLINE — DO NOT RE-READ:
 - Once you Read a file in this session, the content stays in your context. Refer back to it; do NOT Read it again. If you need a specific section, quote the line range from your earlier read instead of re-reading.
 - The same applies to test output files (/tmp/test-results.txt, etc.) and Grep results.
 - Re-reading the same file twice in one step is the #1 cause of max_turns exhaustion (T-359 plan re-read parse-input.test.ts 3× → step thrashed and rolled back).
-
-PARALLELISE TOOL CALLS:
-- When you need to gather information from multiple files or run multiple greps, fire them in ONE turn as parallel tool_use blocks (Read A + Read B + Grep C in a single response). One LLM round-trip instead of three.
-- Sequentially dependent calls (Read X to find a path, then Read that path) must stay sequential. But independent investigation should be parallel.
 
 TOOL USE — GIT:
 - The pipeline owns commit and rollback. Edit files; do not touch git state — git mutations from inside a step corrupt the pipeline's commit/rollback boundary.
