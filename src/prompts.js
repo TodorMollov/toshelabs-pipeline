@@ -99,11 +99,15 @@ function extractFilePaths(text) {
 // description with 30 path mentions doesn't blow the prompt budget. Larger
 // files get truncated with an explicit marker, so the worker knows to Read
 // the rest if needed (the common case is `:start-end` ranges, which fit).
+//
+// Returns { rendered, paths } so callers can both inject the prompt blocks
+// and tell a PreToolUse hook which paths to soft-block from re-Reading.
 async function loadReferencedFiles(text, projectDir) {
   const MAX_FILES = 8;
   const MAX_BYTES_PER_FILE = 20_000;
   const refs = extractFilePaths(text);
   const blocks = [];
+  const paths = [];
   let count = 0;
   for (const [relPath, ranges] of refs) {
     if (count >= MAX_FILES) break;
@@ -130,10 +134,12 @@ async function loadReferencedFiles(text, projectDir) {
         : content;
       blocks.push(`<file path="${relPath}">\n${truncated}\n</file>`);
     }
+    paths.push(relPath);
     count++;
   }
-  if (blocks.length === 0) return '';
-  return `\nFILES REFERENCED IN THIS TICKET (pre-loaded — do NOT Read these again unless you need a different section):\n\n${blocks.join('\n\n')}\n`;
+  const rendered = blocks.length === 0 ? '' :
+    `\nFILES REFERENCED IN THIS TICKET (pre-loaded — do NOT Read these again unless you need a different section):\n\n${blocks.join('\n\n')}\n`;
+  return { rendered, paths };
 }
 
 /**
@@ -171,12 +177,15 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
   //                tests_red (so the worker has both "what to change" and
   //                "what tests must pass" already in context)
   let referencedFiles = '';
+  let preloadedPaths = [];
   if (stepConfig.name === 'plan') {
     const fixPlanText = Array.isArray(ticket.fix_plan) ? ticket.fix_plan.join('\n') : '';
-    referencedFiles = await loadReferencedFiles(
+    const r = await loadReferencedFiles(
       `${ticket.description || ''}\n${fixPlanText}`,
       config.project_dir,
     );
+    referencedFiles = r.rendered;
+    preloadedPaths = r.paths;
   } else if (stepConfig.name === 'tests_red' || stepConfig.name === 'implement') {
     const planFiles = (relevantState.steps?.plan?.files_to_change || [])
       .map((f) => (typeof f === 'string' ? f : f.path))
@@ -187,7 +196,9 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     const paths = [...new Set([...planFiles, ...testFiles])];
     if (paths.length > 0) {
       // Synthetic text so loadReferencedFiles' regex picks them up.
-      referencedFiles = await loadReferencedFiles(paths.join(' '), config.project_dir);
+      const r = await loadReferencedFiles(paths.join(' '), config.project_dir);
+      referencedFiles = r.rendered;
+      preloadedPaths = r.paths;
     }
   }
 
@@ -208,7 +219,7 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     .replace(/\{\{test_commands\}\}/g, renderTestCommands(config))
     .replace(/\{\{docs_check_files\}\}/g, (config.project_profile?.docs_check_files || []).map((f, i) => `${i+1}. ${f}`).join('\n') || '(none configured)');
 
-  return template;
+  return { prompt: template, preloadedPaths };
 }
 
 function renderTestCommands(config) {

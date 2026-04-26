@@ -109,14 +109,14 @@ describe('Fix 2 — docs_update prompt does not tell worker to touch backlog', (
   const ticket = { id: 'T-X', title: 'sample', type: 'feature', description: 'd' };
 
   test('docs_update prompt does not instruct worker to update backlog status', async () => {
-    const prompt = await buildPrompt({ name: 'docs_update' }, ticket, { steps: {} }, config);
+    const { prompt } = await buildPrompt({ name: 'docs_update' }, ticket, { steps: {} }, config);
     assert.doesNotMatch(prompt, /Update ticket status in/, 'prompt still tells worker to update backlog status');
     assert.doesNotMatch(prompt, /backlog_updated/, 'prompt still references backlog_updated field');
     assert.doesNotMatch(prompt, /\{\{backlog_path\}\}/, 'unrendered placeholder leaked into prompt');
   });
 
   test('docs_update prompt lists backlog files under ALREADY DONE', async () => {
-    const prompt = await buildPrompt({ name: 'docs_update' }, ticket, { steps: {} }, config);
+    const { prompt } = await buildPrompt({ name: 'docs_update' }, ticket, { steps: {} }, config);
     assert.match(prompt, /ALREADY DONE/);
     assert.match(prompt, /memory\/backlog\.json/);
     assert.match(prompt, /memory\/backlog-archive\.json/);

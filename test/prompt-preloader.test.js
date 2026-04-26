@@ -43,7 +43,7 @@ describe('plan prompt — referenced file pre-loader', () => {
         id: 'T-X', title: 't', type: 'feature',
         description: 'Modify backend/src/api.ts to return 43.',
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       assert.match(prompt, /FILES REFERENCED IN THIS TICKET/);
@@ -61,7 +61,7 @@ describe('plan prompt — referenced file pre-loader', () => {
         id: 'T-Y', title: 't', type: 'feature',
         description: 'See app/lib/features/foo/widget.dart:10-12 for the bug location.',
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       assert.match(prompt, /<file path="app\/lib\/features\/foo\/widget\.dart" lines="10-12">/);
@@ -85,11 +85,43 @@ describe('plan prompt — referenced file pre-loader', () => {
           'Test app/lib/features/foo/widget.dart for regression.',
         ],
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       assert.match(prompt, /<file path="backend\/src\/api\.ts">/);
       assert.match(prompt, /<file path="app\/lib\/features\/foo\/widget\.dart">/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('preloadedPaths includes every path that was injected', async () => {
+    const dir = makeProject();
+    try {
+      const ticket = {
+        id: 'T-PP', title: 't', type: 'feature',
+        description: 'Change backend/src/api.ts and app/lib/features/foo/widget.dart:5-7.',
+      };
+      const { preloadedPaths } = await buildPrompt(
+        { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
+      );
+      assert.deepEqual(
+        new Set(preloadedPaths),
+        new Set(['backend/src/api.ts', 'app/lib/features/foo/widget.dart']),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('preloadedPaths empty when no files referenced', async () => {
+    const dir = makeProject();
+    try {
+      const ticket = { id: 'T-NONE', title: 't', type: 'feature', description: 'no paths here' };
+      const { preloadedPaths } = await buildPrompt(
+        { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
+      );
+      assert.deepEqual(preloadedPaths, []);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -102,11 +134,14 @@ describe('plan prompt — referenced file pre-loader', () => {
         id: 'T-A', title: 't', type: 'feature',
         description: 'Change backend/src/api.ts.',
       };
-      const prompt = await buildPrompt(
+      const { prompt, preloadedPaths } = await buildPrompt(
         { name: 'tests_red' }, ticket, { steps: {} }, baseConfig(dir),
       );
+      // tests_red gets pre-loading from plan output's files_to_change.
+      // pipelineState here has no plan output → no preload, no <file> blocks.
       assert.doesNotMatch(prompt, /FILES REFERENCED IN THIS TICKET/);
       assert.doesNotMatch(prompt, /<file path=/);
+      assert.deepEqual(preloadedPaths, []);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -119,7 +154,7 @@ describe('plan prompt — referenced file pre-loader', () => {
         id: 'T-B', title: 't', type: 'feature',
         description: 'Modify nonexistent/path.dart and backend/src/api.ts.',
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       // Existing file shows up; missing file is silently dropped from the
@@ -135,7 +170,7 @@ describe('plan prompt — referenced file pre-loader', () => {
     const dir = makeProject();
     try {
       const ticket = { id: 'T-P', title: 't', type: 'feature', description: 'd' };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       assert.match(prompt, /CRITICAL RULE — PARALLEL TOOL CALLS/);
@@ -157,7 +192,7 @@ describe('plan prompt — referenced file pre-loader', () => {
         id: 'T-MR', title: 't', type: 'feature',
         description: 'See app/lib/features/foo/widget.dart:5-7, 20-22 for both spots.',
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       // First range present.
@@ -181,7 +216,7 @@ describe('plan prompt — referenced file pre-loader', () => {
           'Look at widget.dart:30-32 too — same file, different section.',
         ],
       };
-      const prompt = await buildPrompt(
+      const { prompt } = await buildPrompt(
         { name: 'plan' }, ticket, { steps: {} }, baseConfig(dir),
       );
       // The bare "widget.dart:30-32" mention should backfill onto the same

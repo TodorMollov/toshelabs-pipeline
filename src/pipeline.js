@@ -1500,9 +1500,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       const attemptModel = pickAttemptModel(stepConfig, attempt, ladder);
 
       // Build and execute
-      const prompt = isRetry
-        ? await this.buildHealPrompt(stepConfig, ticket, pipelineState, attempt)
+      const built = isRetry
+        ? { prompt: await this.buildHealPrompt(stepConfig, ticket, pipelineState, attempt), preloadedPaths: [] }
         : await buildPrompt(stepConfig, ticket, pipelineState, this.config);
+      const prompt = built.prompt;
+      const preloadedPaths = built.preloadedPaths;
 
       // Session-preservation escape hatch. Resuming the prior session helps
       // when the last attempt produced PARTIAL output that just needs
@@ -1550,7 +1552,15 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           // fields) — in that case a cold start beats a warm "I already
           // finished" session context.
           sessionId: this.sessionId,
-          env: this.config.environment || {},
+          env: {
+            ...(this.config.environment || {}),
+            // Soft hook reads this to know which paths it should
+            // discourage Re-Reads on. Empty string when nothing pre-loaded
+            // so the hook becomes a no-op (also no-op for any other Claude
+            // session running in this project, since they'd never see this
+            // env var).
+            PIPELINE_PRELOADED_FILES: preloadedPaths.join(','),
+          },
           onData: (event) => {
             const usage = event.message?.usage || event.usage;
             if (usage) {
@@ -1800,7 +1810,7 @@ RULES:
     }
 
     // Standard heal: gate validation failed (wrong values, not missing values)
-    const originalPrompt = await buildPrompt(stepConfig, ticket, pipelineState, this.config);
+    const originalPrompt = (await buildPrompt(stepConfig, ticket, pipelineState, this.config)).prompt;
 
     return `You are RETRYING the "${stepConfig.name}" step for ticket ${ticket.id}: "${ticket.title}".
 
