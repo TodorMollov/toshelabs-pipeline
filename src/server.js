@@ -222,34 +222,29 @@ export async function startServer(config) {
     });
   });
 
+  // Load primary + v2 backlogs and tag each ticket with `backlog:'primary'|'v2'`
+  // so the UI can distinguish them. Without the marker, v2 items leak into the
+  // runnable list (UI filters via `t.backlog !== 'v2'`). Both /api/backlog and
+  // /api/backlog/refresh return the same shape — when one drifts from the
+  // other, the page-refresh and refresh-button views disagree (2026-04-25).
+  async function loadFullBacklog() {
+    const tickets = await loadBacklog(config);
+    const actionable = filterAndSort(tickets, config);
+    let v2Tickets = [];
+    try {
+      const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
+      const parsed = JSON.parse(v2Raw).tickets || [];
+      v2Tickets = parsed.map((t) => ({ ...t, backlog: 'v2' }));
+    } catch {}
+    const taggedPrimary = tickets.map((t) => ({ ...t, backlog: 'primary' }));
+    const all = [...taggedPrimary, ...v2Tickets];
+    return { all, actionable, v2: v2Tickets, total: all.length, actionableCount: actionable.length };
+  }
+
   // API: get full backlog (all tickets from all sources)
   app.get('/api/backlog', async (req, res) => {
     try {
-      const tickets = await loadBacklog(config);
-      const actionable = filterAndSort(tickets, config);
-
-      // Also load v2 backlog if it exists. Tag each v2 ticket with
-      // backlog:'v2' so the UI can distinguish them — without the marker
-      // they merge into the same list as runnable tickets and the UI
-      // shows a "Run" button on v2 items whose status isn't in its own
-      // exclude list (e.g. T-250 status:'open' is not actionable here
-      // but looks actionable to the UI).
-      let v2Tickets = [];
-      try {
-        const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
-        const parsed = JSON.parse(v2Raw).tickets || [];
-        v2Tickets = parsed.map((t) => ({ ...t, backlog: 'v2' }));
-      } catch {}
-
-      const taggedPrimary = tickets.map((t) => ({ ...t, backlog: 'primary' }));
-      const all = [...taggedPrimary, ...v2Tickets];
-      res.json({
-        all,
-        actionable,
-        v2: v2Tickets,
-        total: all.length,
-        actionableCount: actionable.length,
-      });
+      res.json(await loadFullBacklog());
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
@@ -282,18 +277,9 @@ export async function startServer(config) {
   // API: refresh backlog
   app.post('/api/backlog/refresh', async (req, res) => {
     try {
-      const tickets = await loadBacklog(config);
-      const actionable = filterAndSort(tickets, config);
-
-      let v2Tickets = [];
-      try {
-        const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
-        v2Tickets = JSON.parse(v2Raw).tickets || [];
-      } catch {}
-
-      const all = [...tickets, ...v2Tickets];
-      emitter.emit('backlog_refreshed', { total: all.length, actionable: actionable.length });
-      res.json({ all, actionable, total: all.length, actionableCount: actionable.length });
+      const payload = await loadFullBacklog();
+      emitter.emit('backlog_refreshed', { total: payload.total, actionable: payload.actionableCount });
+      res.json(payload);
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
