@@ -26,6 +26,52 @@ import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
 // duplicates in a single day's ops log. Cleared on server restart.
 const _crashedDetectedThisBoot = new Set();
 
+// Per-step worker-output schema (2026-04-27 architectural fix).
+// Workers write a flat JSON object to {worker_output_dir}/{ticket}/{step}.json.
+// The orchestrator's ingestWorkerOutput accepts ONLY the fields listed here for
+// each step. Everything else the worker writes is dropped, including any
+// attempt to set state for other pipeline steps. Schema is intentionally
+// generous within a step to accommodate prompt evolution; new fields require
+// adding here, not silently land.
+const STEP_OUTPUT_SCHEMA = {
+  plan: [
+    'status', 'reason',
+    'files_to_change', 'callers_traced', 'edge_cases', 'test_strategy', 'risk',
+    'suggested_sub_tickets',
+  ],
+  tests_red: [
+    'status', 'reason',
+    'outcome', 'test_files', 'test_names', 'tests_before', 'tests_after',
+    'failure_output', 'baseline_failures', 'criteria_to_test_map',
+  ],
+  implement: [
+    'status', 'reason',
+    'files_changed', 'files_skipped',
+    'review_feedback', 'explicit_fixes', // populated by review→implement loop
+  ],
+  tests_green: [
+    'status', 'reason',
+    'unit_tests', 'analyzer_errors', 'failed_tests', 'baseline_failures',
+    'new_failures', 'all_pass', 'unit_crashed', 'unit_exit_code',
+    'unit_ran_nothing', 'unit_skipped_compile_errors', 'new_failed_tests',
+    'extra_failures', 'new_extra_failures', 'new_analyzer_errors',
+    'test_output_summary', 'analyze_output_summary', 'extra_output_summary',
+    'native_step', 'completed_at',
+  ],
+  review: [
+    'status', 'reason',
+    'checklist_items_checked', 'findings', 'findings_fixed', 'findings_considered',
+  ],
+  root_cause: [
+    'status', 'reason',
+    'why_happened', 'why_not_caught', 'proposed_rule',
+  ],
+  docs_update: [
+    'status', 'reason',
+    'files_updated',
+  ],
+};
+
 export class Pipeline {
   constructor(config, opts = {}) {
     this.config = config;
@@ -257,6 +303,15 @@ export class Pipeline {
     const steps = this.config.steps;
     let pipelineState = await this.loadOrCreatePipelineJson(ticket);
     const ticketStartTime = Date.now();
+
+    // Architectural fix 2026-04-27: ensure the per-ticket worker output
+    // directory exists. Each step's worker writes a flat JSON object here
+    // ({worker_output_dir}/{ticket}/{step}.json) instead of the canonical
+    // pipeline state file. Orchestrator's ingestWorkerOutput validates
+    // and merges only schema-allowed fields.
+    try {
+      await mkdir(resolve(this.config._resolved.workerOutputDir, ticket.id), { recursive: true });
+    } catch { /* non-fatal — falls back to old behaviour where worker writes nothing */ }
     const stepMetrics = [];
     // Steps whose worker actually ran (or whose orchestrator-driven body
     // executed) in THIS run. Distinct from `pipelineState.steps[X].status`
@@ -756,10 +811,14 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       };
       stepMetrics.push(metric);
 
-      // Persist metrics onto the ticket's step record so they survive crashes
-      // and are readable from the reports API.
+      // Persist metrics + completed_at onto the ticket's step record so they
+      // survive crashes and are readable from the reports API. completed_at
+      // is orchestrator-stamped (not worker-written) per the architectural
+      // fix — workers can't be trusted with timestamps (we saw values minutes
+      // off wall-clock in the T-359 traces).
       if (pipelineState.steps[stepConfig.name] && typeof pipelineState.steps[stepConfig.name] === 'object') {
         pipelineState.steps[stepConfig.name].metrics = metric;
+        pipelineState.steps[stepConfig.name].completed_at = new Date().toISOString();
         try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* non-fatal */ }
       }
 
@@ -1150,6 +1209,59 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       merged.steps[stepName] = fresh.steps[stepName];
     }
     return merged;
+  }
+
+  // Architectural fix 2026-04-27: workers write a flat JSON object to a
+  // per-step output file ({worker_output_dir}/{ticket}/{step}.json) instead
+  // of the canonical pipeline state. Orchestrator validates the worker's
+  // payload against a per-step field whitelist and merges only those fields
+  // into pipelineState.steps[stepName]. Anything else the worker wrote is
+  // dropped silently — even if a worker tries to set steps for OTHER pipeline
+  // stages, those writes never reach the canonical state.
+  //
+  // Returns true if a worker output was found and ingested, false otherwise.
+  async ingestWorkerOutput(ticketId, stepName, pipelineState) {
+    const path = resolve(this.config._resolved.workerOutputDir, ticketId, `${stepName}.json`);
+    if (!existsSync(path)) return false;
+    let raw;
+    try { raw = await readFile(path, 'utf-8'); }
+    catch (err) {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: read failed — ${err.message}`);
+      return false;
+    }
+    raw = raw.replace(/:\s*(\d+)\s*\+\s*(\d+)/g, (_, a, b) => ': ' + (parseInt(a) + parseInt(b)));
+    let payload;
+    try { payload = JSON.parse(raw); }
+    catch (err) {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: JSON parse failed — ${err.message}`);
+      return false;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: payload is not an object`);
+      return false;
+    }
+    const allowed = STEP_OUTPUT_SCHEMA[stepName];
+    if (!allowed) {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: no schema declared, dropping output`);
+      return false;
+    }
+    const existing = pipelineState.steps?.[stepName] || {};
+    const merged = { ...existing };
+    const accepted = [];
+    const rejected = [];
+    for (const [k, v] of Object.entries(payload)) {
+      if (allowed.includes(k)) { merged[k] = v; accepted.push(k); }
+      else { rejected.push(k); }
+    }
+    if (rejected.length > 0) {
+      this.emit('worker_output_fields_dropped', { ticket: ticketId, step: stepName, dropped: rejected });
+      console.log(`[ingest-worker] ${ticketId}/${stepName}: dropped ${rejected.length} non-whitelisted field(s): ${rejected.join(', ')}`);
+    }
+    pipelineState.steps = pipelineState.steps || {};
+    pipelineState.steps[stepName] = merged;
+    await this.savePipelineJson(ticketId, pipelineState);
+    this.emit('worker_output_ingested', { ticket: ticketId, step: stepName, fields: accepted });
+    return true;
   }
 
   async savePipelineJson(ticketId, state) {
@@ -1714,6 +1826,14 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             // session running in this project, since they'd never see this
             // env var).
             PIPELINE_PRELOADED_FILES: preloadedPaths.join(','),
+            // PreToolUse hook (state-write-protect.sh) reads this to deny
+            // Write/Edit on the canonical state file path. Workers must
+            // write their per-step output to PIPELINE_WORKER_OUT instead.
+            // Both env vars empty/missing = no enforcement (hook no-ops),
+            // so the user's other Claude sessions in the same project
+            // are unaffected.
+            PIPELINE_STATE_PROTECTED: this.config._resolved.pipelineDir,
+            PIPELINE_WORKER_OUT: resolve(this.config._resolved.workerOutputDir, ticket.id),
           },
           onData: (event) => {
             const usage = event.message?.usage || event.usage;
@@ -1754,6 +1874,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       this.emit('step_attempt_done', { ticket: ticket.id, step: stepConfig.name, attempt, model: attemptModel, inputTokens: attemptInputTokens, outputTokens: attemptOutputTokens, toolCalls: attemptToolCalls, maxTurnsHit, timedOut });
 
       if (result.sessionId) this.sessionId = result.sessionId;
+      // Orchestrator-only state writes (2026-04-27): ingest worker's per-step
+      // output file, validate against schema, merge into canonical state.
+      // Worker writes outside the schema (or to other steps' slots) are
+      // silently dropped here — they never reach pipelineState.
+      await this.ingestWorkerOutput(ticket.id, stepConfig.name, pipelineState);
       pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
 
       // Auto-populate files from git
@@ -2042,22 +2167,24 @@ PRIORITY: Write the pipeline JSON FIRST, then investigate. Do not spend turns re
     this.emit('self_heal_start', { ticket: ticket.id, step: stepConfig.name, failures });
     console.log(`[self-heal] ${ticket.id}/${stepConfig.name}: attempting fix for ${failures.length} gate failures`);
 
+    const workerOut = resolve(this.config._resolved.workerOutputDir, ticket.id, `${stepConfig.name}.json`);
     const healPrompt = `The pipeline step "${stepConfig.name}" for ticket ${ticket.id} ("${ticket.title}") completed but FAILED its gate validation.
 
 GATE FAILURES:
 ${failures.map((f, i) => `${i + 1}. ${f}`).join('\n')}
 
-CURRENT PIPELINE JSON:
-${JSON.stringify(pipelineState, null, 2)}
+CURRENT STEP STATE (this step's slot only — do NOT speculate about other steps):
+${JSON.stringify(pipelineState.steps?.[stepConfig.name] || {}, null, 2)}
 
-PIPELINE JSON PATH: ${resolve(this.config._resolved.pipelineDir, `${ticket.id}.json`)}
+YOUR OUTPUT FILE: ${workerOut}
 
 YOUR TASK:
-1. Read the pipeline JSON file
-2. Understand what fields are missing or wrong
-3. If the step actually did work (check git diff, read modified files) but just forgot to update the JSON — fill in the missing fields from what you can observe
-4. If the step didn't complete its work — do the work (read files, check state) and update the JSON
-5. Write the corrected pipeline JSON back
+1. Understand what fields are missing or wrong from the gate failures.
+2. If the step actually did work (check git diff, read modified files) but just forgot to populate fields — fill them in from what you can observe.
+3. If the step didn't complete its work — do the work (read files, check state) and update.
+4. Write the corrected step output as a flat JSON object (this step's fields only) to YOUR OUTPUT FILE.
+
+The orchestrator validates your output against a per-step schema. Fields outside the schema are dropped silently. DO NOT attempt to set state for other steps — only this step's slot.
 
 IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus on the specific failures listed above.`;
 
@@ -2079,11 +2206,17 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
         `${stepConfig.name}_heal`,
       );
 
-      // Mark that we've attempted self-heal for this step
+      // Ingest the heal worker's output into canonical state through the
+      // schema gate (same as a normal step run). Then stamp _selfHealed on
+      // the step so the gate doesn't loop forever.
       const updated = await this.loadPipelineJson(ticket.id);
-      if (updated?.steps[stepConfig.name]) {
-        updated.steps[stepConfig.name]._selfHealed = true;
-        await this.savePipelineJson(ticket.id, updated);
+      if (updated) {
+        await this.ingestWorkerOutput(ticket.id, stepConfig.name, updated);
+        const refreshed = await this.loadPipelineJson(ticket.id);
+        if (refreshed?.steps?.[stepConfig.name]) {
+          refreshed.steps[stepConfig.name]._selfHealed = true;
+          await this.savePipelineJson(ticket.id, refreshed);
+        }
       }
 
       this.emit('self_heal_done', { ticket: ticket.id, step: stepConfig.name });

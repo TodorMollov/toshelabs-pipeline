@@ -215,6 +215,7 @@ export async function buildPrompt(stepConfig, ticket, pipelineState, config) {
     )
     .replace(/\{\{project_dir\}\}/g, config.project_dir)
     .replace(/\{\{pipeline_dir\}\}/g, config._resolved.pipelineDir)
+    .replace(/\{\{worker_output\}\}/g, `${config._resolved.workerOutputDir}/${ticket.id}/${stepConfig.name}.json`)
     .replace(/\{\{tech_stack_hints\}\}/g, config.project_profile?.tech_stack_hints || 'use the project conventions')
     .replace(/\{\{test_commands\}\}/g, renderTestCommands(config))
     .replace(/\{\{docs_check_files\}\}/g, (config.project_profile?.docs_check_files || []).map((f, i) => `${i+1}. ${f}`).join('\n') || '(none configured)');
@@ -301,8 +302,8 @@ For schema changes: flag if a numbered migration is needed.
 DEPENDENCY DISCIPLINE (critical — this has broken past tickets):
 If any file you plan to write will import a package (Dart: \`package:foo/…\`; TS/JS: \`import 'bar'\` or \`require('bar')\`; etc.) that is NOT already declared in the project's manifest (pubspec.yaml / package.json / etc.), you MUST add that manifest file to files_to_change with an explicit what_to_do describing the exact dep+version to add. A missing dep add will cause load-time compile failures that self-heal cannot fix. Check manifests before finalising the plan.
 
-IMPORTANT: You MUST write the pipeline JSON file before your session ends.
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.plan.status = "done" and ALL of these fields:
+IMPORTANT: You MUST write your output file before your session ends.
+Write {{worker_output}} as a flat JSON object (NOT the whole pipeline state) with status = "done" and ALL of these fields:
 - files_to_change: [{path, reason, what_to_do}] — ONLY files that MUST change for the ticket to work. If a caller might be affected but the change is backward-compatible, do NOT list it. Verify: "will this file fail to compile or behave incorrectly without a change?" If no, exclude it. reason: WHY. what_to_do: SPECIFIC action. If the action is pure plumbing (field passing, data addition, constructor shape, import reorg) — something that will be covered transitively by behavioural tests rather than a dedicated test case — prefix the what_to_do with "[no-test]". tests_red will skip those bullets from coverage checks. Use sparingly; behavioural additions always need dedicated tests.
 - SCOPE GATE: if files_to_change has more than 15 paths OR you find yourself writing more than 20 distinct what_to_do bullets, STOP. One implement step cannot reliably carry that much — it will hit max_turns and the ticket will be rolled back. Set status = "needs_split" with a suggested_sub_tickets: [{title, scope}] array of 2–4 sub-tickets covering the work, and STOP writing the plan.
 - callers_traced: [{function, callers: ["file:line"]}] — just file:line refs, not grep output
@@ -331,7 +332,7 @@ ITERATION LIMIT: if you have edited the same test file 3 times and tests still d
 
 Three outcomes: new_test_fails | existing_test_fails | existing_test_covers (→ STOP)
 
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.tests_red.status = "done":
+Write {{worker_output}} as a flat JSON object with status = "done" and:
 - outcome, test_files, test_names, tests_before, tests_after
 - failure_output: "one line per failing test — assertion message only, no stack traces"
 - baseline_failures: [test names already failing before changes]
@@ -359,7 +360,7 @@ IMPLEMENT STEP:
    - Never add dependencies without flagging
 4. Grep for SAME PATTERN across codebase — fix all matching locations
 
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.implement.status = "done":
+Write {{worker_output}} as a flat JSON object with status = "done" and:
 - files_changed: [{path}] — every file you modified
 - files_skipped: [{path, reason}] — for any file in plan.files_to_change that you did NOT modify, explain why (e.g. "backward-compatible, no change needed" or "deferred — not required for this ticket")
 If blocked: set status = "blocked" with reason.`,
@@ -372,9 +373,9 @@ TESTS GREEN — run tests and write JSON. Nothing else.
 Test commands (run in order):
 {{test_commands}}
 
-Then write {{pipeline_dir}}/{{ticket_id}}.json immediately:
+Then write {{worker_output}} as a flat JSON object:
 
-steps.tests_green = {
+{
   "status": "done",
   "unit_tests": {"passed": N, "failed": N},
   "analyzer_errors": 0,
@@ -405,7 +406,7 @@ WORK (do all of this, but don't narrate):
 5. Fix any findings you can fix directly (edit the file)
 
 OUTPUT — only this, nothing else:
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.review:
+Write {{worker_output}} as a flat JSON object with:
 - status: "done" (no findings, or you fixed all of them) | "blocked" (unfixable findings — name them)
 - checklist_items_checked: number — MUST always be >0 (how many checklist items you actually evaluated). If you checked anything at all, this is not 0.
 - findings: [{file, line, severity, issue, fix}] — issue is ONE sentence, fix is ONE sentence
@@ -423,7 +424,7 @@ ${EFFICIENCY_RULE}
 
 ROOT CAUSE — one sentence per field, no prose.
 
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.root_cause.status = "done":
+Write {{worker_output}} as a flat JSON object with status = "done" and:
 - why_happened: "one sentence"
 - why_not_caught: "one sentence"
 - proposed_rule: "one sentence — the pattern, how to detect it"`,
@@ -451,7 +452,7 @@ Check and update if applicable (skip silently if N/A):
 6. Grep for stale hints/tooltips referencing old behavior
 7. memory/code_validation.md — if new coding rule from root_cause
 
-Write {{pipeline_dir}}/{{ticket_id}}.json with steps.docs_update.status = "done":
+Write {{worker_output}} as a flat JSON object with status = "done" and:
 - files_updated: [{path}] — path only`,
   };
 
