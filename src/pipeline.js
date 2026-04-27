@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync, statSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import { loadBacklog, filterAndSort, archiveTicket } from './backlog.js';
 import { spawnClaude } from './runner.js';
 import { thinkLoop } from './think-loop.js';
@@ -303,6 +304,19 @@ export class Pipeline {
     const steps = this.config.steps;
     let pipelineState = await this.loadOrCreatePipelineJson(ticket);
     const ticketStartTime = Date.now();
+
+    // F5 (audit 2026-04-26): stamp a per-run UUID so we can tell crash-
+    // recovery (steps from a prior run, run_id different) from forgery
+    // (claims to be from this run but no orchestrator activity recorded).
+    // Saved under runs[].run_id; this run's id is exposed as `currentRunId`.
+    const currentRunId = randomUUID();
+    pipelineState.runs = pipelineState.runs || [];
+    pipelineState.runs.push({
+      run_id: currentRunId,
+      started_at: new Date().toISOString(),
+      ticket: ticket.id,
+    });
+    pipelineState.current_run_id = currentRunId;
 
     // Architectural fix 2026-04-27: ensure the per-ticket worker output
     // directory exists. Each step's worker writes a flat JSON object here
@@ -811,14 +825,16 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       };
       stepMetrics.push(metric);
 
-      // Persist metrics + completed_at onto the ticket's step record so they
-      // survive crashes and are readable from the reports API. completed_at
-      // is orchestrator-stamped (not worker-written) per the architectural
-      // fix — workers can't be trusted with timestamps (we saw values minutes
-      // off wall-clock in the T-359 traces).
+      // Persist metrics + completed_at + run_id onto the ticket's step record
+      // so they survive crashes and are readable from the reports API. All
+      // three are orchestrator-stamped (not worker-written) per the
+      // architectural fix — workers can't be trusted with timestamps (we saw
+      // values minutes off wall-clock in T-359 traces) and the per-run UUID
+      // is the F5 evidence channel for "this run actually executed this step."
       if (pipelineState.steps[stepConfig.name] && typeof pipelineState.steps[stepConfig.name] === 'object') {
         pipelineState.steps[stepConfig.name].metrics = metric;
         pipelineState.steps[stepConfig.name].completed_at = new Date().toISOString();
+        pipelineState.steps[stepConfig.name].run_id = currentRunId;
         try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* non-fatal */ }
       }
 
@@ -1244,6 +1260,15 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     if (!allowed) {
       console.warn(`[ingest-worker] ${ticketId}/${stepName}: no schema declared, dropping output`);
       return false;
+    }
+    // F4 (audit 2026-04-26): only the orchestrator may set not_applicable.
+    // Workers writing it would bypass the F2 merge guard (which only checks
+    // status=='done'). Coerce worker-set not_applicable to pending so the
+    // orchestrator's condition-skip path stays the single authority.
+    if (payload.status === 'not_applicable') {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: worker tried to set status=not_applicable; coerced to pending (orchestrator owns this status)`);
+      payload.status = 'pending';
+      this.emit('worker_status_coerced', { ticket: ticketId, step: stepName, from: 'not_applicable', to: 'pending' });
     }
     const existing = pipelineState.steps?.[stepName] || {};
     const merged = { ...existing };

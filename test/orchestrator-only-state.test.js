@@ -118,6 +118,25 @@ describe('Pipeline.ingestWorkerOutput — schema gate', () => {
     }
   });
 
+  test('coerces worker-set status:not_applicable to pending (F4)', async () => {
+    const { pipeline, workerOut } = makePipeline();
+    try {
+      mkdirSync(join(workerOut, 'T-X'), { recursive: true });
+      // Worker tries to claim "not_applicable" — would bypass merge guard.
+      writeFileSync(join(workerOut, 'T-X', 'plan.json'), JSON.stringify({
+        status: 'not_applicable',
+        risk: 'low',
+      }));
+      const state = { ticket: 'T-X', steps: { plan: {} } };
+      await pipeline.ingestWorkerOutput('T-X', 'plan', state);
+      // Must NOT be not_applicable — orchestrator owns that status
+      assert.notEqual(state.steps.plan.status, 'not_applicable');
+      assert.equal(state.steps.plan.status, 'pending');
+    } finally {
+      rmSync(workerOut, { recursive: true, force: true });
+    }
+  });
+
   test('returns false when no worker output file exists', async () => {
     const { pipeline } = makePipeline();
     const state = { ticket: 'T-X', steps: {} };
