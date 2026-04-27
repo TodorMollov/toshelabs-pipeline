@@ -314,10 +314,17 @@ export class Pipeline {
       // by hand each time. Code dirties still trigger DIRTY_TREE — those
       // are likely WIP and shouldn't be folded into pipeline history.
       try {
+        const buildLogDir = this.config.build_log_dir || 'memory/build-log';
+        const today = new Date().toISOString().split('T')[0];
         const ledgerPaths = [
           this.config.backlog_file || 'memory/backlog.json',
           this.config.archive_file || 'memory/backlog-archive.json',
           this.config.closed_bugs_file || 'memory/closed-bugs.json',
+          // Orchestrator-written ledgers in build-log/. Without these the
+          // appendUsageLog write from a prior run leaves the tree dirty
+          // and the next run's DIRTY_TREE check refuses to start.
+          `${buildLogDir}/usage.jsonl`,
+          `${buildLogDir}/${today}.md`,
         ];
         const sha = autoCommitPaths(this.config.project_dir, ledgerPaths);
         if (sha) {
@@ -1025,11 +1032,17 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             mergedSha = await checkpointMergeToMaster(ticket.id, {
               title: ticket.title,
               cwd: this.config.project_dir,
-              ledgerPaths: [
-                this.config.backlog_file || 'memory/backlog.json',
-                this.config.archive_file || 'memory/backlog-archive.json',
-                this.config.closed_bugs_file || 'memory/closed-bugs.json',
-              ],
+              ledgerPaths: (() => {
+                const buildLogDir = this.config.build_log_dir || 'memory/build-log';
+                const today = new Date().toISOString().split('T')[0];
+                return [
+                  this.config.backlog_file || 'memory/backlog.json',
+                  this.config.archive_file || 'memory/backlog-archive.json',
+                  this.config.closed_bugs_file || 'memory/closed-bugs.json',
+                  `${buildLogDir}/usage.jsonl`,
+                  `${buildLogDir}/${today}.md`,
+                ];
+              })(),
             });
             if (mergedSha) {
               this.emit('checkpoint_merged_to_master', { ticket: ticket.id, sha: mergedSha });
