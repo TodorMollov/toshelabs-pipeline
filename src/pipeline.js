@@ -264,6 +264,20 @@ export class Pipeline {
     // time to refuse "ship" when a step claims done but never executed.
     const executedThisRun = new Set();
 
+    // Stale-failed reset: if a prior run crashed in post-loop bookkeeping,
+    // the catch block set status='failed' on disk. A fresh attempt loaded
+    // that state and got stuck routing through preserve-blocked, never
+    // entering the success path → no merge. Reset to in_progress so the
+    // current run can complete cleanly. Step statuses stay (they correctly
+    // reflect prior progress and let the loop skip already-done work).
+    if (pipelineState.status === 'failed') {
+      console.log(`[stale-failed-reset] ${ticket.id}: clearing status=failed from prior run (failure_reason=${(pipelineState.failure_reason || '').slice(0, 100)}…)`);
+      pipelineState.status = 'in_progress';
+      pipelineState.failure_reason = null;
+      pipelineState.failed_at = null;
+      await this.savePipelineJson(ticket.id, pipelineState);
+    }
+
     // Blocked-retry escalation: a ticket that keeps getting blocked on the
     // same step consumes LLM budget forever. After N attempts we escalate
     // to `failed`, which triggers rollback in run()'s catch block so its
@@ -916,6 +930,15 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         if (!stepState || stepState.status !== 'done') continue;
         if (executedThisRun.has(stepCfg.name)) continue;       // ran this run
         if (priorRunStepNames.has(stepCfg.name)) continue;      // tag from prior run
+        // Crash-recovery fallback: plan and tests_green don't produce step
+        // tags (plan typically changes no files; tests_green is native and
+        // doesn't go through checkpointCommitStep). For those, trust the
+        // orchestrator-written metrics.attempts > 0 OR tests_green's
+        // all_pass:true — both set by the orchestrator after a real
+        // execution, not the worker's own status writes.
+        const metrics = stepState.metrics;
+        if (metrics && typeof metrics.attempts === 'number' && metrics.attempts > 0) continue;
+        if (stepCfg.name === 'tests_green' && stepState.all_pass === true) continue;
         unverifiedSteps.push(stepCfg.name);
       }
       // tests_green specifically: even if executed, must have all_pass:true.
