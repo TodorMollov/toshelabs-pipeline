@@ -51,13 +51,14 @@ const STEP_OUTPUT_SCHEMA = {
     'review_feedback', 'explicit_fixes', // populated by review→implement loop
   ],
   tests_green: [
-    'status', 'reason',
-    'unit_tests', 'analyzer_errors', 'failed_tests', 'baseline_failures',
-    'new_failures', 'all_pass', 'unit_crashed', 'unit_exit_code',
-    'unit_ran_nothing', 'unit_skipped_compile_errors', 'new_failed_tests',
-    'extra_failures', 'new_extra_failures', 'new_analyzer_errors',
-    'test_output_summary', 'analyze_output_summary', 'extra_output_summary',
-    'native_step', 'completed_at',
+    // Orchestrator-only step. The native runTestsGreen body writes test
+    // results directly via savePipelineJson; workers never produce
+    // tests_green output. Empty schema means ingestWorkerOutput rejects
+    // ALL worker writes for this step — no worker can claim all_pass:true
+    // without the orchestrator actually running the test suite. (2026-04-27
+    // BUG-253 incident: gate-level selfHeal worker wrote `status:"passed",
+    // all_pass:true, unit_tests:{passed:2071,failed:0}` and the schema
+    // accepted everything.)
   ],
   review: [
     'status', 'reason',
@@ -539,19 +540,18 @@ export class Pipeline {
             this.emit('step_gate', { ticket: ticket.id, step: 'tests_green', pass: validation.pass, failures: validation.failures });
 
             if (!validation.pass) {
-              // Last resort: try self-heal on the gate itself
-              const healed = await this.selfHeal(ticket, stepConfig, pipelineState, validation.failures);
-              if (healed) {
-                pipelineState = await this.reloadStepFromDisk(ticket.id, 'tests_green', pipelineState);
-                const healValidation = validateStep(pipelineState.steps.tests_green || {}, stepConfig, pipelineState.steps.plan || {});
-                if (!healValidation.pass) {
-                  this.emit('step_gate_failed', { ticket: ticket.id, step: 'tests_green', failures: healValidation.failures });
-                  throw new Error(`Gate failed for ${ticket.id}/tests_green: ${healValidation.failures.join(', ')}`);
-                }
-              } else {
-                this.emit('step_gate_failed', { ticket: ticket.id, step: 'tests_green', failures: validation.failures });
-                throw new Error(`Gate failed for ${ticket.id}/tests_green: ${validation.failures.join(', ')}`);
-              }
+              // 2026-04-27: gate-level generic selfHeal removed for
+              // tests_green. The worker would happily rewrite the worker
+              // output file with `all_pass:true` and the orchestrator would
+              // accept it without actually re-running tests — exactly what
+              // happened on BUG-253 (gate-level heal claimed 2071 passed /
+              // 0 failed with 0 tool calls). The in-loop heal above is the
+              // only legitimate path for tests_green: it edits source code,
+              // then runTestsGreen re-runs the actual suite. If the in-loop
+              // heal exhausts its attempts and the gate still fails, that's
+              // a real verification failure — fail the ticket honestly.
+              this.emit('step_gate_failed', { ticket: ticket.id, step: 'tests_green', failures: validation.failures });
+              throw new Error(`Gate failed for ${ticket.id}/tests_green: ${validation.failures.join(', ')}`);
             }
             break;
           }
