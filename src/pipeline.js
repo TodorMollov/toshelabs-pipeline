@@ -389,6 +389,9 @@ export class Pipeline {
           this.config.backlog_file || 'memory/backlog.json',
           this.config.archive_file || 'memory/backlog-archive.json',
           this.config.closed_bugs_file || 'memory/closed-bugs.json',
+          // Secondary backlog source the server merges into /api/backlog —
+          // also human-edited and needs to be absorbed at run start.
+          'memory/backlog-v2.json',
           // Orchestrator-written ledgers in build-log/. Without these the
           // appendUsageLog write from a prior run leaves the tree dirty
           // and the next run's DIRTY_TREE check refuses to start.
@@ -1114,6 +1117,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
                   this.config.backlog_file || 'memory/backlog.json',
                   this.config.archive_file || 'memory/backlog-archive.json',
                   this.config.closed_bugs_file || 'memory/closed-bugs.json',
+                  'memory/backlog-v2.json',
                   `${buildLogDir}/usage.jsonl`,
                   `${buildLogDir}/${today}.md`,
                 ];
