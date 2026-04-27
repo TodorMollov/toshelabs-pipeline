@@ -1274,6 +1274,20 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       payload.status = 'pending';
       this.emit('worker_status_coerced', { ticket: ticketId, step: stepName, from: 'not_applicable', to: 'pending' });
     }
+    // Status value validation. Workers occasionally invent values like
+    // "passed" / "success" / "ok" — these aren't in TERMINAL_OK and would
+    // trip the merge guard ("incomplete sub-steps"). Coerce common
+    // success-shaped synonyms to "done"; coerce anything else to "pending"
+    // so the orchestrator decides explicitly.
+    const VALID_STATUS = new Set(['done', 'blocked', 'pending', 'failed', 'crashed']);
+    const SUCCESS_SYNONYMS = new Set(['passed', 'pass', 'success', 'ok', 'complete', 'completed', 'green']);
+    if (payload.status && !VALID_STATUS.has(payload.status)) {
+      const original = payload.status;
+      const target = SUCCESS_SYNONYMS.has(String(payload.status).toLowerCase()) ? 'done' : 'pending';
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: worker wrote invalid status="${original}"; coerced to "${target}"`);
+      payload.status = target;
+      this.emit('worker_status_coerced', { ticket: ticketId, step: stepName, from: original, to: target });
+    }
     const existing = pipelineState.steps?.[stepName] || {};
     const merged = { ...existing };
     const accepted = [];
