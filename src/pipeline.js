@@ -1304,6 +1304,19 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // Union of files_changed across every step's artifacts. Pipeline state
   // files (memory/pipeline/*.json) are excluded — they're bookkeeping, not
   // ticket output. Paths are relative to project_dir, matching git.
+  // Paths the orchestrator manages as bookkeeping — never count toward
+  // ticket file changes, never trip silent-writes guards. Includes
+  // memory/pipeline/ (canonical state) and the worker output directory
+  // (per-step worker payloads, ingested via schema gate, not real ticket
+  // output).
+  isOrchestratorPath(path) {
+    if (!path) return false;
+    if (path.startsWith('memory/pipeline/')) return true;
+    const workerDir = this.config?.worker_output_dir || '.pipeline-worker-out';
+    if (path === workerDir || path.startsWith(`${workerDir}/`)) return true;
+    return false;
+  }
+
   collectDeclaredFiles(pipelineState) {
     const out = new Set();
     for (const step of Object.values(pipelineState.steps || {})) {
@@ -1311,7 +1324,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       for (const fc of (step.files_changed || [])) {
         const p = typeof fc === 'object' ? fc.path : fc;
         if (!p || typeof p !== 'string') continue;
-        if (p.startsWith('memory/pipeline/')) continue;
+        if (this.isOrchestratorPath(p)) continue;
         out.add(p);
       }
     }
@@ -1329,7 +1342,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const nowDirty = this.getDirtyFiles(this.config.project_dir);
     for (const path of nowDirty.keys()) {
       if (dirtyAtStart.has(path)) continue;
-      if (path.startsWith('memory/pipeline/')) continue;
+      if (this.isOrchestratorPath(path)) continue;
       out.add(path);
     }
     return out;
@@ -1349,12 +1362,12 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const plan = pipelineState.steps?.plan;
     for (const fc of (plan?.files_to_change || [])) {
       const p = typeof fc === 'object' ? fc.path : fc;
-      if (p && typeof p === 'string' && !p.startsWith('memory/pipeline/')) declared.add(p);
+      if (p && typeof p === 'string' && !this.isOrchestratorPath(p)) declared.add(p);
     }
     const silent = [];
     for (const path of nowDirty.keys()) {
       if (dirtyAtStart.has(path)) continue;
-      if (path.startsWith('memory/pipeline/')) continue;
+      if (this.isOrchestratorPath(path)) continue;
       if (declared.has(path)) continue;
       silent.push(path);
     }
