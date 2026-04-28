@@ -383,30 +383,12 @@ export class Pipeline {
       // Without this, DIRTY_TREE refuses and the operator has to commit
       // by hand each time. Code dirties still trigger DIRTY_TREE — those
       // are likely WIP and shouldn't be folded into pipeline history.
-      try {
-        const buildLogDir = this.config.build_log_dir || 'memory/build-log';
-        const today = new Date().toISOString().split('T')[0];
-        const ledgerPaths = [
-          this.config.backlog_file || 'memory/backlog.json',
-          this.config.archive_file || 'memory/backlog-archive.json',
-          this.config.closed_bugs_file || 'memory/closed-bugs.json',
-          // Secondary backlog source the server merges into /api/backlog —
-          // also human-edited and needs to be absorbed at run start.
-          'memory/backlog-v2.json',
-          // Orchestrator-written ledgers in build-log/. Without these the
-          // appendUsageLog write from a prior run leaves the tree dirty
-          // and the next run's DIRTY_TREE check refuses to start.
-          `${buildLogDir}/usage.jsonl`,
-          `${buildLogDir}/${today}.md`,
-        ];
-        const sha = autoCommitPaths(this.config.project_dir, ledgerPaths);
-        if (sha) {
-          this.emit('human_backlog_committed', { ticket: ticket.id, sha });
-          console.log(`[checkpoint] ${ticket.id}: absorbed human backlog edits as ${sha.slice(0, 7)}`);
-        }
-      } catch (err) {
-        console.error(`[checkpoint] ${ticket.id}: auto-commit of backlog edits failed: ${err.message}`);
-      }
+      // 2026-04-28: backlog files (backlog.json, backlog-v2.json,
+      // backlog-archive.json, closed-bugs.json) and memory/build-log/ are
+      // now gitignored in the project — they no longer enter git's view, so
+      // there's nothing to absorb. autoCommitPaths is left exported for any
+      // future per-project ledger that genuinely lives in git, but the
+      // default run path doesn't call it anymore.
 
       try {
         const res = await checkpointEnsureBranch(ticket.id, this.config.project_dir);
@@ -1110,18 +1092,9 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             mergedSha = await checkpointMergeToMaster(ticket.id, {
               title: ticket.title,
               cwd: this.config.project_dir,
-              ledgerPaths: (() => {
-                const buildLogDir = this.config.build_log_dir || 'memory/build-log';
-                const today = new Date().toISOString().split('T')[0];
-                return [
-                  this.config.backlog_file || 'memory/backlog.json',
-                  this.config.archive_file || 'memory/backlog-archive.json',
-                  this.config.closed_bugs_file || 'memory/closed-bugs.json',
-                  'memory/backlog-v2.json',
-                  `${buildLogDir}/usage.jsonl`,
-                  `${buildLogDir}/${today}.md`,
-                ];
-              })(),
+              // 2026-04-28: ledgerPaths empty — backlog/build-log are
+              // gitignored, no pre-merge absorb required.
+              ledgerPaths: [],
             });
             if (mergedSha) {
               this.emit('checkpoint_merged_to_master', { ticket: ticket.id, sha: mergedSha });

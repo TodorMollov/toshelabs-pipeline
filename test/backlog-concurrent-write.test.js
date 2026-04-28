@@ -123,8 +123,8 @@ describe('Fix 2 — docs_update prompt does not tell worker to touch backlog', (
   });
 });
 
-describe('Fix 3 — archiveTicket commits its ledger writes atomically', () => {
-  test('working tree is clean after archiveTicket', async () => {
+describe('archiveTicket — file-only writes (post 2026-04-28: backlog gitignored)', () => {
+  test('persists JSON without touching git', async () => {
     const repo = makeRepo();
     try {
       writeFileSync(
@@ -133,6 +133,7 @@ describe('Fix 3 — archiveTicket commits its ledger writes atomically', () => {
       );
       writeFileSync(join(repo, 'memory/backlog-archive.json'), JSON.stringify({ tickets: [] }, null, 2));
       execSync('git add . && git commit -q -m init', { cwd: repo });
+      const headBefore = git('rev-parse HEAD', repo);
 
       const config = {
         project_dir: repo,
@@ -147,18 +148,20 @@ describe('Fix 3 — archiveTicket commits its ledger writes atomically', () => {
       assert.ok(archived);
       assert.equal(archived.id, 'T-X');
 
-      // Tree must be clean — the archiveTicket call should have committed.
-      assert.equal(git('status --porcelain', repo), '');
+      // No new commits — archiveTicket does not invoke git.
+      assert.equal(git('rev-parse HEAD', repo), headBefore);
 
-      // HEAD subject identifies this as a pipeline archive commit.
-      const subject = git('log -1 --pretty=%s', repo);
-      assert.equal(subject, '[pipeline] archive T-X');
+      // The on-disk JSON has been moved between files.
+      const backlog = JSON.parse(readFileSync(join(repo, 'memory/backlog.json'), 'utf-8'));
+      const archive = JSON.parse(readFileSync(join(repo, 'memory/backlog-archive.json'), 'utf-8'));
+      assert.equal(backlog.tickets.find((t) => t.id === 'T-X'), undefined);
+      assert.ok(archive.tickets.find((t) => t.id === 'T-X'));
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
   });
 
-  test('archiveTicket leaves unrelated dirty files alone', async () => {
+  test('does not commit unrelated dirty files', async () => {
     const repo = makeRepo();
     try {
       writeFileSync(
@@ -168,6 +171,7 @@ describe('Fix 3 — archiveTicket commits its ledger writes atomically', () => {
       writeFileSync(join(repo, 'memory/backlog-archive.json'), JSON.stringify({ tickets: [] }, null, 2));
       writeFileSync(join(repo, 'unrelated.txt'), 'pre\n');
       execSync('git add . && git commit -q -m init', { cwd: repo });
+      const headBefore = git('rev-parse HEAD', repo);
 
       // Operator has an unrelated edit when archive runs.
       writeFileSync(join(repo, 'unrelated.txt'), 'post\n');
@@ -183,10 +187,10 @@ describe('Fix 3 — archiveTicket commits its ledger writes atomically', () => {
       };
       await archiveTicket('T-X', config);
 
-      // Ledger files committed, but unrelated.txt is still dirty.
+      // No new commit was made — operator's WIP edit is untouched and uncommitted.
+      assert.equal(git('rev-parse HEAD', repo), headBefore);
       const status = git('status --porcelain', repo);
       assert.match(status, /unrelated\.txt/);
-      assert.doesNotMatch(status, /backlog/);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
