@@ -1077,12 +1077,27 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             this.emit('ticket_committed', { ticket: ticket.id, sha: ticketSha });
             console.log(`[checkpoint] ${ticket.id}: committed to master (${ticketSha.slice(0, 7)})`);
           } else {
-            // Empty diff — pipeline ran but produced no file changes.
-            // Could be a docs-only ticket where the worker decided no
-            // edits were needed. Leave master untouched, baseline tag
-            // gets cleaned up below.
-            this.emit('ticket_committed_empty', { ticket: ticket.id });
-            console.log(`[checkpoint] ${ticket.id}: no diff to commit (empty ticket)`);
+            // Empty diff — pipeline finished all steps but produced no
+            // changes. This is almost always a mis-ship: a previous run
+            // that left state=done without actually landing the work,
+            // or a worker that no-op'd every step. Either way, nothing to
+            // ship. Block the ticket with a clear reason — operator can
+            // decide whether to re-queue or split the ticket. (2026-04-28:
+            // this case caused BUG-253 to "ship" twice with no commit on
+            // master.)
+            pipelineState.status = 'blocked';
+            pipelineState.blocked_at = new Date().toISOString();
+            pipelineState.blocked_step = 'commit';
+            pipelineState.blocked_reason =
+              'all 7 steps marked done but no working-tree changes to commit. ' +
+              'Likely a stale-state bug — re-queue the ticket.';
+            await this.savePipelineJson(ticket.id, pipelineState);
+            this.emit('ticket_committed_empty', { ticket: ticket.id, reason: pipelineState.blocked_reason });
+            console.error(`[checkpoint] ${ticket.id}: BLOCKED — ${pipelineState.blocked_reason}`);
+            // Drop baseline tag and bail. The ticket stays in the backlog
+            // (run() only archives status:done) and surfaces as blocked.
+            try { cleanupBaseline(ticket.id, this.config.project_dir); } catch { /* best effort */ }
+            return;
           }
         } catch (err) {
           console.error(`[checkpoint] ${ticket.id}: commit FAILED — ${err.message}`);
@@ -1105,22 +1120,18 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   async loadOrCreatePipelineJson(ticket) {
     const existing = await this.loadPipelineJson(ticket.id);
     if (existing) {
-      if (existing.created_by === 'pipeline') return existing;
-      // File was created by a Claude Code session, not this pipeline.
-      // Reset all "done" steps to pending so the pipeline re-runs them
-      // with its own prompts and validation.
-      this.emit('external_file_reset', {
-        ticket: ticket.id,
-        reason: 'pipeline file not created by pipeline runner — resetting steps',
-      });
-      for (const [name, step] of Object.entries(existing.steps)) {
-        if (step.status === 'done') {
-          existing.steps[name] = { status: 'pending', completed_at: null };
-        }
-      }
-      existing.created_by = 'pipeline';
-      await this.savePipelineJson(ticket.id, existing);
-      return existing;
+      // 2026-04-28: state files no longer "resume" across pipeline runs.
+      // The ticket is in the actionable backlog (otherwise we wouldn't be
+      // running it), so any prior status:done in the state file must be
+      // wrong — either from a mis-ship that didn't actually land, or a
+      // crash mid-archive, or a stale file the operator left around. Reset
+      // to a fresh slate; treat this run as a from-scratch attempt. The
+      // previous "skip already-done step" path was the source of repeated
+      // mis-ships (T-359, BUG-253) where the orchestrator trusted state
+      // and ended up shipping nothing. Crash recovery costs us re-running
+      // ~30 minutes of completed steps; mis-shipping cost us a week.
+      this.emit('stale_state_reset', { ticket: ticket.id, prior_status: existing.status });
+      console.log(`[load] ${ticket.id}: stale state file reset (prior status=${existing.status})`);
     }
 
     const state = {
