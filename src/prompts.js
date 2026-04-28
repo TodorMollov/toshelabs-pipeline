@@ -336,7 +336,18 @@ Write {{worker_output}} as a flat JSON object with status = "done" and:
 - outcome, test_files, test_names, tests_before, tests_after
 - failure_output: "one line per failing test — assertion message only, no stack traces"
 - baseline_failures: [test names already failing before changes]
-- criteria_to_test_map: [{criterion: "what the plan says must happen", test_name: "name of test that covers it"}] — one entry per BEHAVIOURAL deliverable from the plan. Plan bullets prefixed with "[no-test]" are plumbing and SHOULD NOT appear here — they're covered transitively. Every other files_to_change what_to_do must appear as a criterion.
+- criteria_to_test_map: [{criterion, test_name}] — REQUIRED, the gate fails on every ticket that gets this wrong.
+  HOW TO BUILD IT:
+    For each entry in plan.files_to_change whose what_to_do does NOT start with "[no-test]":
+      criterion  = the what_to_do text VERBATIM (or, if too long, its key noun-verb clause —
+                   keep the specific nouns: file paths, function names, field names, behavioural verbs).
+                   Paraphrases that drop those nouns FAIL the gate (30% keyword-overlap rule).
+      test_name  = the actual it/test('...') string of the test you wrote that covers this deliverable.
+    Skip what_to_do bullets prefixed "[no-test]" — they're plumbing.
+    Every remaining plan deliverable MUST have an entry. Missing entries cause the gate failure
+    "criteria_to_test_map: N/M plan deliverable(s) have no matching test" — the most common
+    tests_red gate failure across the project. Heal can fix it but it costs ~8 minutes per ticket.
+
 If blocked: set status = "blocked" with reason.`,
 
     implement: `Ticket {{ticket_id}}: "{{ticket_title}}"
