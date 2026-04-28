@@ -2478,11 +2478,12 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${res.unitExitCode}. Tail: ${res.testOutput.slice(-500)}`);
     }
 
-    const failed_ = (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0 || newAnalyzerErrors > 0;
+    const testsActuallyRan = !res.unitRanNothing && !res.skippedDueToCompileErrors;
+    const failed_ = !testsActuallyRan || (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0 || newAnalyzerErrors > 0;
     const step = {
       status: failed_ ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0 && newAnalyzerErrors === 0,
+      all_pass: testsActuallyRan && res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0 && newAnalyzerErrors === 0,
       unit_tests: { passed: res.passed, failed: res.failed, skipped: 0 },
       unit_crashed: res.unitCrashed,
       unit_exit_code: res.unitExitCode,
