@@ -110,6 +110,17 @@ export class Pipeline {
     return this.activeWorktree || this.config.project_dir;
   }
 
+  // Shallow-cloned config with project_dir rewritten to the active
+  // worktree. Used for buildPrompt so prompt templates that interpolate
+  // {{project_dir}} or read referenced files do so against the worktree.
+  // Does NOT mutate the shared config object (server.js reads
+  // config.project_dir at request time and would surface worktree paths
+  // to the dashboard if we mutated in place).
+  effectiveConfig() {
+    if (!this.activeWorktree) return this.config;
+    return { ...this.config, project_dir: this.activeWorktree };
+  }
+
   /**
    * Hard-stop: terminate the currently-running Claude subprocess. The
    * spawnClaude promise then rejects; the enclosing step throws and
@@ -1847,7 +1858,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       // Build and execute
       const built = isRetry
         ? { prompt: await this.buildHealPrompt(stepConfig, ticket, pipelineState, attempt), preloadedPaths: [] }
-        : await buildPrompt(stepConfig, ticket, pipelineState, this.config);
+        : await buildPrompt(stepConfig, ticket, pipelineState, this.effectiveConfig());
       const prompt = built.prompt;
       const preloadedPaths = built.preloadedPaths;
 
@@ -2158,7 +2169,7 @@ RULES:
     }
 
     // Standard heal: gate validation failed (wrong values, not missing values)
-    const originalPrompt = (await buildPrompt(stepConfig, ticket, pipelineState, this.config)).prompt;
+    const originalPrompt = (await buildPrompt(stepConfig, ticket, pipelineState, this.effectiveConfig())).prompt;
 
     return `You are RETRYING the "${stepConfig.name}" step for ticket ${ticket.id}: "${ticket.title}".
 
