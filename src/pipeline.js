@@ -2268,22 +2268,11 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     }
 
-    // 2. Append one-line summary to build log
-    try {
-      const today = new Date().toISOString().split('T')[0];
-      const logDir = this.config._resolved.buildLogDir;
-      await mkdir(logDir, { recursive: true });
-      const logPath = resolve(logDir, `${today}.md`);
-
-      const implFiles = (pipelineState.steps.implement?.files_changed || [])
-        .map(f => typeof f === 'object' ? f.path : f);
-      const line = `- **${ticket.id}** ${ticket.title} (${ticket.type || 'feature'}) — ${implFiles.length} files changed\n`;
-
-      await writeFile(logPath, line, { flag: 'a' });
-      this.emit('mechanical_docs', { ticket: ticket.id, file: `build-log/${today}.md` });
-    } catch (err) {
-      console.error(`[mechanical-docs] build-log failed: ${err.message}`);
-    }
+    // 2026-04-28: build-log/{date}.md write removed. The CLAUDE.md rule
+    // that justified writing it (rule 23 + 23b "weekly retrospective")
+    // never actually fired — no retrospective was ever produced in the
+    // entire project life. Writing was overhead with no reader. usage.jsonl
+    // (token tracking) is unaffected — that lives in appendUsageLog.
   }
 
   // --- Shared test-suite runner: used by baseline capture and tests_green ---
