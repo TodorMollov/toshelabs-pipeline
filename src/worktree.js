@@ -89,11 +89,19 @@ function isRegisteredWorktreeFor(masterDir, worktreeDir, branchName) {
 }
 
 function samePath(a, b) {
-  const norm = (p) => {
-    try { return realpathSync(p).replace(/\/+$/, ''); }
-    catch { return p.replace(/\r$/, '').replace(/\/+$/, ''); }
-  };
-  return norm(a) === norm(b);
+  // Symmetric: if either side fails to resolve, both sides use the
+  // raw fallback. Asymmetric normalization produced false negatives
+  // when one path existed and the other did not.
+  const strip = (p) => p.replace(/\r$/, '').replace(/\/+$/, '');
+  let na;
+  let nb;
+  try {
+    na = realpathSync(a);
+    nb = realpathSync(b);
+  } catch {
+    return strip(a) === strip(b);
+  }
+  return strip(na) === strip(nb);
 }
 
 // Idempotent: creates the worktree the first time and is a no-op every
@@ -183,24 +191,27 @@ export function cherryPickToMaster(masterDir, sha, defaultBranch) {
     cherryErr = err;
   }
   // Capture conflict files *before* abort; after abort the unmerged
-  // markers are gone. If cherry-pick left no CHERRY_PICK_HEAD it means
-  // git decided the patch was empty/no-op (default `cherry.empty=stop`)
-  // — treat that as EMPTY rather than CONFLICT. This is more robust
-  // than scraping prose from stderr/stdout, which is locale-dependent.
+  // markers are gone. CHERRY_PICK_HEAD presence tells us cherry-pick
+  // got far enough to start applying the patch:
+  //   - missing → pre-flight failure (bad sha, repo lock, etc.) →
+  //     PREFLIGHT_FAILED. Reporting CONFLICT here would be a lie.
+  //   - present + no unmerged paths + clean index → EMPTY (already
+  //     applied; default cherry.empty=stop holds the cherry-pick state)
+  //   - present + unmerged paths → real CONFLICT
   const cherryHead = git(['rev-parse', '--verify', 'CHERRY_PICK_HEAD'], masterDir, { tolerateFailure: true });
-  const conflictFiles = cherryHead
-    ? (git(['diff', '--name-only', '--diff-filter=U'], masterDir, { tolerateFailure: true }) || '')
-        .split('\n').map((s) => s.trim()).filter(Boolean)
-    : [];
-  // Status v2 shows the staged-but-no-diff state of an empty cherry-pick.
+  const stderr = (cherryErr.stderr?.toString?.() ?? '').trim().slice(0, 500);
+  if (!cherryHead) {
+    return { ok: false, code: 'PREFLIGHT_FAILED', message: stderr };
+  }
+  const conflictFiles = (git(['diff', '--name-only', '--diff-filter=U'], masterDir, { tolerateFailure: true }) || '')
+    .split('\n').map((s) => s.trim()).filter(Boolean);
   const statusV2 = git(['status', '--porcelain=v2'], masterDir, { tolerateFailure: true }) || '';
-  const isEmpty = !!cherryHead && conflictFiles.length === 0 && statusV2.length === 0;
+  const isEmpty = conflictFiles.length === 0 && statusV2.length === 0;
   // Always try to abort so the tree never lingers in a half-merged
   // state. ROLLBACK_FAILED if the abort itself fails — distinct from a
   // normal conflict.
   const abortRes = git(['cherry-pick', '--abort'], masterDir, { tolerateFailure: true });
-  const stderr = (cherryErr.stderr?.toString?.() ?? '').slice(0, 500);
-  if (cherryHead && abortRes === null) {
+  if (abortRes === null) {
     return { ok: false, code: 'ROLLBACK_FAILED', message: stderr };
   }
   if (isEmpty) {
