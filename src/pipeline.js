@@ -201,6 +201,7 @@ export class Pipeline {
         // for parallel edits. On any failure to set up, we fall back to
         // running directly in project_dir (legacy behavior).
         let worktreeCtx = null;
+        try {
         if (!this.dryRun && this.worktreeEnabled) {
           try {
             const wtDir = this.config._resolved.projectWorktree;
@@ -257,8 +258,6 @@ export class Pipeline {
           // (and the worktree, when enabled, is permanently pinned to its
           // side branch). No checkout-master cleanup needed here.
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
-          this.activeWorktree = null;
-          this.worktreeBranch = null;
           continue;
         }
 
@@ -308,6 +307,18 @@ export class Pipeline {
             finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: result.headSha };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
           } else {
+            // Anchor the unmerged sha with a tag in the primary repo
+            // (worktree shares object storage). The next ticket's
+            // prepareWorktreeForTicket resets the side branch to
+            // master, which would otherwise leave the commit only
+            // reachable via reflog. The tag keeps it permanently
+            // resolvable for the operator's manual cherry-pick.
+            const tag = `pipeline/pending-merge-${ticket.id}`;
+            try {
+              execSync(`git tag -f ${tag} ${sha}`, { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
+            } catch (tagErr) {
+              console.error(`[worktree] ${ticket.id}: tag anchor failed — ${tagErr.message?.slice(0, 200)}`);
+            }
             this.emit('pipeline_merge_pending', {
               ticket: ticket.id,
               sha,
@@ -315,10 +326,11 @@ export class Pipeline {
               files: result.files,
               head: result.head,
               branch: worktreeCtx.branch,
-              hint: `cd ${this.config.project_dir} && git cherry-pick ${sha}`,
+              tag,
+              hint: `cd ${this.config.project_dir} && git cherry-pick ${tag}`,
             });
-            console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); commit ${sha.slice(0, 7)} stays on ${worktreeCtx.branch}`);
-            finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files };
+            console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); commit ${sha.slice(0, 7)} anchored at tag ${tag}`);
+            finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
           }
         }
@@ -330,10 +342,14 @@ export class Pipeline {
           console.log(`Paused. Next ticket: ${queue[i + 1]?.id}. Press enter to continue...`);
           await new Promise((resolve) => process.stdin.once('data', resolve));
         }
-        // Per-ticket worktree state always cleared at end of iteration —
-        // every `continue` path above also resets these.
-        this.activeWorktree = null;
-        this.worktreeBranch = null;
+        } finally {
+          // Worktree state must be cleared at end of every iteration,
+          // including paths that `continue` (blocked / failed / not
+          // done). try/finally enforces this mechanically — a future
+          // contributor adding a continue won't accidentally leak.
+          this.activeWorktree = null;
+          this.worktreeBranch = null;
+        }
       }
 
       // Phase 3-5: Integration tests, docs, build
