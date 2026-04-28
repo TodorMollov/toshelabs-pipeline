@@ -24,7 +24,7 @@ import { Pipeline } from '../src/pipeline.js';
 function makeProject() {
   const dir = mkdtempSync(join(tmpdir(), 'pipeline-trust-'));
   execSync('git init -q -b master', { cwd: dir });
-  execSync('git config user.email t@t.t && git config user.name t && git config commit.gpgsign false', { cwd: dir });
+  execSync('git config user.email t@t.t && git config user.name t && git config commit.gpgsign false && git config core.hooksPath /dev/null', { cwd: dir });
   writeFileSync(join(dir, 'init.txt'), 'init\n');
   execSync('git add . && git commit -q -m init', { cwd: dir });
   return dir;

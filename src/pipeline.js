@@ -10,13 +10,11 @@ import { validateStep } from './validator.js';
 import { buildPrompt } from './prompts.js';
 import { acquireLock, releaseLock } from './lock.js';
 import {
-  ensureBranch as checkpointEnsureBranch,
-  commitStepSnapshot as checkpointCommitStep,
-  revertToLastSnapshot as checkpointRevert,
-  deleteBranch as checkpointDeleteBranch,
-  mergeToMaster as checkpointMergeToMaster,
+  setupTicketBaseline,
+  revertToBaseline,
+  commitTicketAsOne,
+  cleanupBaseline,
   autoCommitPaths,
-  listStepSnapshots,
   CheckpointError,
 } from './checkpoint.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
@@ -391,13 +389,13 @@ export class Pipeline {
       // default run path doesn't call it anymore.
 
       try {
-        const res = await checkpointEnsureBranch(ticket.id, this.config.project_dir);
-        this.emit('checkpoint_branch_ready', { ticket: ticket.id, ...res });
-        console.log(`[checkpoint] ${ticket.id}: on branch ${res.branch}${res.recoveredFromExisting ? ' (recovered stale)' : ''}`);
+        const res = setupTicketBaseline(ticket.id, this.config.project_dir);
+        this.emit('checkpoint_baseline_set', { ticket: ticket.id, baselineTag: res.baselineTag, baselineSha: res.baselineSha });
+        console.log(`[checkpoint] ${ticket.id}: baseline ${res.baselineTag} at ${res.baselineSha.slice(0, 7)}`);
       } catch (err) {
         if (err instanceof CheckpointError) {
           // DIRTY_TREE is operator error, not pipeline failure — surface
-          // clearly and refuse to start so we don't smash their work.
+          // clearly and refuse to start so we don't smash their WIP.
           this.emit('checkpoint_refused', { ticket: ticket.id, reason: err.message });
           console.error(`[checkpoint] ${ticket.id}: REFUSED — ${err.message}`);
           throw err;
@@ -706,7 +704,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             // pipeline-state layer.
             if (this.config.checkpoints?.enabled) {
               try {
-                await checkpointRevert(ticket.id, this.config.project_dir);
+                revertToBaseline(ticket.id, this.config.project_dir);
                 this.emit('checkpoint_reverted_for_restart', { ticket: ticket.id, from: stepConfig.name, to: prevStepName });
               } catch (revertErr) {
                 console.warn(`[restart] ${ticket.id}: git revert failed — ${revertErr.message}`);
@@ -979,30 +977,22 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const incompleteSteps = Object.entries(pipelineState.steps || {})
       .filter(([, step]) => !step || !TERMINAL_OK.has(step.status));
 
-    // F2 + F3 (audit 2026-04-26): every step claiming `done` must either
-    // have actually executed in this run (executedThisRun) OR have a step
-    // tag from a prior run (crash recovery). A worker can't fake a tag —
-    // they're created by the orchestrator after gate pass.
+    // F2 + F3 (audit 2026-04-26, simplified post 2026-04-28): every step
+    // claiming `done` must have actually executed in this run
+    // (executedThisRun) OR have crash-recovery evidence in the state file
+    // (metrics.attempts > 0 written by the orchestrator after a real run,
+    // or tests_green.all_pass===true written by the native runTestsGreen).
+    // The previous tag-based fallback is gone — there are no step tags
+    // anymore (per-ticket branches and per-step commits removed).
     let unverifiedSteps = [];
     if (this.config.checkpoints?.enabled && pipelineState.status !== 'blocked' && pipelineState.status !== 'failed') {
-      let priorRunStepNames = new Set();
-      try {
-        const tags = await listStepSnapshots(ticket.id, this.config.project_dir);
-        priorRunStepNames = new Set(tags.map((t) => t.step));
-      } catch (err) {
-        console.warn(`[merge-guard] ${ticket.id}: tag listing failed — ${err.message}`);
-      }
       for (const stepCfg of steps) {
         const stepState = pipelineState.steps?.[stepCfg.name];
         if (!stepState || stepState.status !== 'done') continue;
         if (executedThisRun.has(stepCfg.name)) continue;       // ran this run
-        if (priorRunStepNames.has(stepCfg.name)) continue;      // tag from prior run
-        // Crash-recovery fallback: plan and tests_green don't produce step
-        // tags (plan typically changes no files; tests_green is native and
-        // doesn't go through checkpointCommitStep). For those, trust the
-        // orchestrator-written metrics.attempts > 0 OR tests_green's
-        // all_pass:true — both set by the orchestrator after a real
-        // execution, not the worker's own status writes.
+        // Crash-recovery: orchestrator-written evidence from a prior run.
+        // Workers can't write metrics or all_pass via the schema gate, so
+        // these two markers are trustworthy.
         const metrics = stepState.metrics;
         if (metrics && typeof metrics.attempts === 'number' && metrics.attempts > 0) continue;
         if (stepCfg.name === 'tests_green' && stepState.all_pass === true) continue;
@@ -1067,64 +1057,44 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       // own status is already 'done' on disk — the only thing missing is
       // integration.
       if (this.config.checkpoints?.enabled) {
-        // Capture pipeline-owned post-loop writes (memory/build-log/usage.jsonl
-        // from appendUsageLog, memory/build-log/YYYY-MM-DD.md from mechanical
-        // docs) into a final snapshot on the ticket branch. Without this, the
-        // subsequent `git checkout master` inside mergeToMaster carries those
-        // writes over as "dirty master" and the merge refuses with DIRTY_TREE
-        // — which is how 4 of 6 tickets on 2026-04-21 ended up stranded on
-        // their branches until manually squash-merged. Bundling the writes
-        // into the ticket's own snapshot makes the merge see a clean master
-        // and lands everything in ONE ticket commit as intended.
+        // 2026-04-28: per-ticket branches removed. The ticket's work is
+        // currently in master's working tree (uncommitted). Make ONE
+        // commit with everything `git add -A` picks up — that's the
+        // ticket's full output. Then drop the baseline tag.
+        //
+        // No branch to merge, no step tags to delete, no DIRTY_TREE
+        // class of merge failures. The previous mergeToMaster path could
+        // strand tickets on side branches when an operator concurrent
+        // edit dirtied master mid-run; that failure mode no longer exists
+        // because the ticket never left master in the first place.
         try {
-          const metaSha = await checkpointCommitStep(ticket.id, 'pipeline-metadata', this.config.project_dir);
-          if (metaSha) {
-            this.emit('checkpoint_step_committed', { ticket: ticket.id, step: 'pipeline-metadata', sha: metaSha });
+          const ticketSha = commitTicketAsOne(
+            ticket.id,
+            ticket.title || '',
+            this.config.project_dir,
+          );
+          if (ticketSha) {
+            this.emit('ticket_committed', { ticket: ticket.id, sha: ticketSha });
+            console.log(`[checkpoint] ${ticket.id}: committed to master (${ticketSha.slice(0, 7)})`);
+          } else {
+            // Empty diff — pipeline ran but produced no file changes.
+            // Could be a docs-only ticket where the worker decided no
+            // edits were needed. Leave master untouched, baseline tag
+            // gets cleaned up below.
+            this.emit('ticket_committed_empty', { ticket: ticket.id });
+            console.log(`[checkpoint] ${ticket.id}: no diff to commit (empty ticket)`);
           }
         } catch (err) {
-          console.warn(`[checkpoint] ${ticket.id}/pipeline-metadata: pre-merge snapshot failed — ${err.message}`);
+          console.error(`[checkpoint] ${ticket.id}: commit FAILED — ${err.message}`);
+          this.emit('ticket_commit_failed', { ticket: ticket.id, error: err.message });
+          return;
         }
 
-        const shouldMerge = this.config.checkpoints.merge_to_master !== false;
-        let mergedSha = null;
-        if (shouldMerge) {
-          try {
-            mergedSha = await checkpointMergeToMaster(ticket.id, {
-              title: ticket.title,
-              cwd: this.config.project_dir,
-              // 2026-04-28: ledgerPaths empty — backlog/build-log are
-              // gitignored, no pre-merge absorb required.
-              ledgerPaths: [],
-            });
-            if (mergedSha) {
-              this.emit('checkpoint_merged_to_master', { ticket: ticket.id, sha: mergedSha });
-              console.log(`[checkpoint] ${ticket.id}: squash-merged to master (${mergedSha.slice(0, 7)})`);
-            }
-          } catch (err) {
-            this.emit('ticket_merge_conflict', {
-              ticket: ticket.id,
-              code: err.code || 'UNKNOWN',
-              message: err.message,
-            });
-            console.error(`[checkpoint] ${ticket.id}: merge to master FAILED — ${err.message}`);
-            // Skip branch cleanup — operator needs the branch to resolve.
-            return;
-          }
-        }
-
-        if (!this.config.checkpoints.keep_branch_on_success) {
-          try {
-            // After a successful merge we're already on master; otherwise
-            // checkout defensively before deleting.
-            const currentBranch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
-            if (currentBranch !== 'master') {
-              execSync('git checkout master', { cwd: this.config.project_dir, stdio: 'pipe' });
-            }
-            await checkpointDeleteBranch(ticket.id, this.config.project_dir);
-            this.emit('checkpoint_branch_cleaned', { ticket: ticket.id });
-          } catch (err) {
-            console.warn(`[checkpoint] ${ticket.id}: cleanup failed — ${err.message}`);
-          }
+        // Drop the baseline tag — no longer needed once committed.
+        try {
+          cleanupBaseline(ticket.id, this.config.project_dir);
+        } catch (err) {
+          console.warn(`[checkpoint] ${ticket.id}: baseline cleanup failed — ${err.message}`);
         }
       }
     }
@@ -1964,21 +1934,11 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       });
 
       if (validation.pass) {
-        // META-001 Phase 3: snapshot the step's output to the ticket branch
-        // so a later step's failure can be rewound to this exact state.
-        if (this.config.checkpoints?.enabled) {
-          try {
-            const sha = await checkpointCommitStep(ticket.id, stepConfig.name, this.config.project_dir);
-            if (sha) {
-              this.emit('checkpoint_step_committed', { ticket: ticket.id, step: stepConfig.name, sha });
-            }
-          } catch (err) {
-            // Snapshot failure shouldn't block the step — log and continue.
-            // Worst case: a later revert can't find this step; it just walks
-            // further back or to the branch base.
-            console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: snapshot failed — ${err.message}`);
-          }
-        }
+        // 2026-04-28: per-step git commits removed. Steps' work product is
+        // just the working-tree edits (committed as one ticket commit at
+        // success, reverted to baseline tag on failure). Step boundaries
+        // exist in the state file (steps[X].status, run_id, attempts) — no
+        // longer in git history.
         return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
       // Remember the failures this attempt produced before deciding what to do next.
@@ -2023,7 +1983,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // Rewind to the previous snapshot so partial work doesn't leak.
         if (this.config.checkpoints?.enabled) {
           try {
-            await checkpointRevert(ticket.id, this.config.project_dir);
+            revertToBaseline(ticket.id, this.config.project_dir);
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
           } catch (err) {
             console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: revert failed — ${err.message}`);
@@ -2054,7 +2014,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // base (= master tip at ticket start).
         if (this.config.checkpoints?.enabled) {
           try {
-            await checkpointRevert(ticket.id, this.config.project_dir);
+            revertToBaseline(ticket.id, this.config.project_dir);
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
             console.log(`[checkpoint] ${ticket.id}/${stepConfig.name}: working tree reverted to last snapshot`);
           } catch (err) {

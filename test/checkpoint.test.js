@@ -1,19 +1,17 @@
-// Pipeline checkpoint — per-step git snapshot + rollback.
+// Baseline-tag rollback model (post 2026-04-28).
 // Tests run in isolated temp repos so we never touch the real project.
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  ensureBranch,
-  commitStepSnapshot,
-  revertToLastSnapshot,
-  deleteBranch,
-  listStepSnapshots,
-  mergeToMaster,
+  setupTicketBaseline,
+  revertToBaseline,
+  commitTicketAsOne,
+  cleanupBaseline,
   CheckpointError,
 } from '../src/checkpoint.js';
 
@@ -23,320 +21,191 @@ function git(args, opts = {}) {
   return execSync(`git ${args}`, { cwd: repoDir, encoding: 'utf-8', ...opts }).trim();
 }
 
-function setupRepo() {
-  repoDir = mkdtempSync(join(tmpdir(), 'pipeline-ckpt-'));
-  git('init --initial-branch=master');
-  git('config user.email "test@example.com"');
-  git('config user.name "Test"');
-  writeFileSync(join(repoDir, 'README.md'), '# initial\n');
-  git('add README.md');
-  git('commit -m "initial"');
-}
-
-beforeEach(() => setupRepo());
-afterEach(() => rmSync(repoDir, { recursive: true, force: true }));
-
-describe('ensureBranch', () => {
-  test('creates pipeline/{id} from master when none exists', async () => {
-    const result = await ensureBranch('TEST-1', repoDir);
-    assert.equal(result.branch, 'pipeline/TEST-1');
-    assert.equal(result.createdFromMaster, true);
-    assert.equal(git('rev-parse --abbrev-ref HEAD'), 'pipeline/TEST-1');
-  });
-
-  test('refuses when working tree has tracked modifications', async () => {
-    writeFileSync(join(repoDir, 'README.md'), '# dirty\n');
-    await assert.rejects(() => ensureBranch('TEST-2', repoDir), CheckpointError);
-    // Branch was not created
-    assert.throws(() => git('rev-parse pipeline/TEST-2'));
-  });
-
-  test('refuses when working tree has untracked files', async () => {
-    writeFileSync(join(repoDir, 'orphan.txt'), 'not-committed');
-    await assert.rejects(() => ensureBranch('TEST-3', repoDir), CheckpointError);
-  });
-
-  test('recovers existing stale branch by resetting to master tip', async () => {
-    // Simulate a crashed prior run that left a real pipeline step commit
-    // on the branch. Commit subject must match the [pipeline] {id} step-
-    // shape — anything else triggers STALE_BRANCH_HAS_COMMITS to protect
-    // operator commits (see test/branch-reset-safety.test.js).
-    git('checkout -b pipeline/TEST-4');
-    writeFileSync(join(repoDir, 'stale.txt'), 'left over');
-    git('add stale.txt');
-    git('commit -m "[pipeline] TEST-4 step-1-tests_red"');
-    git('checkout master');
-
-    const result = await ensureBranch('TEST-4', repoDir);
-    assert.equal(result.branch, 'pipeline/TEST-4');
-    assert.equal(result.recoveredFromExisting, true);
-    // Stale commit must be gone — the branch was reset to master's head.
-    assert.equal(git('rev-parse HEAD'), git('rev-parse master'));
-    // And the stale file is no longer on disk.
-    assert.equal(existsSync(join(repoDir, 'stale.txt')), false);
-  });
+beforeEach(() => {
+  repoDir = mkdtempSync(join(tmpdir(), 'pipeline-checkpoint-'));
+  execSync('git init -q -b master', { cwd: repoDir });
+  // Override every global git surface that could slow/block a commit:
+  //   - user.email/name: avoid prompt
+  //   - commit.gpgsign false: skip signing prompt
+  //   - core.hooksPath /dev/null: bypass the operator's global post-commit
+  //     hooks (e.g. ~/.git-hooks/post-commit triggering a code-review run).
+  //     Without this, each test commit waits ~20s on the review subprocess.
+  execSync(
+    'git config user.email t@t.t && git config user.name t && git config commit.gpgsign false && git config core.hooksPath /dev/null',
+    { cwd: repoDir },
+  );
+  writeFileSync(join(repoDir, 'init.txt'), 'init\n');
+  execSync('git add . && git commit -q -m init', { cwd: repoDir });
 });
 
-describe('commitStepSnapshot', () => {
-  test('stages and commits all changes; returns SHA; tags the commit', async () => {
-    await ensureBranch('TEST-5', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'alpha');
-    writeFileSync(join(repoDir, 'b.txt'), 'beta');
-
-    const sha = await commitStepSnapshot('TEST-5', 'plan', repoDir);
-    assert.match(sha, /^[0-9a-f]{40}$/);
-    // Commit message contains step name
-    const msg = git(`log -1 --format=%B ${sha}`);
-    assert.match(msg, /plan/);
-    // Both files committed
-    const tree = git(`show --stat ${sha} --format=`);
-    assert.match(tree, /a\.txt/);
-    assert.match(tree, /b\.txt/);
-    // Tag exists
-    assert.equal(git(`tag -l pipeline/TEST-5/step-1-plan`), 'pipeline/TEST-5/step-1-plan');
-  });
-
-  test('returns null when no changes to commit (step was a no-op)', async () => {
-    await ensureBranch('TEST-6', repoDir);
-    const sha = await commitStepSnapshot('TEST-6', 'plan', repoDir);
-    assert.equal(sha, null);
-  });
-
-  test('increments step index across successive commits', async () => {
-    await ensureBranch('TEST-7', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a');
-    await commitStepSnapshot('TEST-7', 'plan', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a-modified');
-    await commitStepSnapshot('TEST-7', 'implement', repoDir);
-
-    assert.ok(git('tag -l pipeline/TEST-7/step-1-plan'));
-    assert.ok(git('tag -l pipeline/TEST-7/step-2-implement'));
-  });
+afterEach(() => {
+  rmSync(repoDir, { recursive: true, force: true });
 });
 
-describe('revertToLastSnapshot', () => {
-  test('resets working tree to the last step snapshot', async () => {
-    await ensureBranch('TEST-8', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'step1');
-    await commitStepSnapshot('TEST-8', 'plan', repoDir);
-    // Simulate a failing step that wrote garbage
-    writeFileSync(join(repoDir, 'a.txt'), 'step2-garbage');
-    writeFileSync(join(repoDir, 'new-orphan.txt'), 'also-garbage');
-
-    await revertToLastSnapshot('TEST-8', repoDir);
-
-    assert.equal(readFileSync(join(repoDir, 'a.txt'), 'utf-8'), 'step1');
-    assert.equal(existsSync(join(repoDir, 'new-orphan.txt')), false);
-    // History is intact — plan snapshot still tagged
-    assert.ok(git('tag -l pipeline/TEST-8/step-1-plan'));
+describe('setupTicketBaseline', () => {
+  test('tags HEAD as the baseline and returns the tag + sha', () => {
+    const headSha = git('rev-parse HEAD');
+    const res = setupTicketBaseline('T-X', repoDir);
+    assert.equal(res.baselineTag, 'pipeline/T-X/baseline');
+    assert.equal(res.baselineSha, headSha);
+    // Tag exists.
+    assert.equal(git(`rev-parse pipeline/T-X/baseline`), headSha);
   });
 
-  test('resets to branch base when no step snapshots exist', async () => {
-    await ensureBranch('TEST-9', repoDir);
-    writeFileSync(join(repoDir, 'orphan.txt'), 'garbage');
-
-    await revertToLastSnapshot('TEST-9', repoDir);
-
-    assert.equal(existsSync(join(repoDir, 'orphan.txt')), false);
-    assert.equal(git('rev-parse HEAD'), git('rev-parse master'));
-  });
-});
-
-describe('deleteBranch', () => {
-  test('removes the pipeline branch and all its step tags', async () => {
-    await ensureBranch('TEST-10', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a');
-    await commitStepSnapshot('TEST-10', 'plan', repoDir);
-    // Need to be on another branch to delete the current one
-    git('checkout master');
-
-    await deleteBranch('TEST-10', repoDir);
-
-    assert.throws(() => git('rev-parse pipeline/TEST-10'));
-    assert.equal(git('tag -l pipeline/TEST-10/step-1-plan'), '');
-  });
-
-  test('no-op when branch does not exist', async () => {
-    // Should not throw
-    await deleteBranch('TEST-11-nonexistent', repoDir);
-  });
-});
-
-describe('listStepSnapshots', () => {
-  test('returns step tags in order for a ticket', async () => {
-    await ensureBranch('TEST-12', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a');
-    await commitStepSnapshot('TEST-12', 'plan', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'aa');
-    await commitStepSnapshot('TEST-12', 'tests_red', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'aaa');
-    await commitStepSnapshot('TEST-12', 'implement', repoDir);
-
-    const snapshots = await listStepSnapshots('TEST-12', repoDir);
-    assert.deepEqual(
-      snapshots.map((s) => s.step),
-      ['plan', 'tests_red', 'implement'],
-    );
-    assert.deepEqual(
-      snapshots.map((s) => s.index),
-      [1, 2, 3],
-    );
-  });
-
-  test('returns empty array when ticket has no snapshots', async () => {
-    const snapshots = await listStepSnapshots('TEST-13-no-work', repoDir);
-    assert.deepEqual(snapshots, []);
-  });
-});
-
-describe('mergeToMaster', () => {
-  test('squashes all step commits into one commit on master', async () => {
-    await ensureBranch('TEST-14', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'alpha');
-    await commitStepSnapshot('TEST-14', 'plan', repoDir);
-    writeFileSync(join(repoDir, 'b.txt'), 'beta');
-    await commitStepSnapshot('TEST-14', 'implement', repoDir);
-
-    const masterBeforeSha = git('rev-parse master');
-    const sha = await mergeToMaster('TEST-14', { title: 'Test ticket', cwd: repoDir });
-
-    assert.match(sha, /^[0-9a-f]{40}$/);
-    assert.equal(git('rev-parse --abbrev-ref HEAD'), 'master');
-    assert.notEqual(git('rev-parse master'), masterBeforeSha);
-    // Master advanced by exactly one commit
-    const masterLog = git('log master --format=%H').split('\n');
-    const beforeLog = git(`log ${masterBeforeSha} --format=%H`).split('\n');
-    assert.equal(masterLog.length, beforeLog.length + 1);
-    // Both files landed in the squash
-    assert.equal(readFileSync(join(repoDir, 'a.txt'), 'utf-8'), 'alpha');
-    assert.equal(readFileSync(join(repoDir, 'b.txt'), 'utf-8'), 'beta');
-  });
-
-  test('commit message contains ticket id, title, and step tag list', async () => {
-    await ensureBranch('TEST-15', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a');
-    await commitStepSnapshot('TEST-15', 'plan', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'aa');
-    await commitStepSnapshot('TEST-15', 'implement', repoDir);
-
-    await mergeToMaster('TEST-15', { title: 'Some ticket title', cwd: repoDir });
-
-    const msg = git('log master -1 --format=%B');
-    assert.match(msg, /TEST-15/);
-    assert.match(msg, /Some ticket title/);
-    assert.match(msg, /plan/);
-    assert.match(msg, /implement/);
-  });
-
-  test('returns null when branch has no commits beyond master', async () => {
-    await ensureBranch('TEST-16', repoDir);
-    // No commitStepSnapshot calls — branch tip == master tip.
-    const masterBefore = git('rev-parse master');
-    const sha = await mergeToMaster('TEST-16', { title: 'Empty', cwd: repoDir });
-
-    assert.equal(sha, null);
-    assert.equal(git('rev-parse master'), masterBefore);
-    assert.equal(git('rev-parse --abbrev-ref HEAD'), 'master');
-  });
-
-  test('aborts cleanly on conflict; master unchanged; working tree clean', async () => {
-    await ensureBranch('TEST-17', repoDir);
-    writeFileSync(join(repoDir, 'README.md'), 'branch-version\n');
-    await commitStepSnapshot('TEST-17', 'implement', repoDir);
-
-    // Move master forward with a conflicting edit
-    git('checkout master');
-    writeFileSync(join(repoDir, 'README.md'), 'master-version\n');
-    git('add README.md');
-    git('commit -m "master conflicting edit"');
-    const masterAfterConflict = git('rev-parse master');
-
-    await assert.rejects(
-      () => mergeToMaster('TEST-17', { title: 'Conflict case', cwd: repoDir }),
-      (err) => err instanceof CheckpointError && err.code === 'MERGE_CONFLICT',
-    );
-
-    // Master tip unchanged (abort worked)
-    assert.equal(git('rev-parse master'), masterAfterConflict);
-    // Working tree clean — not stuck in a half-merge
-    assert.equal(git('status --porcelain'), '');
-    // Ticket branch preserved for manual resolution
-    assert.ok(git('rev-parse pipeline/TEST-17'));
-  });
-
-  test('refuses when master has uncommitted local changes', async () => {
-    await ensureBranch('TEST-18', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'branch-work');
-    await commitStepSnapshot('TEST-18', 'implement', repoDir);
-
-    git('checkout master');
-    writeFileSync(join(repoDir, 'README.md'), 'uncommitted-local-change\n');
-
-    await assert.rejects(
-      () => mergeToMaster('TEST-18', { title: 'Dirty master', cwd: repoDir }),
+  test('refuses with DIRTY_TREE when working tree has tracked modifications', () => {
+    writeFileSync(join(repoDir, 'init.txt'), 'changed\n');
+    assert.throws(
+      () => setupTicketBaseline('T-Y', repoDir),
       (err) => err instanceof CheckpointError && err.code === 'DIRTY_TREE',
     );
   });
 
-  test('full lifecycle: merge then delete branch leaves master with squashed commit and no ticket branch', async () => {
-    await ensureBranch('TEST-19', repoDir);
-    writeFileSync(join(repoDir, 'a.txt'), 'a');
-    await commitStepSnapshot('TEST-19', 'plan', repoDir);
-
-    const masterBefore = git('rev-parse master');
-    await mergeToMaster('TEST-19', { title: 'Lifecycle', cwd: repoDir });
-    await deleteBranch('TEST-19', repoDir);
-
-    assert.notEqual(git('rev-parse master'), masterBefore);
-    assert.throws(() => git('rev-parse pipeline/TEST-19'));
-    assert.equal(git('tag -l "pipeline/TEST-19/*"'), '');
+  test('refuses with DIRTY_TREE on untracked tracked-shape files', () => {
+    writeFileSync(join(repoDir, 'new.txt'), 'untracked\n');
+    assert.throws(
+      () => setupTicketBaseline('T-Z', repoDir),
+      (err) => err instanceof CheckpointError && err.code === 'DIRTY_TREE',
+    );
   });
 
-  test('pipeline-metadata snapshot prevents stranded branch on merge-to-master', async () => {
-    // Regression for the 2026-04-21 pattern: pipeline writes to tracked
-    // metadata files (memory/build-log/usage.jsonl, build-log/YYYY-MM-DD.md)
-    // AFTER the last step snapshot but BEFORE mergeToMaster. Without a
-    // catch-all snapshot those writes carry over to master on checkout and
-    // refuse the merge with DIRTY_TREE. With the snapshot, the merge sees
-    // a clean master and bundles everything into ONE ticket commit.
-    //
-    // Seed a tracked "metadata" file on master so writes to it behave the
-    // same way pipeline.log / build-log writes do in production.
-    writeFileSync(join(repoDir, 'metadata.log'), 'initial\n');
-    git('add metadata.log');
-    git('commit -m "seed metadata"');
+  test('idempotent: rerunning replaces the baseline tag at current HEAD', () => {
+    setupTicketBaseline('T-X', repoDir);
+    // Make a new commit, advancing HEAD.
+    writeFileSync(join(repoDir, 'second.txt'), 'second\n');
+    execSync('git add . && git commit -q -m second', { cwd: repoDir });
+    const newHead = git('rev-parse HEAD');
+    const res = setupTicketBaseline('T-X', repoDir);
+    assert.equal(res.baselineSha, newHead, 'tag should follow HEAD on rerun');
+  });
+});
 
-    await ensureBranch('TEST-20', repoDir);
-    writeFileSync(join(repoDir, 'code.txt'), 'real work\n');
-    await commitStepSnapshot('TEST-20', 'implement', repoDir);
-
-    // Simulate the pipeline-owned post-loop write (appendUsageLog).
-    writeFileSync(join(repoDir, 'metadata.log'), 'initial\nticket TEST-20 ran\n');
-
-    // Without the pipeline-metadata snapshot, mergeToMaster would refuse here.
-    // With it, the write lands on the ticket branch first and merge proceeds.
-    const metaSha = await commitStepSnapshot('TEST-20', 'pipeline-metadata', repoDir);
-    assert.ok(metaSha, 'expected pipeline-metadata snapshot to be created');
-
-    const mergedSha = await mergeToMaster('TEST-20', { title: 'Stranded fix', cwd: repoDir });
-    assert.ok(mergedSha, 'merge should succeed after metadata snapshot');
-
-    // Master should now contain BOTH the code change and the metadata write.
-    const masterContent = readFileSync(join(repoDir, 'metadata.log'), 'utf-8');
-    assert.match(masterContent, /ticket TEST-20 ran/);
-    const codeContent = readFileSync(join(repoDir, 'code.txt'), 'utf-8');
-    assert.match(codeContent, /real work/);
+describe('revertToBaseline', () => {
+  test('restores working tree to baseline state and removes worker edits', () => {
+    setupTicketBaseline('T-X', repoDir);
+    writeFileSync(join(repoDir, 'worker-output.txt'), 'worker wrote this\n');
+    writeFileSync(join(repoDir, 'init.txt'), 'modified by worker\n');
+    revertToBaseline('T-X', repoDir);
+    // Modified file restored.
+    assert.equal(execSync('cat init.txt', { cwd: repoDir, encoding: 'utf-8' }), 'init\n');
+    // Untracked worker file removed.
+    assert.equal(existsSync(join(repoDir, 'worker-output.txt')), false);
   });
 
-  test('pipeline-metadata snapshot is a no-op when nothing is dirty', async () => {
-    // Clean path: no post-loop writes between last step and merge. The
-    // snapshot should return null so the caller doesn't emit a spurious
-    // checkpoint_step_committed event.
-    await ensureBranch('TEST-21', repoDir);
-    writeFileSync(join(repoDir, 'x.txt'), 'x');
-    await commitStepSnapshot('TEST-21', 'implement', repoDir);
+  test('preserves gitignored files (no -x flag on clean)', () => {
+    writeFileSync(join(repoDir, '.gitignore'), 'local-state.json\n');
+    execSync('git add . && git commit -q -m gitignore', { cwd: repoDir });
+    setupTicketBaseline('T-X', repoDir);
+    // Operator's gitignored file written before/during pipeline run.
+    writeFileSync(join(repoDir, 'local-state.json'), '{"x":1}\n');
+    revertToBaseline('T-X', repoDir);
+    // Ignored file survives — what the operator's parallel session needs.
+    assert.equal(existsSync(join(repoDir, 'local-state.json')), true);
+  });
 
-    const metaSha = await commitStepSnapshot('TEST-21', 'pipeline-metadata', repoDir);
-    assert.equal(metaSha, null, 'no-op expected when nothing is dirty');
+  test('throws NO_BASELINE when no baseline tag exists', () => {
+    assert.throws(
+      () => revertToBaseline('NEVER-SET-UP', repoDir),
+      (err) => err instanceof CheckpointError && err.code === 'NO_BASELINE',
+    );
+  });
+
+  test('idempotent: can be called twice in a row', () => {
+    setupTicketBaseline('T-X', repoDir);
+    writeFileSync(join(repoDir, 'init.txt'), 'edited\n');
+    revertToBaseline('T-X', repoDir);
+    revertToBaseline('T-X', repoDir);
+    assert.equal(execSync('cat init.txt', { cwd: repoDir, encoding: 'utf-8' }), 'init\n');
+  });
+});
+
+describe('commitTicketAsOne', () => {
+  test('commits all working-tree changes with [ticket] subject', () => {
+    setupTicketBaseline('T-X', repoDir);
+    writeFileSync(join(repoDir, 'a.dart'), 'class A {}\n');
+    writeFileSync(join(repoDir, 'b.dart'), 'class B {}\n');
+    const sha = commitTicketAsOne('T-X', 'Add A and B', repoDir);
+    assert.match(sha, /^[0-9a-f]{40}$/);
+    const subject = git('log -1 --pretty=%s');
+    assert.equal(subject, '[T-X] Add A and B');
+    const fileList = git('show --name-only --pretty= HEAD').trim().split('\n').sort();
+    assert.deepEqual(fileList, ['a.dart', 'b.dart']);
+  });
+
+  test('returns null when working tree has no diff', () => {
+    setupTicketBaseline('T-X', repoDir);
+    const sha = commitTicketAsOne('T-X', 'Empty ticket', repoDir);
+    assert.equal(sha, null);
+  });
+
+  test('handles ticket titles with shell-special characters', () => {
+    setupTicketBaseline('T-X', repoDir);
+    writeFileSync(join(repoDir, 'a.dart'), 'class A {}\n');
+    const sha = commitTicketAsOne('T-X', 'Fix `bash` "quotes" + $vars', repoDir);
+    assert.ok(sha);
+    const subject = git('log -1 --pretty=%s');
+    assert.equal(subject, '[T-X] Fix `bash` "quotes" + $vars');
+  });
+
+  test('truncates very long titles to 72 chars', () => {
+    setupTicketBaseline('T-X', repoDir);
+    writeFileSync(join(repoDir, 'a.dart'), 'class A {}\n');
+    const longTitle = 'A'.repeat(200);
+    commitTicketAsOne('T-X', longTitle, repoDir);
+    const subject = git('log -1 --pretty=%s');
+    // [T-X] + space + 72 A's
+    assert.equal(subject, `[T-X] ${'A'.repeat(72)}`);
+  });
+});
+
+describe('cleanupBaseline', () => {
+  test('removes the baseline tag', () => {
+    setupTicketBaseline('T-X', repoDir);
+    cleanupBaseline('T-X', repoDir);
+    const exists = execSync(`git tag -l pipeline/T-X/baseline`, { cwd: repoDir, encoding: 'utf-8' }).trim();
+    assert.equal(exists, '');
+  });
+
+  test('idempotent — no error if tag already missing', () => {
+    cleanupBaseline('NEVER-SET-UP', repoDir);
+    // No throw.
+  });
+});
+
+describe('end-to-end happy path', () => {
+  test('setup → edit → commit → cleanup', () => {
+    const baselineSha = git('rev-parse HEAD');
+    const res = setupTicketBaseline('T-FLOW', repoDir);
+    assert.equal(res.baselineSha, baselineSha);
+
+    writeFileSync(join(repoDir, 'feature.dart'), 'feature code\n');
+    writeFileSync(join(repoDir, 'feature_test.dart'), 'feature test\n');
+
+    const ticketSha = commitTicketAsOne('T-FLOW', 'Add feature', repoDir);
+    assert.match(ticketSha, /^[0-9a-f]{40}$/);
+
+    cleanupBaseline('T-FLOW', repoDir);
+
+    // Master has one new commit; baseline tag is gone.
+    assert.equal(git('rev-parse HEAD'), ticketSha);
+    assert.notEqual(ticketSha, baselineSha);
+    assert.equal(execSync('git tag -l pipeline/T-FLOW/baseline', { cwd: repoDir, encoding: 'utf-8' }).trim(), '');
+  });
+});
+
+describe('end-to-end failure path', () => {
+  test('setup → edit → revert restores master tip exactly', () => {
+    const baselineSha = git('rev-parse HEAD');
+    setupTicketBaseline('T-FAIL', repoDir);
+
+    writeFileSync(join(repoDir, 'broken.dart'), 'syntax error\n');
+    writeFileSync(join(repoDir, 'init.txt'), 'corrupted\n');
+
+    revertToBaseline('T-FAIL', repoDir);
+    cleanupBaseline('T-FAIL', repoDir);
+
+    // Tree is back to baseline state.
+    assert.equal(git('rev-parse HEAD'), baselineSha);
+    assert.equal(existsSync(join(repoDir, 'broken.dart')), false);
+    assert.equal(execSync('cat init.txt', { cwd: repoDir, encoding: 'utf-8' }), 'init\n');
   });
 });
