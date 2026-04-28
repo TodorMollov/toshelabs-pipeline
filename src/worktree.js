@@ -19,7 +19,7 @@
 // runs against the same worktree dir will race; the orchestrator's
 // per-project lock is what serializes them.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 export class WorktreeError extends Error {
@@ -89,8 +89,11 @@ function isRegisteredWorktreeFor(masterDir, worktreeDir, branchName) {
 }
 
 function samePath(a, b) {
-  // Trailing-slash and trivial normalization tolerance.
-  return a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
+  const norm = (p) => {
+    try { return realpathSync(p).replace(/\/+$/, ''); }
+    catch { return p.replace(/\r$/, '').replace(/\/+$/, ''); }
+  };
+  return norm(a) === norm(b);
 }
 
 // Idempotent: creates the worktree the first time and is a no-op every
@@ -119,12 +122,16 @@ export function ensureWorktree(masterDir, worktreeDir, branchName) {
 // a clean copy of the default branch, regardless of what the prior run
 // left behind.
 //
-// `git clean -fdx` (with -x) removes gitignored caches too, so a prior
-// ticket's build artifacts don't leak in. The default branch in the
-// primary checkout is the source of truth.
+// `git clean -fd` removes untracked-but-not-gitignored files only —
+// gitignored build caches (node_modules, .dart_tool, target/) survive
+// across tickets. A per-ticket `flutter pub get` or `npm install` is
+// expensive enough that we deliberately keep them. Stale caches that
+// matter (lockfile mismatches) are caught by the manifest-changed
+// dependency-sync hook in pipeline.js.
 export function prepareWorktreeForTicket(worktreeDir, defaultBranch) {
+  if (!defaultBranch) throw new WorktreeError('defaultBranch is required', { code: 'BAD_ARG' });
   git(['reset', '--hard', defaultBranch], worktreeDir);
-  git(['clean', '-fdx'], worktreeDir);
+  git(['clean', '-fd'], worktreeDir);
 }
 
 // Attempt to cherry-pick a single commit from the worktree's branch
@@ -141,6 +148,8 @@ export function prepareWorktreeForTicket(worktreeDir, defaultBranch) {
 // side branch in the worktree so the operator can manually cherry-pick
 // it later.
 export function cherryPickToMaster(masterDir, sha, defaultBranch) {
+  if (!defaultBranch) throw new WorktreeError('defaultBranch is required', { code: 'BAD_ARG' });
+  if (!sha) throw new WorktreeError('sha is required', { code: 'BAD_ARG' });
   // Refuse if HEAD isn't pointed at the default branch — we'd silently
   // land the ticket commit on whatever branch the operator happens to
   // be on, which is the opposite of what the function name promises.
@@ -160,51 +169,47 @@ export function cherryPickToMaster(masterDir, sha, defaultBranch) {
   }
   let cherryErr = null;
   try {
-    execFileSync('git', ['cherry-pick', sha], {
+    // -- separator guards against a sha that begins with `-` being
+    // parsed as a flag.
+    execFileSync('git', ['cherry-pick', '--', sha], {
       cwd: masterDir,
       encoding: 'utf-8',
       maxBuffer: MAX_BUFFER,
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
     });
     const headSha = git(['rev-parse', 'HEAD'], masterDir);
     return { ok: true, headSha };
   } catch (err) {
     cherryErr = err;
   }
-  {
-    // Distinguish empty/no-op from real conflicts. cherry-pick prints
-    // "previous cherry-pick is now empty" to stdout (not stderr) when
-    // the commit's diff is already in master, so check both streams.
-    const stderr = cherryErr.stderr?.toString?.() ?? '';
-    const stdout = cherryErr.stdout?.toString?.() ?? '';
-    const combined = `${stdout}\n${stderr}` || cherryErr.message || '';
-    const isEmpty = /nothing to commit|now empty|--allow-empty/i.test(combined);
-    // Always try to abort so the tree never lingers in a half-merged
-    // state. Track abort failure separately — it's a different class
-    // of failure from a normal conflict.
-    const abortRes = git(['cherry-pick', '--abort'], masterDir, { tolerateFailure: true });
-    if (abortRes === null) {
-      return {
-        ok: false,
-        code: 'ROLLBACK_FAILED',
-        message: stderr.trim().slice(0, 500),
-      };
-    }
-    if (isEmpty) {
-      return { ok: false, code: 'EMPTY', message: stderr.trim().slice(0, 500) };
-    }
-    return {
-      ok: false,
-      code: 'CONFLICT',
-      files: listConflictFilesAfterAbort(masterDir, sha),
-      message: stderr.trim().slice(0, 500),
-    };
+  // Capture conflict files *before* abort; after abort the unmerged
+  // markers are gone. If cherry-pick left no CHERRY_PICK_HEAD it means
+  // git decided the patch was empty/no-op (default `cherry.empty=stop`)
+  // — treat that as EMPTY rather than CONFLICT. This is more robust
+  // than scraping prose from stderr/stdout, which is locale-dependent.
+  const cherryHead = git(['rev-parse', '--verify', 'CHERRY_PICK_HEAD'], masterDir, { tolerateFailure: true });
+  const conflictFiles = cherryHead
+    ? (git(['diff', '--name-only', '--diff-filter=U'], masterDir, { tolerateFailure: true }) || '')
+        .split('\n').map((s) => s.trim()).filter(Boolean)
+    : [];
+  // Status v2 shows the staged-but-no-diff state of an empty cherry-pick.
+  const statusV2 = git(['status', '--porcelain=v2'], masterDir, { tolerateFailure: true }) || '';
+  const isEmpty = !!cherryHead && conflictFiles.length === 0 && statusV2.length === 0;
+  // Always try to abort so the tree never lingers in a half-merged
+  // state. ROLLBACK_FAILED if the abort itself fails — distinct from a
+  // normal conflict.
+  const abortRes = git(['cherry-pick', '--abort'], masterDir, { tolerateFailure: true });
+  const stderr = (cherryErr.stderr?.toString?.() ?? '').slice(0, 500);
+  if (cherryHead && abortRes === null) {
+    return { ok: false, code: 'ROLLBACK_FAILED', message: stderr };
   }
-}
-
-// After abort, the conflict files are no longer marked as such — but
-// we can recover the list by diffing the source commit against HEAD.
-function listConflictFilesAfterAbort(masterDir, sha) {
-  const out = git(['show', '--name-only', '--pretty=format:', sha], masterDir, { tolerateFailure: true });
-  if (!out) return [];
-  return out.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (isEmpty) {
+    return { ok: false, code: 'EMPTY', message: stderr };
+  }
+  return {
+    ok: false,
+    code: 'CONFLICT',
+    files: conflictFiles,
+    message: stderr,
+  };
 }
