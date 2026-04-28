@@ -6,7 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync, existsSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ensureWorktree, prepareWorktreeForTicket, cherryPickToMaster } from '../src/worktree.js';
+import { ensureWorktree, prepareWorktreeForTicket, cherryPickToMaster, resolveDefaultBranch } from '../src/worktree.js';
 
 function git(cmd, cwd) {
   return execSync(`git ${cmd}`, { cwd, encoding: 'utf-8' }).trim();
@@ -23,6 +23,30 @@ function makeRepo() {
   execSync('git add . && git commit -q -m init', { cwd: dir });
   return dir;
 }
+
+describe('resolveDefaultBranch', () => {
+  test('returns master when present', () => {
+    const repo = makeRepo();
+    try {
+      assert.equal(resolveDefaultBranch(repo), 'master');
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('falls back to main when only main exists', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'wt-main-'));
+    try {
+      execSync('git init -q -b main', { cwd: dir });
+      execSync('git config user.email t@t.t && git config user.name t && git config commit.gpgsign false && git config core.hooksPath /dev/null', { cwd: dir });
+      writeFileSync(join(dir, 'a.txt'), 'a\n');
+      execSync('git add . && git commit -q -m init', { cwd: dir });
+      assert.equal(resolveDefaultBranch(dir), 'main');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('ensureWorktree', () => {
   test('creates worktree on first call, no-ops on second', () => {
@@ -78,7 +102,7 @@ describe('prepareWorktreeForTicket', () => {
       writeFileSync(join(wtDir, 'README.md'), 'corrupted\n');
       writeFileSync(join(wtDir, 'orphan.txt'), 'leftover\n');
 
-      prepareWorktreeForTicket(wtDir);
+      prepareWorktreeForTicket(wtDir, 'master');
 
       // README is back to master content
       assert.equal(readFileSync(join(wtDir, 'README.md'), 'utf-8'), 'hello\n');
@@ -105,7 +129,7 @@ describe('prepareWorktreeForTicket', () => {
 
       // Worktree was at the original master sha — after prepare it sees op.txt
       assert.ok(!existsSync(join(wtDir, 'op.txt')), 'op.txt not in worktree yet');
-      prepareWorktreeForTicket(wtDir);
+      prepareWorktreeForTicket(wtDir, 'master');
       assert.equal(readFileSync(join(wtDir, 'op.txt'), 'utf-8'), 'op-edit\n');
     } finally {
       rmSync(master, { recursive: true, force: true });
@@ -121,16 +145,16 @@ describe('cherryPickToMaster', () => {
     const wtDir = join(wtParent, 'wt');
     try {
       ensureWorktree(master, wtDir, 'pipeline/wt-test');
-      prepareWorktreeForTicket(wtDir);
+      prepareWorktreeForTicket(wtDir, 'master');
 
       // Worker makes a change in the worktree and commits on side branch
       writeFileSync(join(wtDir, 'feature.txt'), 'new-feature\n');
       execSync('git add . && git commit -q -m "[T-X] feature"', { cwd: wtDir });
       const sha = git('rev-parse HEAD', wtDir);
 
-      const result = cherryPickToMaster(master, sha);
+      const result = cherryPickToMaster(master, sha, 'master');
       assert.equal(result.ok, true);
-      assert.ok(result.sha);
+      assert.ok(result.headSha);
 
       // master in the primary checkout now has the file
       assert.equal(readFileSync(join(master, 'feature.txt'), 'utf-8'), 'new-feature\n');
@@ -147,7 +171,7 @@ describe('cherryPickToMaster', () => {
     const wtDir = join(wtParent, 'wt');
     try {
       ensureWorktree(master, wtDir, 'pipeline/wt-test');
-      prepareWorktreeForTicket(wtDir);
+      prepareWorktreeForTicket(wtDir, 'master');
       writeFileSync(join(wtDir, 'feature.txt'), 'new-feature\n');
       execSync('git add . && git commit -q -m "[T-X] feature"', { cwd: wtDir });
       const sha = git('rev-parse HEAD', wtDir);
@@ -155,7 +179,7 @@ describe('cherryPickToMaster', () => {
       // Operator has uncommitted WIP in the primary checkout
       writeFileSync(join(master, 'README.md'), 'operator WIP\n');
 
-      const result = cherryPickToMaster(master, sha);
+      const result = cherryPickToMaster(master, sha, 'master');
       assert.equal(result.ok, false);
       assert.equal(result.code, 'DIRTY');
 
@@ -168,13 +192,63 @@ describe('cherryPickToMaster', () => {
     }
   });
 
+  test('refuses when primary checkout is on a non-default branch', () => {
+    const master = makeRepo();
+    const wtParent = mkdtempSync(join(tmpdir(), 'wt-parent-'));
+    const wtDir = join(wtParent, 'wt');
+    try {
+      ensureWorktree(master, wtDir, 'pipeline/wt-test');
+      prepareWorktreeForTicket(wtDir, 'master');
+      writeFileSync(join(wtDir, 'feature.txt'), 'new-feature\n');
+      execSync('git add . && git commit -q -m "[T-X] feature"', { cwd: wtDir });
+      const sha = git('rev-parse HEAD', wtDir);
+
+      // Operator switches to a feature branch in primary checkout.
+      execSync('git checkout -q -b op-feature', { cwd: master });
+
+      const result = cherryPickToMaster(master, sha, 'master');
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'WRONG_BRANCH');
+      assert.equal(result.head, 'op-feature');
+    } finally {
+      rmSync(master, { recursive: true, force: true });
+      rmSync(wtParent, { recursive: true, force: true });
+    }
+  });
+
+  test('reports EMPTY when commit is already in master', () => {
+    const master = makeRepo();
+    const wtParent = mkdtempSync(join(tmpdir(), 'wt-parent-'));
+    const wtDir = join(wtParent, 'wt');
+    try {
+      ensureWorktree(master, wtDir, 'pipeline/wt-test');
+      prepareWorktreeForTicket(wtDir, 'master');
+      writeFileSync(join(wtDir, 'feature.txt'), 'new-feature\n');
+      execSync('git add . && git commit -q -m "[T-X] feature"', { cwd: wtDir });
+      const sha = git('rev-parse HEAD', wtDir);
+
+      // Operator independently makes the same change on master.
+      writeFileSync(join(master, 'feature.txt'), 'new-feature\n');
+      execSync('git add . && git commit -q -m "operator: same change"', { cwd: master });
+
+      const result = cherryPickToMaster(master, sha, 'master');
+      assert.equal(result.ok, false);
+      assert.equal(result.code, 'EMPTY');
+      // Master has not advanced past the operator commit.
+      assert.match(git('log -1 --pretty=%s', master), /operator: same change/);
+    } finally {
+      rmSync(master, { recursive: true, force: true });
+      rmSync(wtParent, { recursive: true, force: true });
+    }
+  });
+
   test('aborts on conflict and leaves master unchanged', () => {
     const master = makeRepo();
     const wtParent = mkdtempSync(join(tmpdir(), 'wt-parent-'));
     const wtDir = join(wtParent, 'wt');
     try {
       ensureWorktree(master, wtDir, 'pipeline/wt-test');
-      prepareWorktreeForTicket(wtDir);
+      prepareWorktreeForTicket(wtDir, 'master');
 
       // Worker edits README.md in the worktree and commits.
       writeFileSync(join(wtDir, 'README.md'), 'worker version\n');
@@ -186,7 +260,7 @@ describe('cherryPickToMaster', () => {
       execSync('git add . && git commit -q -m "operator readme"', { cwd: master });
       const masterShaBefore = git('rev-parse HEAD', master);
 
-      const result = cherryPickToMaster(master, sha);
+      const result = cherryPickToMaster(master, sha, 'master');
       assert.equal(result.ok, false);
       assert.equal(result.code, 'CONFLICT');
       assert.ok(result.files.includes('README.md'), 'conflict files reported');
