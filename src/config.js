@@ -1,27 +1,42 @@
 import { readFile } from 'fs/promises';
 import { parse as parseYaml } from 'yaml';
-import { resolve } from 'path';
+import { resolve, dirname } from 'path';
+
+// Pipeline working data ({tickets-state, worker-output, build-log}) lives
+// under {pipelineHome}/projects/{config.name}/ — never inside the project
+// being worked on. Pre-2026-04-28 these paths were relative to project_dir
+// and polluted the project repo with pipeline-only state files. Now they
+// follow the pipeline binary.
+function resolveAll(absConfigPath, config) {
+  const projectDir = config.project_dir;
+  const pipelineHome = dirname(absConfigPath);
+  const projectName = config.name || 'default';
+  const projectWorkDir = resolve(pipelineHome, 'projects', projectName);
+  return {
+    configPath: absConfigPath,
+    pipelineHome,
+    projectWorkDir,
+    // Project-owned (still resolved against the project being worked on).
+    backlog: resolve(projectDir, config.backlog_file),
+    archive: resolve(projectDir, config.archive_file),
+    closedBugs: resolve(projectDir, config.closed_bugs_file),
+    validationRules: resolve(projectDir, config.validation_rules),
+    codeLock: resolve(projectDir, config.code_lock),
+    contextFiles: (config.context_files || []).map((f) => resolve(projectDir, f)),
+    // Pipeline-owned working data — under projectWorkDir, NOT in the
+    // project being worked on. Operator never sees these in `git status`
+    // because they're outside the project repo entirely.
+    pipelineDir: resolve(projectWorkDir, 'pipeline-state'),
+    workerOutputDir: resolve(projectWorkDir, 'worker-output'),
+    buildLogDir: resolve(projectWorkDir, 'build-log'),
+  };
+}
 
 export async function loadConfig(configPath) {
   const absPath = resolve(configPath);
   const raw = await readFile(absPath, 'utf-8');
   const config = parseYaml(raw);
-
-  // Resolve paths relative to project_dir
-  const dir = config.project_dir;
-  config._resolved = {
-    configPath: absPath,
-    backlog: resolve(dir, config.backlog_file),
-    archive: resolve(dir, config.archive_file),
-    closedBugs: resolve(dir, config.closed_bugs_file),
-    validationRules: resolve(dir, config.validation_rules),
-    pipelineDir: resolve(dir, config.pipeline_dir),
-    workerOutputDir: resolve(dir, config.worker_output_dir || '.pipeline-worker-out'),
-    buildLogDir: resolve(dir, config.build_log_dir),
-    codeLock: resolve(dir, config.code_lock),
-    contextFiles: config.context_files.map((f) => resolve(dir, f)),
-  };
-
+  config._resolved = resolveAll(absPath, config);
   return config;
 }
 
@@ -32,22 +47,10 @@ export async function loadConfig(configPath) {
 // Returns the updated config (same reference as input), or null on error.
 export async function reloadConfig(config) {
   if (!config?._resolved?.configPath) return null;
-  const raw = await readFile(config._resolved.configPath, 'utf-8');
+  const absPath = config._resolved.configPath;
+  const raw = await readFile(absPath, 'utf-8');
   const next = parseYaml(raw);
-  // Preserve _resolved since its entries are re-derived below.
-  const dir = next.project_dir;
-  next._resolved = {
-    configPath: config._resolved.configPath,
-    backlog: resolve(dir, next.backlog_file),
-    archive: resolve(dir, next.archive_file),
-    closedBugs: resolve(dir, next.closed_bugs_file),
-    validationRules: resolve(dir, next.validation_rules),
-    pipelineDir: resolve(dir, next.pipeline_dir),
-    workerOutputDir: resolve(dir, next.worker_output_dir || '.pipeline-worker-out'),
-    buildLogDir: resolve(dir, next.build_log_dir),
-    codeLock: resolve(dir, next.code_lock),
-    contextFiles: (next.context_files || []).map((f) => resolve(dir, f)),
-  };
+  next._resolved = resolveAll(absPath, next);
   // In-place mutation — drop old keys, copy new ones. This keeps the
   // object identity that closures depend on.
   for (const k of Object.keys(config)) delete config[k];

@@ -9,3 +9,7 @@ ops/
 # Local / per-user state — do NOT commit
 .claude/
 pipeline.config.yaml
+
+# Per-project pipeline working data — created at runtime, contains the
+# user's per-ticket state files, worker output, build logs. Never commit.
+projects/

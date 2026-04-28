@@ -1292,15 +1292,16 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // files (memory/pipeline/*.json) are excluded — they're bookkeeping, not
   // ticket output. Paths are relative to project_dir, matching git.
   // Paths the orchestrator manages as bookkeeping — never count toward
-  // ticket file changes, never trip silent-writes guards. Includes
-  // memory/pipeline/ (canonical state) and the worker output directory
-  // (per-step worker payloads, ingested via schema gate, not real ticket
-  // output).
+  // ticket file changes, never trip silent-writes guards. After the
+  // 2026-04-28 working-data relocation, pipeline state and worker output
+  // both live under {pipeline-home}/projects/{name}/ — outside the project
+  // entirely, so they don't appear in the project's git status. The legacy
+  // prefixes are kept for back-compat with stale state files that may
+  // still exist in older projects mid-migration.
   isOrchestratorPath(path) {
     if (!path) return false;
-    if (path.startsWith('memory/pipeline/')) return true;
-    const workerDir = this.config?.worker_output_dir || '.pipeline-worker-out';
-    if (path === workerDir || path.startsWith(`${workerDir}/`)) return true;
+    if (path.startsWith('memory/pipeline/')) return true;       // legacy
+    if (path.startsWith('.pipeline-worker-out/')) return true;  // legacy
     return false;
   }
 
@@ -2299,7 +2300,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     // 2. Append one-line summary to build log
     try {
       const today = new Date().toISOString().split('T')[0];
-      const logDir = resolve(projectDir, this.config.build_log_dir || 'memory/build-log');
+      const logDir = this.config._resolved.buildLogDir;
       await mkdir(logDir, { recursive: true });
       const logPath = resolve(logDir, `${today}.md`);
 

@@ -12,9 +12,10 @@ closed_bugs_file: memory/closed-bugs.json
 # Validation rules (injected into every Claude session)
 validation_rules: memory/code_validation.md
 
-# Pipeline state
-pipeline_dir: memory/pipeline
-build_log_dir: memory/build-log
+# Pipeline working data lives under {pipeline-repo}/projects/{name}/
+# (pipeline-state, worker-output, build-log) — derived from `name` above.
+# These directories are NOT inside the project being worked on, so the
+# pipeline never pollutes the project tree.
 code_lock: code.lock
 
 # Context files (read at session start, injected into plan step)
