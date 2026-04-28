@@ -29,6 +29,12 @@ function resolveAll(absConfigPath, config) {
     pipelineDir: resolve(projectWorkDir, 'pipeline-state'),
     workerOutputDir: resolve(projectWorkDir, 'worker-output'),
     buildLogDir: resolve(projectWorkDir, 'build-log'),
+    // Worktree path: where the pipeline runs each ticket. The
+    // operator's primary checkout (project_dir) stays untouched while
+    // a ticket is in progress. Pinned to side branch
+    // `pipeline/worktree-{name}`.
+    projectWorktree: resolve(projectWorkDir, 'worktree'),
+    projectWorktreeBranch: `pipeline/worktree-${projectName}`,
   };
 }
 

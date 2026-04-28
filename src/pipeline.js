@@ -17,6 +17,11 @@ import {
   autoCommitPaths,
   CheckpointError,
 } from './checkpoint.js';
+import {
+  ensureWorktree,
+  prepareWorktreeForTicket,
+  cherryPickToMaster,
+} from './worktree.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
@@ -86,6 +91,23 @@ export class Pipeline {
     // `/api/stop?hard=true` uses this to SIGTERM the step immediately
     // instead of waiting for Claude to finish naturally.
     this.activeSubprocess = null;
+    // Worktree-per-pipeline-run: when enabled, the orchestrator runs
+    // each ticket in {pipelineHome}/projects/{name}/worktree rather
+    // than in config.project_dir, so the operator can keep editing
+    // the primary checkout in parallel. `this.cwd` is what every git
+    // / worker / shell call should target. activeWorktree is set at
+    // ticket start and cleared at ticket end (in run()).
+    this.activeWorktree = null;
+    this.worktreeBranch = null;
+    this.worktreeEnabled = config.worktree?.enabled !== false;
+  }
+
+  // The path the pipeline operates in for a ticket. Defaults to
+  // project_dir; switches to the worktree once a ticket starts in
+  // worktree mode. All git/shell ops + worker spawn cwds should use
+  // this getter rather than `config.project_dir`.
+  get cwd() {
+    return this.activeWorktree || this.config.project_dir;
   }
 
   /**
@@ -174,6 +196,29 @@ export class Pipeline {
 
         // Fresh session per ticket
         this.sessionId = null;
+        // Worktree-per-pipeline-run: set up an isolated worktree where
+        // the ticket runs, leaving the operator's primary checkout free
+        // for parallel edits. On any failure to set up, we fall back to
+        // running directly in project_dir (legacy behavior).
+        let worktreeCtx = null;
+        if (!this.dryRun && this.worktreeEnabled) {
+          try {
+            const wtDir = this.config._resolved.projectWorktree;
+            const wtBranch = this.config._resolved.projectWorktreeBranch;
+            const { defaultBranch } = ensureWorktree(this.config.project_dir, wtDir, wtBranch);
+            prepareWorktreeForTicket(wtDir, defaultBranch);
+            this.activeWorktree = wtDir;
+            this.worktreeBranch = wtBranch;
+            worktreeCtx = { dir: wtDir, branch: wtBranch, defaultBranch };
+            this.emit('worktree_ready', { ticket: ticket.id, worktree: wtDir, branch: wtBranch });
+            console.log(`[worktree] ${ticket.id}: ready at ${wtDir} (${wtBranch}, base=${defaultBranch})`);
+          } catch (err) {
+            this.activeWorktree = null;
+            this.worktreeBranch = null;
+            this.emit('worktree_setup_failed', { ticket: ticket.id, error: err.message });
+            console.error(`[worktree] ${ticket.id}: setup failed (${err.message}), falling back to project_dir`);
+          }
+        }
         try {
           await this.processTicket(ticket);
         } catch (err) {
@@ -207,18 +252,13 @@ export class Pipeline {
             try { await this.rollbackTicketFiles(ticket, failedState); }
             catch (rbErr) { console.error(`[rollback] ${ticket.id}: ${rbErr.message}`); }
           }
-          // Return the working tree to master so the operator isn't left on
-          // a dead pipeline/{id} branch after a failure. Best-effort: a
-          // dirty tree or detached HEAD here is better than crashing the
-          // whole run loop on cleanup.
-          if (!this.dryRun && this.config.checkpoints?.enabled) {
-            try {
-              execSync('git checkout master', { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
-            } catch (coErr) {
-              console.error(`[checkout-master] ${ticket.id}: ${coErr.message?.slice(0, 200)}`);
-            }
-          }
+          // Per-ticket branches were removed in the 2026-04-28 refactor;
+          // the orchestrator never leaves master in the primary checkout
+          // (and the worktree, when enabled, is permanently pinned to its
+          // side branch). No checkout-master cleanup needed here.
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
+          this.activeWorktree = null;
+          this.worktreeBranch = null;
           continue;
         }
 
@@ -250,35 +290,37 @@ export class Pipeline {
           continue;
         }
 
-        // Defensive: ensure we're on master before archive runs. archiveTicket
-        // commits to whatever branch is checked out — and a prior step's
-        // bookkeeping may have left us on `pipeline/{id}` (mergeToMaster did
-        // checkout master, but a crash in the merge path can skip it).
-        // Committing the archive to a pipeline branch pollutes it with
-        // non-step commits and trips the next run's branch-reset safety
-        // (2026-04-26 incident, T-359).
-        if (this.config.checkpoints?.enabled) {
-          try {
-            execSync('git checkout master', { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
-          } catch (coErr) {
-            console.error(`[pre-archive-checkout] ${ticket.id}: ${coErr.message?.slice(0, 200)}`);
-          }
-        }
-
-        // Archive the ticket first so its backlog.json/backlog-archive.json
-        // mutations are dirty in the tree when commitTicketFiles runs and get
-        // folded into the same ticket-tagged commit. Reversing this order
-        // leaves the archive write uncommitted and the next ticket's
-        // checkpoint guard refuses with DIRTY_TREE.
+        // Archive the ticket. Backlog files are gitignored so this is a
+        // file-only operation that doesn't touch git history.
         await archiveTicket(ticket.id, this.config);
 
-        // Auto-commit: successful tickets commit their declared files as a
-        // single ticket-tagged commit. Keeps the tree clean so subsequent
-        // baseline captures reflect a genuine HEAD, not a pile of
-        // uncommitted work from earlier pipeline runs.
-        if (finalState?.status === 'done') {
-          try { await this.commitTicketFiles(ticket, finalState); }
-          catch (err) { console.error(`[auto-commit] ${ticket.id}: ${err.message}`); }
+        // Worktree mode: cherry-pick the ticket commit from the worktree's
+        // side branch onto the operator's master in the primary checkout.
+        // We only attempt this when the ticket actually committed (the
+        // commit step in processTicket records sha on pipelineState).
+        if (worktreeCtx && finalState?.checkpoint?.ticket_sha) {
+          const sha = finalState.checkpoint.ticket_sha;
+          const result = cherryPickToMaster(this.config.project_dir, sha, worktreeCtx.defaultBranch);
+          if (result.ok) {
+            this.emit('worktree_merged', { ticket: ticket.id, sha: result.headSha, source: sha });
+            console.log(`[worktree] ${ticket.id}: cherry-picked ${sha.slice(0, 7)} onto ${worktreeCtx.defaultBranch} (${result.headSha.slice(0, 7)})`);
+            // Persist merge status so the dashboard / next run can see it.
+            finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: result.headSha };
+            try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+          } else {
+            this.emit('pipeline_merge_pending', {
+              ticket: ticket.id,
+              sha,
+              code: result.code,
+              files: result.files,
+              head: result.head,
+              branch: worktreeCtx.branch,
+              hint: `cd ${this.config.project_dir} && git cherry-pick ${sha}`,
+            });
+            console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); commit ${sha.slice(0, 7)} stays on ${worktreeCtx.branch}`);
+            finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files };
+            try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+          }
         }
 
         // Pause between tickets if requested
@@ -288,6 +330,10 @@ export class Pipeline {
           console.log(`Paused. Next ticket: ${queue[i + 1]?.id}. Press enter to continue...`);
           await new Promise((resolve) => process.stdin.once('data', resolve));
         }
+        // Per-ticket worktree state always cleared at end of iteration —
+        // every `continue` path above also resets these.
+        this.activeWorktree = null;
+        this.worktreeBranch = null;
       }
 
       // Phase 3-5: Integration tests, docs, build
@@ -389,7 +435,7 @@ export class Pipeline {
       // default run path doesn't call it anymore.
 
       try {
-        const res = setupTicketBaseline(ticket.id, this.config.project_dir);
+        const res = setupTicketBaseline(ticket.id, this.cwd);
         this.emit('checkpoint_baseline_set', { ticket: ticket.id, baselineTag: res.baselineTag, baselineSha: res.baselineSha });
         console.log(`[checkpoint] ${ticket.id}: baseline ${res.baselineTag} at ${res.baselineSha.slice(0, 7)}`);
       } catch (err) {
@@ -584,7 +630,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
                 model: healModel,
                 tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write'],
                 maxTurns: 20,
-                workingDir: this.config.project_dir,
+                workingDir: this.cwd,
                 sessionId: null,
                 env: this.config.environment || {},
                 onData: (event) => {
@@ -704,7 +750,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             // pipeline-state layer.
             if (this.config.checkpoints?.enabled) {
               try {
-                revertToBaseline(ticket.id, this.config.project_dir);
+                revertToBaseline(ticket.id, this.cwd);
                 this.emit('checkpoint_reverted_for_restart', { ticket: ticket.id, from: stepConfig.name, to: prevStepName });
               } catch (revertErr) {
                 console.warn(`[restart] ${ticket.id}: git revert failed — ${revertErr.message}`);
@@ -1071,11 +1117,17 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           const ticketSha = commitTicketAsOne(
             ticket.id,
             ticket.title || '',
-            this.config.project_dir,
+            this.cwd,
           );
           if (ticketSha) {
             this.emit('ticket_committed', { ticket: ticket.id, sha: ticketSha });
             console.log(`[checkpoint] ${ticket.id}: committed to master (${ticketSha.slice(0, 7)})`);
+            // Persist the sha on pipelineState so run()'s post-archive
+            // worktree merge step can find it.
+            pipelineState.checkpoint = pipelineState.checkpoint || {};
+            pipelineState.checkpoint.ticket_sha = ticketSha;
+            pipelineState.checkpoint.committed_at = new Date().toISOString();
+            await this.savePipelineJson(ticket.id, pipelineState);
           } else {
             // Empty diff — pipeline finished all steps but produced no
             // changes. This is almost always a mis-ship: a previous run
@@ -1096,7 +1148,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             console.error(`[checkpoint] ${ticket.id}: BLOCKED — ${pipelineState.blocked_reason}`);
             // Drop baseline tag and bail. The ticket stays in the backlog
             // (run() only archives status:done) and surfaces as blocked.
-            try { cleanupBaseline(ticket.id, this.config.project_dir); } catch { /* best effort */ }
+            try { cleanupBaseline(ticket.id, this.cwd); } catch { /* best effort */ }
             return;
           }
         } catch (err) {
@@ -1107,7 +1159,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
         // Drop the baseline tag — no longer needed once committed.
         try {
-          cleanupBaseline(ticket.id, this.config.project_dir);
+          cleanupBaseline(ticket.id, this.cwd);
         } catch (err) {
           console.warn(`[checkpoint] ${ticket.id}: baseline cleanup failed — ${err.message}`);
         }
@@ -1308,7 +1360,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   collectTicketFiles(pipelineState) {
     const out = this.collectDeclaredFiles(pipelineState);
     const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
-    const nowDirty = this.getDirtyFiles(this.config.project_dir);
+    const nowDirty = this.getDirtyFiles(this.cwd);
     for (const path of nowDirty.keys()) {
       if (dirtyAtStart.has(path)) continue;
       if (this.isOrchestratorPath(path)) continue;
@@ -1324,7 +1376,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // into the kind of 40-file graveyard we cleaned up in 2026-04-19.
   checkSilentWrites(pipelineState) {
     const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
-    const nowDirty = this.getDirtyFiles(this.config.project_dir);
+    const nowDirty = this.getDirtyFiles(this.cwd);
     const declared = this.collectDeclaredFiles(pipelineState);
     // Also accept paths the planner declared under plan.files_to_change
     // even if no step reports them in files_changed yet.
@@ -1365,7 +1417,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // uncommitted tickets or manual edits, not to this ticket.
   async snapshotDirtyAtStart(ticket, pipelineState) {
     if (Array.isArray(pipelineState.dirty_at_start)) return; // already captured
-    const dirty = this.getDirtyFiles(this.config.project_dir);
+    const dirty = this.getDirtyFiles(this.cwd);
     pipelineState.dirty_at_start = Array.from(dirty.keys());
     pipelineState.dirty_at_start_captured_at = new Date().toISOString();
     await this.savePipelineJson(ticket.id, pipelineState);
@@ -1398,7 +1450,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       });
       return;
     }
-    const projectDir = this.config.project_dir;
+    const projectDir = this.cwd;
     const touched = this.collectTicketFiles(pipelineState);
     const dirtyAtStart = new Set(pipelineState.dirty_at_start);
     const nowDirty = this.getDirtyFiles(projectDir);
@@ -1446,7 +1498,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // other uncommitted work in the tree is left alone. No-op if nothing
   // declared by this ticket is currently dirty (idempotent across retries).
   async commitTicketFiles(ticket, pipelineState) {
-    const projectDir = this.config.project_dir;
+    const projectDir = this.cwd;
     const touched = this.collectTicketFiles(pipelineState);
     const nowDirty = this.getDirtyFiles(projectDir);
 
@@ -1506,7 +1558,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // --- Dependency-declaration gate ---
 
   checkDepsDeclared(stepArtifacts, planArtifacts) {
-    const projectDir = this.config.project_dir;
+    const projectDir = this.cwd;
     // Dart/Flutter packages that are available without being in pubspec:
     const DART_BUILTIN = new Set(['flutter', 'flutter_test', 'flutter_localizations', 'flutter_driver']);
     // Node built-ins (not exhaustive — covers the common ones):
@@ -1575,7 +1627,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
   findNearestManifest(startFile, name) {
     let dir = startFile.slice(0, startFile.lastIndexOf('/'));
-    const root = this.config.project_dir;
+    const root = this.cwd;
     while (dir.startsWith(root)) {
       const candidate = resolve(dir, name);
       if (existsSync(candidate)) return candidate;
@@ -1756,8 +1808,8 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       let gitSnapshotBefore = null;
       if (['implement', 'tests_red', 'docs_update'].includes(stepConfig.name)) {
         try {
-          const tracked = execSync('git diff --name-only HEAD', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
-          const untracked = execSync('git ls-files --others --exclude-standard', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
+          const tracked = execSync('git diff --name-only HEAD', { cwd: this.cwd, encoding: 'utf-8' }).trim();
+          const untracked = execSync('git ls-files --others --exclude-standard', { cwd: this.cwd, encoding: 'utf-8' }).trim();
           gitSnapshotBefore = [tracked, untracked].filter(Boolean).join('\n');
         } catch { /* ignore */ }
       }
@@ -1822,7 +1874,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           },
           effort: stepConfig.effort || null,
           systemPromptFile: (!isRetry && stepConfig.inject_validation_rules) ? this.config._resolved.validationRules : null,
-          workingDir: this.config.project_dir,
+          workingDir: this.cwd,
           // Preserve session across heal attempts so amendment cases don't
           // re-read spec files. Escape hatch above nulls sessionId when the
           // prior attempt produced no substantive output (undefined required
@@ -1994,7 +2046,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // Rewind to the previous snapshot so partial work doesn't leak.
         if (this.config.checkpoints?.enabled) {
           try {
-            revertToBaseline(ticket.id, this.config.project_dir);
+            revertToBaseline(ticket.id, this.cwd);
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
           } catch (err) {
             console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: revert failed — ${err.message}`);
@@ -2025,7 +2077,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // base (= master tip at ticket start).
         if (this.config.checkpoints?.enabled) {
           try {
-            revertToBaseline(ticket.id, this.config.project_dir);
+            revertToBaseline(ticket.id, this.cwd);
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
             console.log(`[checkpoint] ${ticket.id}/${stepConfig.name}: working tree reverted to last snapshot`);
           } catch (err) {
@@ -2127,15 +2179,15 @@ PRIORITY: Write the pipeline JSON FIRST, then investigate. Do not spend turns re
     if (step[fieldName] && Array.isArray(step[fieldName]) && step[fieldName].length > 0) return;
 
     try {
-      const trackedNow = execSync('git diff --name-only HEAD', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
-      const untrackedNow = execSync('git ls-files --others --exclude-standard', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
+      const trackedNow = execSync('git diff --name-only HEAD', { cwd: this.cwd, encoding: 'utf-8' }).trim();
+      const untrackedNow = execSync('git ls-files --others --exclude-standard', { cwd: this.cwd, encoding: 'utf-8' }).trim();
       const allDirty = [trackedNow, untrackedNow].filter(Boolean).join('\n').split('\n').filter(Boolean);
 
       const beforeSet = new Set(gitSnapshotBefore ? gitSnapshotBefore.split('\n') : []);
       const newFiles = allDirty.filter((f) => !beforeSet.has(f));
       const editedFiles = allDirty.filter((f) => {
         if (newFiles.includes(f)) return false;
-        try { return statSync(resolve(this.config.project_dir, f)).mtimeMs >= stepStartTime; } catch { return false; }
+        try { return statSync(resolve(this.cwd, f)).mtimeMs >= stepStartTime; } catch { return false; }
       });
 
       const touchedFiles = [...newFiles, ...editedFiles];
@@ -2196,7 +2248,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
           model: 'sonnet',
           tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash(git *)'],
           maxTurns: 15,
-          workingDir: this.config.project_dir,
+          workingDir: this.cwd,
           sessionId: null,
           env: this.config.environment || {},
           onData: (event) => {
@@ -2234,7 +2286,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
   // --- Mechanical docs: scripted updates that don't need LLM ---
 
   async mechanicalDocsUpdate(ticket, pipelineState) {
-    const projectDir = this.config.project_dir;
+    const projectDir = this.cwd;
 
     // 1. Append to closed-bugs.json (bugs only)
     if (ticket.type?.includes('bug')) {
@@ -2287,7 +2339,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
   // will trigger). runAllExtras=false keeps the trigger_file_prefix filter
   // driven by the current implement files_changed.
   async runTestSuite(pipelineState, { runAllExtras = false } = {}) {
-    const projectDir = this.config.project_dir;
+    const projectDir = this.cwd;
     const env = { ...process.env };
     for (const [k, v] of Object.entries(this.config.environment || {})) {
       env[k] = String(v).replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '');
@@ -2645,7 +2697,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
 
   async appendUsageLog(report) {
     try {
-      const logDir = this.config._resolved.buildLogDir || resolve(this.config.project_dir, 'memory/build-log');
+      const logDir = this.config._resolved.buildLogDir || resolve(this.cwd, 'memory/build-log');
       await mkdir(logDir, { recursive: true });
       const logPath = resolve(logDir, 'usage.jsonl');
       const entry = JSON.stringify({
