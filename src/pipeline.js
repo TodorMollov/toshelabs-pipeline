@@ -1108,7 +1108,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         stepStatus: 'post_loop_incomplete',
         reason: pipelineState.blocked_reason,
       });
-      console.log(`[blocked] ${ticket.id} post-loop incomplete: ${stepList}`);
+      console.log(`[blocked] ${ticket.id} post-loop incomplete: ${pipelineState.blocked_reason}`);
       await this.savePipelineJson(ticket.id, pipelineState);
     } else {
       // All sub-steps terminal-OK and no failure state. Truly done.
@@ -2562,7 +2562,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     const step = {
       status: failed_ ? 'failed' : 'done',
       completed_at: new Date().toISOString(),
-      all_pass: testsActuallyRan && res.failed === 0 && !res.unitCrashed && res.extraFailures.length === 0 && newAnalyzerErrors === 0,
+      all_pass: testsActuallyRan && newFailures === 0 && !res.unitCrashed && newExtraFailures.length === 0 && newAnalyzerErrors === 0,
       unit_tests: { passed: res.passed, failed: res.failed, skipped: 0 },
       unit_crashed: res.unitCrashed,
       unit_exit_code: res.unitExitCode,
