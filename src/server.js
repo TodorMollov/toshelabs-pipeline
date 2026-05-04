@@ -220,12 +220,70 @@ export async function startServer(config) {
       running: activePipeline !== null,
       eventCount: eventLog.length,
       lastEvent: eventLog[eventLog.length - 1] || null,
+      activeProjectId: config._activeProjectId || null,
       server: {
         startedAt: serverStartedAt,
         uptimeSec: Math.round(process.uptime()),
         pid: process.pid,
       },
     });
+  });
+
+  // PIPE-003: list all loaded projects with their basic metadata. The
+  // active project is the one served by all top-level routes (/api/backlog,
+  // /api/run/all, etc.). Switch the active project with POST
+  // /api/projects/:id/activate. Switching is refused while a run is in
+  // flight — config mutation mid-run would corrupt the live Pipeline
+  // instance's path resolution.
+  app.get('/api/projects', (req, res) => {
+    const projects = config._projects;
+    if (!projects) {
+      // Single-config mode — surface the active config as the only project.
+      return res.json({
+        active: config._activeProjectId || config.name || 'default',
+        projects: [{
+          id: config._activeProjectId || config.name || 'default',
+          name: config.name || 'default',
+          project_dir: config.project_dir,
+          configPath: config._resolved?.configPath || null,
+          active: true,
+        }],
+      });
+    }
+    const list = [...projects.entries()].map(([id, cfg]) => ({
+      id,
+      name: cfg.name || id,
+      project_dir: cfg.project_dir,
+      configPath: cfg._resolved?.configPath || null,
+      active: id === config._activeProjectId,
+    }));
+    res.json({ active: config._activeProjectId, projects: list });
+  });
+
+  app.post('/api/projects/:id/activate', async (req, res) => {
+    if (activePipeline !== null) {
+      return res.status(409).json({ error: 'cannot switch projects while a pipeline run is in flight. Wait for it to finish or POST /api/stop first.' });
+    }
+    const targetId = req.params.id;
+    const projects = config._projects;
+    if (!projects || !projects.has(targetId)) {
+      return res.status(404).json({ error: `project ${targetId} not found. Available: ${projects ? [...projects.keys()].join(', ') : '(single-config mode)'}` });
+    }
+    const target = projects.get(targetId);
+    // In-place mutation preserves the config object identity so closures
+    // (route handlers that captured `config`) see the new active project
+    // without needing to re-bind. Same pattern as reloadConfig. Critical:
+    // shallow-clone `target` first — assigning the Map entry directly
+    // would alias config and target, and the next switch's
+    // delete-loop would destroy both.
+    const preservedProjects = config._projects;
+    for (const k of Object.keys(config)) delete config[k];
+    Object.assign(config, { ...target });
+    Object.defineProperty(config, '_projects', { value: preservedProjects, enumerable: false });
+    Object.defineProperty(config, '_activeProjectId', { value: targetId, enumerable: false, writable: true });
+    emitter.emit('project_activated', { id: targetId, name: config.name });
+    console.log(`[projects] activated ${targetId} (project_dir=${config.project_dir})`);
+    res.json({ active: targetId, name: config.name, project_dir: config.project_dir });
   });
 
   // Load primary + v2 backlogs and tag each ticket with `backlog:'primary'|'v2'`

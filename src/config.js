@@ -1,6 +1,8 @@
-import { readFile } from 'fs/promises';
+import { readFile, readdir } from 'fs/promises';
+import { existsSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
-import { resolve, dirname } from 'path';
+import { resolve, dirname, basename } from 'path';
+import { homedir } from 'os';
 
 // Pipeline working data ({tickets-state, worker-output, build-log}) lives
 // under {pipelineHome}/projects/{config.name}/ — never inside the project
@@ -62,4 +64,60 @@ export async function reloadConfig(config) {
   for (const k of Object.keys(config)) delete config[k];
   Object.assign(config, next);
   return config;
+}
+
+/**
+ * PIPE-003: multi-project loader. Returns a Map<projectId, config> covering:
+ *
+ *   1. The legacy single config at `legacyConfigPath` (typically
+ *      pipeline.config.yaml in the pipeline repo root). Loaded under the
+ *      project id from its `name` field, or 'default' if missing. Skipped
+ *      silently when the file doesn't exist.
+ *   2. Every YAML file under `registryDir` (default ~/.toshelabs/projects/).
+ *      Project id = filename without .yaml. Skipped silently when the
+ *      directory doesn't exist.
+ *
+ * Both sources can coexist during the migration window — operators can
+ * gradually move projects from the legacy single-config file into the
+ * registry directory at their own pace. A registry entry with the same
+ * id as the legacy config wins (registry is canonical).
+ *
+ * Returns at minimum an empty Map if neither source has content; callers
+ * should error if they need at least one project loaded.
+ */
+export async function loadAllConfigs({ legacyConfigPath = 'pipeline.config.yaml', registryDir = null } = {}) {
+  const projects = new Map();
+  const effectiveRegistry = registryDir || resolve(homedir(), '.toshelabs', 'projects');
+
+  // 1. Legacy single config (backwards-compat).
+  if (legacyConfigPath && existsSync(resolve(legacyConfigPath))) {
+    try {
+      const cfg = await loadConfig(legacyConfigPath);
+      const id = cfg.name || 'default';
+      projects.set(id, cfg);
+    } catch (err) {
+      console.error(`[config] failed to load legacy ${legacyConfigPath}: ${err.message}`);
+    }
+  }
+
+  // 2. Registry directory (per-project files).
+  if (existsSync(effectiveRegistry)) {
+    let files = [];
+    try {
+      files = (await readdir(effectiveRegistry)).filter((f) => /\.ya?ml$/i.test(f));
+    } catch (err) {
+      console.error(`[config] failed to read registry ${effectiveRegistry}: ${err.message}`);
+    }
+    for (const f of files) {
+      const id = basename(f).replace(/\.ya?ml$/i, '');
+      try {
+        const cfg = await loadConfig(resolve(effectiveRegistry, f));
+        projects.set(id, cfg); // registry wins if id collides with legacy
+      } catch (err) {
+        console.error(`[config] failed to load ${f}: ${err.message}`);
+      }
+    }
+  }
+
+  return projects;
 }
