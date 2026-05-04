@@ -1346,6 +1346,26 @@ let _currentEventTs = null;
 
 function handleEvent(ev, d, serverTs) {
   _currentEventTs = serverTs || null;
+  // PIPE-008: server tags Pipeline events with `project: <id>`. Drop
+  // events that belong to a project the user isn't currently looking
+  // at — otherwise the terminal feed interleaves N projects' chatter.
+  // Lifecycle events that aren't tagged (server_started, etc.) and
+  // server-wide events (project_activated, projects_refreshed,
+  // backlog_refreshed) always pass through.
+  const PROJECT_AGNOSTIC_EVENTS = new Set([
+    'server_started','server_stopping','config_reloaded','memory_sample',
+    'project_activated','projects_refreshed','backlog_refreshed',
+    'ticket_rejected','pipeline_stopped','pipeline_error',
+  ]);
+  if (d?.project && state.activeProjectId && d.project !== state.activeProjectId
+      && !PROJECT_AGNOSTIC_EVENTS.has(ev)) {
+    // Still surface to the running-projects indicator below, but don't
+    // render in the active-project terminal feed.
+    if (ev === 'pipeline_stopped' || ev === 'ticket_done' || ev === 'ticket_failed' || ev === 'ticket_start') {
+      refreshRunningProjects();
+    }
+    return;
+  }
   switch (ev) {
     case 'run_requested': setRunning(true); break;
     case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
@@ -1594,6 +1614,18 @@ function handleEvent(ev, d, serverTs) {
       break;
     }
 
+    // PIPE-008: a Pipeline run finished (any project). Refresh the
+    // dropdown so the running indicator flips off.
+    case 'pipeline_stopped': {
+      if (d.project === state.activeProjectId) {
+        // Active project's run finished — flip status pill to idle and
+        // log to terminal.
+        appendTerminal(`Pipeline finished for ${d.project}`, 'system');
+      }
+      refreshRunningProjects();
+      break;
+    }
+
     // PIPE-003: another session refreshed the projects map. Re-fetch our picker.
     case 'projects_refreshed': {
       const added = (d.added || []).join(', ');
@@ -1828,18 +1860,34 @@ initPanelResize();
 // ─── PIPE-003: project picker init + switching ───
 async function loadProjects() {
   try {
-    const r = await fetch('/api/projects');
-    if (!r.ok) return;
-    const { active, projects } = await r.json();
+    const [pr, sr] = await Promise.all([fetch('/api/projects'), fetch('/api/status')]);
+    if (!pr.ok) return;
+    const { active, projects } = await pr.json();
+    const status = sr.ok ? await sr.json() : { runningProjects: [] };
+    const running = new Set(status.runningProjects || []);
+    state.activeProjectId = active;
     const picker = document.getElementById('projectPicker');
     if (!picker) return;
+    // PIPE-008: prefix with • when this project's pipeline is running so
+    // the operator sees concurrent runs in the dropdown without needing
+    // a separate UI surface.
     picker.innerHTML = projects
-      .map(p => `<option value="${p.id}"${p.id === active ? ' selected' : ''}>${p.name}${p.id !== p.name ? ` (${p.id})` : ''}</option>`)
+      .map(p => {
+        const dot = running.has(p.id) ? '● ' : '';
+        return `<option value="${p.id}"${p.id === active ? ' selected' : ''}>${dot}${p.name}${p.id !== p.name ? ` (${p.id})` : ''}</option>`;
+      })
       .join('');
     picker.disabled = projects.length < 2;
     if (projects.length < 2) picker.title = 'Only one project loaded. Add YAML files under ~/.toshelabs/projects/ to enable switching.';
-    else picker.title = '';
+    else picker.title = `Active: ${active}${running.size ? ` · running: ${[...running].join(', ')}` : ''}`;
   } catch (e) { console.warn('[projects] load failed', e); }
+}
+
+// Refresh the running-projects indicator without rebuilding the whole
+// dropdown (called from the SSE handler when an out-of-active-project
+// lifecycle event lands).
+function refreshRunningProjects() {
+  loadProjects();
 }
 async function activateProject(id) {
   try {
@@ -1847,13 +1895,16 @@ async function activateProject(id) {
     const body = await r.json();
     if (!r.ok) {
       alert(`Cannot switch project: ${body.error || r.status}`);
-      // restore picker to whatever the server still considers active
       loadProjects();
       return;
     }
-    // The project_activated event fires from the server and re-syncs everything;
-    // just nudge the local title for instant feedback.
+    // PIPE-008: switching is just a display change now. Other projects'
+    // pipelines keep running independently. Refresh the displayed
+    // backlog + state to match the new active project.
     document.title = `${body.name || id} — TosheLabs Pipeline`;
+    refreshBacklog();
+    loadPipelineStates();
+    state.activeProjectId = id;
   } catch (e) { console.warn('[projects] activate failed', e); }
 }
 document.getElementById('projectPicker').addEventListener('change', (e) => {
