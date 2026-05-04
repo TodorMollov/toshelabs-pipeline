@@ -7,6 +7,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
 import { reloadConfig } from './config.js';
+import { createMcpServer, mountMcpOnExpress } from './mcp/server.js';
 import { Pipeline } from './pipeline.js';
 import { EventLogger } from './event-log.js';
 import { releaseLock } from './lock.js';
@@ -195,6 +196,26 @@ export async function startServer(config) {
 
   // Static files
   app.use(express.static(resolve(__dirname, '..', 'public')));
+
+  // PIPE-006: mount the MCP server on POST /mcp + GET /mcp (SSE).
+  // Same Node process — shares the projects map, the active-project
+  // pointer, and the event emitter with the HTTP server. Local-only
+  // by default (the HTTP transport is bound to whatever host the
+  // pipeline server runs on; if you exposed the pipeline beyond
+  // loopback, MCP travels with it — add auth before doing that).
+  if (config._projects) {
+    try {
+      const serverFactory = () => createMcpServer({
+        projects: config._projects,
+        getActiveId: () => config._activeProjectId || config.name || 'default',
+        emitter,
+      });
+      await mountMcpOnExpress(app, serverFactory, '/mcp');
+      console.log(`MCP: tools available at POST ${config.server.host}:${config.server.port}/mcp`);
+    } catch (err) {
+      console.error(`[mcp] mount failed: ${err.message}`);
+    }
+  }
 
   // SSE endpoint
   app.get('/events', (req, res) => {
