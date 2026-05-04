@@ -1,12 +1,12 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-04",
-  "_last_session_note": "2026-05-04 — PIPE-001 + PIPE-003 open questions resolved by operator. PIPE-001: dropped tags arm (gate is now complexity OR load-bearing files only); critic gets all tools; re-pass enabled; dismissed_findings audit path approved. PIPE-003: registry is directory ~/.toshelabs/projects/ with one file per project; intra-project parallel descoped (master/rate-limit/worktree shared-state hazards). Implementation order: PIPE-002 → PIPE-004 → PIPE-001 → PIPE-003.",
+  "_last_session_note": "2026-05-04 — All four tickets shipped this session: PIPE-002 (5d0104e schema backfill), PIPE-004 (a3dc137 write-zone enforcement), PIPE-003 (d89a818 multi-project), PIPE-001 (f3f4db8 plan_critic infrastructure). PIPE-001 deferred items: backtest run, tests_red consumption, dismissed_findings audit path, re-pass loop — file as PIPE-005 if/when needed.",
   "tickets": [
     {
       "id": "PIPE-001",
       "title": "Add `plan_critic` phase between plan and tests_red — falsify plan claims before code is written",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "feature",
       "complexity": "medium",
@@ -80,13 +80,16 @@
         "Adding adversarial steps to other phases (review, implement). The plan is the highest-leverage point; revisit after PIPE-001 has 4 weeks of production data.",
         "Replacing the existing `think_challenge` self-prompt on the plan step. Complementary, not redundant.",
         "Cross-ticket pattern detection ('the last 5 plans all assumed X'). Future work."
-      ]
+      ],
+      "landed_commit": "f3f4db8",
+      "shipped_note": "Infrastructure shipped (prompt, step config, gate logic, backtest harness). DEFERRED: actual backtest run against archived plans, tests_red consumption of findings, dismissed_findings audit path, re-pass loop. File as PIPE-005 if/when ready.",
+      "shipped_at": "2026-05-04"
     },
     {
       "id": "PIPE-002",
       "schema_version": 1,
       "title": "Backfill non-conformant tickets to schema v1, then flip ticket_schema.mode from warn to strict",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "ops",
       "complexity": "small",
@@ -123,13 +126,16 @@
         "Schema v2 (no v2 yet; flip happens when one is needed).",
         "Cross-project orchestration (PIPE-003 territory).",
         "Migrating busydad's state/backlog-v2.json — that file is a separate roadmap pile, not pipeline-actionable; same migration script could process it but isn't required for PIPE-002 to be done."
-      ]
+      ],
+      "landed_commit": "5d0104e",
+      "shipped_note": "Migration script + busydad backfill to schema v1 + flip to strict mode. 1 manual triage case (T-84 has 7-char title — operator should re-title).",
+      "shipped_at": "2026-05-04"
     },
     {
       "id": "PIPE-003",
       "schema_version": 1,
       "title": "Multi-project support — per-project config registry, project switcher (parallel work descoped)",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "feature",
       "complexity": "medium",
@@ -184,13 +190,16 @@
         "Cross-machine pipeline coordination — single host for now.",
         "Project-level RBAC / multi-user — single operator.",
         "Auto-discovery (scan ~/code/* for pipeline.config.yaml files) — explicit registry only."
-      ]
+      ],
+      "landed_commit": "d89a818",
+      "shipped_note": "Server-side multi-project loader + /api/projects + activate route + --project CLI flag. Round-trip tested. DEFERRED: dashboard project picker UI, per-project SSE filtering, busydad config migration to ~/.toshelabs/projects/busydad.yaml (legacy path keeps working).",
+      "shipped_at": "2026-05-04"
     },
     {
       "id": "PIPE-004",
       "schema_version": 1,
       "title": "Refuse worker edits outside configured code_dirs / docs_dir",
-      "status": "requested",
+      "status": "done",
       "priority": "P2",
       "type": "feature",
       "complexity": "medium",
@@ -229,7 +238,10 @@
         "Read enforcement — workers can still read anywhere (needed for cross-cutting investigations).",
         "Auto-detecting code_dirs from the project layout — explicit configuration only (otherwise we re-introduce the same drift problem in disguise).",
         "Per-ticket write zone overrides — tickets don't get to widen the sandbox; if a ticket genuinely needs to touch outside, the project config gets a permanent extension."
-      ]
+      ],
+      "landed_commit": "a3dc137",
+      "shipped_note": "Post-hoc detection via git diff inspection in worktree + canonical project_dir. busydad implement + docs_update opted into warn mode. DEFERRED: PreToolUse hook for true sandboxing; flip warn → strict once trusted.",
+      "shipped_at": "2026-05-04"
     }
   ]
 }
