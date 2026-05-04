@@ -856,6 +856,7 @@
     <select id="projectPicker" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">
       <option value="">— loading —</option>
     </select>
+    <button id="projectRefreshBtn" title="Re-scan ~/.toshelabs/projects/ for new project files (works mid-run; active project stays running)" style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">↻</button>
     <button id="projectSettingsBtn" title="View project settings" style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">⚙</button>
   </div>
   <div class="spacer"></div>
@@ -1593,6 +1594,18 @@ function handleEvent(ev, d, serverTs) {
       break;
     }
 
+    // PIPE-003: another session refreshed the projects map. Re-fetch our picker.
+    case 'projects_refreshed': {
+      const added = (d.added || []).join(', ');
+      const removed = (d.removed || []).join(', ');
+      const note = added || removed
+        ? `Projects refreshed${added ? ` (added: ${added})` : ''}${removed ? ` (removed: ${removed})` : ''}`
+        : 'Projects refreshed (no changes)';
+      appendTerminal(note, 'system');
+      loadProjects();
+      break;
+    }
+
     // PIPE-003: project switcher confirms activation. Re-sync the picker label and
     // refresh the backlog (different project = different actionable list).
     case 'project_activated': {
@@ -1846,6 +1859,40 @@ async function activateProject(id) {
 document.getElementById('projectPicker').addEventListener('change', (e) => {
   if (e.target.value) activateProject(e.target.value);
 });
+// Re-scan ~/.toshelabs/projects/ — picks up new YAML files mid-run without
+// killing the active pipeline. Activation of a newly-loaded project is
+// still refused while running (409 from /api/projects/:id/activate).
+document.getElementById('projectRefreshBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('projectRefreshBtn');
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '…';
+  try {
+    const r = await fetch('/api/projects/refresh', { method: 'POST' });
+    const body = await r.json();
+    if (!r.ok) {
+      alert('Project refresh failed: ' + (body.error || r.status));
+    } else {
+      await loadProjects();
+      const noteParts = [];
+      if (body.added?.length) noteParts.push('+ ' + body.added.join(', '));
+      if (body.removed?.length) noteParts.push('- ' + body.removed.join(', '));
+      btn.title = noteParts.length
+        ? `Last refresh: ${noteParts.join(' / ')} (${new Date().toLocaleTimeString()})`
+        : `Last refresh: no changes (${new Date().toLocaleTimeString()})`;
+      btn.style.borderColor = body.added?.length || body.removed?.length ? 'var(--green)' : 'var(--border)';
+      setTimeout(() => { btn.style.borderColor = 'var(--border)'; }, 1500);
+    }
+  } catch (err) {
+    alert('Project refresh error: ' + err.message);
+  } finally {
+    btn.textContent = orig;
+    btn.disabled = false;
+  }
+});
+// SSE event handler — when ANOTHER session triggers a refresh, our picker
+// should also update without manual re-click.
+// (Wired via the main switch statement below; see project_refreshed case.)
 
 // ─── PIPE-003: project settings modal ───
 function escapeHtml(s) {

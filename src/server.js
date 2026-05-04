@@ -6,7 +6,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
-import { reloadConfig } from './config.js';
+import { reloadConfig, loadAllConfigs } from './config.js';
 import { createMcpServer, mountMcpOnExpress } from './mcp/server.js';
 import { Pipeline } from './pipeline.js';
 import { EventLogger } from './event-log.js';
@@ -224,9 +224,16 @@ export async function startServer(config) {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
 
-    const since = parseInt(req.query.since || '0');
-    for (let i = since; i < eventLog.length; i++) {
-      res.write(`data: ${JSON.stringify(eventLog[i])}\n\n`);
+    // Replay only when the client explicitly asks (since= present). On a
+    // fresh page load the client omits the param and starts from "now" —
+    // without this, every reload flushes the in-memory event log to the
+    // UI, which makes the status pill animate through old ticket_start /
+    // ticket_done pairs as if they were happening live.
+    if (req.query.since !== undefined) {
+      const since = Math.max(0, parseInt(req.query.since) || 0);
+      for (let i = since; i < eventLog.length; i++) {
+        res.write(`data: ${JSON.stringify(eventLog[i])}\n\n`);
+      }
     }
 
     const handler = (entry) => {
@@ -280,6 +287,51 @@ export async function startServer(config) {
       active: id === config._activeProjectId,
     }));
     res.json({ active: config._activeProjectId, projects: list });
+  });
+
+  // PIPE-003: hot-reload the projects map from disk. Re-enumerates
+  // ~/.toshelabs/projects/*.yaml + the legacy config file, replaces every
+  // entry in the live projects Map EXCEPT the currently-active one (its
+  // config object holds live state — running Pipeline instance, _resolved
+  // paths the worker is using, etc. — and replacing it mid-run would
+  // desync). New project files become visible in /api/projects
+  // immediately; activating one is still refused while a run is in
+  // flight (handled by /api/projects/:id/activate). The active project's
+  // config does NOT see changes from disk via this endpoint — for that
+  // use the existing /api/backlog/refresh (which calls reloadConfig on
+  // the active config in place) or restart.
+  app.post('/api/projects/refresh', async (req, res) => {
+    try {
+      const projectsMap = config._projects;
+      if (!projectsMap) {
+        return res.status(400).json({ error: 'multi-project mode not enabled (single-config startup)' });
+      }
+      const fresh = await loadAllConfigs({ legacyConfigPath: config._legacyConfigPath || 'pipeline.config.yaml' });
+      const activeId = config._activeProjectId;
+      const before = new Set(projectsMap.keys());
+
+      // Mutate in place so any closures over `projectsMap` keep working.
+      // Active project keeps its existing config object (do not replace).
+      const activeCfg = projectsMap.get(activeId);
+      projectsMap.clear();
+      for (const [id, freshCfg] of fresh.entries()) {
+        if (id === activeId && activeCfg) {
+          projectsMap.set(id, activeCfg);
+        } else {
+          projectsMap.set(id, freshCfg);
+        }
+      }
+      const after = new Set(projectsMap.keys());
+      const added = [...after].filter((id) => !before.has(id));
+      const removed = [...before].filter((id) => !after.has(id));
+
+      emitter.emit('projects_refreshed', { count: projectsMap.size, ids: [...projectsMap.keys()], added, removed, active: activeId });
+      console.log(`[projects] refreshed: ${projectsMap.size} projects (added=[${added.join(',')}], removed=[${removed.join(',')}], active=${activeId})`);
+      res.json({ ok: true, count: projectsMap.size, projects: [...projectsMap.keys()], added, removed, active: activeId });
+    } catch (err) {
+      console.error('[projects] refresh failed:', err.stack || err.message);
+      res.status(500).json({ error: err.message });
+    }
   });
 
   // PIPE-003: full settings dump for a project. Returns the config as

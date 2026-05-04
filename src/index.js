@@ -53,6 +53,11 @@ async function main() {
   const config = { ...projects.get(activeId) };
   Object.defineProperty(config, '_projects', { value: projects, enumerable: false });
   Object.defineProperty(config, '_activeProjectId', { value: activeId, enumerable: false, writable: true });
+  // Stash the legacy config path used at startup so /api/projects/refresh
+  // can re-call loadAllConfigs with the same args (otherwise it would
+  // fall back to the default 'pipeline.config.yaml' and miss any --config
+  // override the operator passed).
+  Object.defineProperty(config, '_legacyConfigPath', { value: opts.config, enumerable: false });
 
   if (opts.port) config.server.port = parseInt(opts.port);
 
