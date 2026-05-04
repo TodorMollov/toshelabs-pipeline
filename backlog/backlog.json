@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
-  "updated_at": "2026-05-03",
-  "_last_session_note": "2026-05-03 — Backlog created. PIPE-001 added: insert a dedicated `plan_critic` phase between `plan` and `tests_red` to catch unverified claims that the planner committed as resolved edge cases. Motivated by L10N-1 escape (busydad BUG-261/BUG-267).",
+  "updated_at": "2026-05-04",
+  "_last_session_note": "2026-05-04 — Added PIPE-002 (schema backfill + flip to strict), PIPE-003 (multi-project + parallel work), PIPE-004 (refuse worker edits outside configured zones). All emerge from the same architectural conversation that produced PIPE-001 — coherent direction: pipeline as a generic, multi-project orchestrator with hard contracts at every input boundary.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -77,6 +77,154 @@
         "Adding adversarial steps to other phases (review, implement). The plan is the highest-leverage point; revisit after PIPE-001 has 4 weeks of production data.",
         "Replacing the existing `think_challenge` self-prompt on the plan step. Complementary, not redundant.",
         "Cross-ticket pattern detection ('the last 5 plans all assumed X'). Future work."
+      ]
+    },
+    {
+      "id": "PIPE-002",
+      "schema_version": 1,
+      "title": "Backfill non-conformant tickets to schema v1, then flip ticket_schema.mode from warn to strict",
+      "status": "requested",
+      "priority": "P1",
+      "type": "ops",
+      "complexity": "small",
+      "area": "scripts/migrate-tickets-vN-to-vM.{js,py} (new), per-project pipeline.config.yaml mode flip, project backlog files",
+      "reported": "2026-05-04",
+      "source": "Schema validator landed in commit 29c4475 in `warn` mode — busydad's BUG-266 already fails validation (missing schema_version, complexity: \"unknown\"). Validator is currently a no-op for queue inclusion; the contract is documented but not enforced. Until tickets are backfilled to v1, flipping to strict would reject every existing ticket and freeze the pipeline.",
+      "description": "Write a one-time migration pass that loads a project's backlog file, validates each ticket against schema v1, and either auto-fixes mechanical violations (add `schema_version: 1`, coerce known complexity strings into the enum, drop free-form prose from `status` into `description`) or flags tickets requiring manual triage. Then flip ticket_schema.mode from warn → strict in the project config and verify the next pipeline run passes validation cleanly.",
+      "user_impact": "Until this lands, the schema is documentation, not enforcement — the entire point of shipping the validator. Producers (operator + LLMs in busydad CLAUDE.md) won't get fast feedback on non-conformant tickets because warn mode just logs and keeps going.",
+      "acceptance_criteria": [
+        "GIVEN a project's backlog with N non-conformant tickets, WHEN the migration script runs in --dry-run, THEN it prints a per-ticket diff of proposed changes without writing.",
+        "GIVEN the same backlog, WHEN the migration runs without --dry-run, THEN every auto-fixable ticket is rewritten in place, irrecoverable tickets are flagged for manual triage, and a summary report is printed (auto-fixed: N, manual: M, untouched: K).",
+        "GIVEN busydad's backlog after migration, WHEN the pipeline loads with ticket_schema.mode=strict, THEN no ticket_rejected events fire and `actionable` count is preserved.",
+        "GIVEN the migration is idempotent, WHEN run a second time on the same backlog, THEN it produces zero changes (auto-fixed: 0)."
+      ],
+      "decisions": [
+        "Migration is per-project, invoked manually (not auto-run on pipeline startup) — auto-migration on a live backlog risks operator-edits being overwritten between sessions.",
+        "Auto-fix scope is mechanical only. Anything semantic (e.g. \"this `complexity: huge` should be `large`\" — fine; \"this `status: 'COMPLETE — three fixes...'` — flag for manual triage, do NOT guess) goes to the manual pile.",
+        "The flip to strict happens per-project, in a separate config commit. A project can sit in warn indefinitely if its backlog hygiene isn't ready."
+      ],
+      "fix_plan": [
+        "1. Write scripts/migrate-tickets.js that loads a backlog, validates each ticket against schema v1 via src/ticket-schema.js, and produces an auto-fix plan (--dry-run by default).",
+        "2. Define mechanical auto-fixes: add schema_version=1, coerce complexity from {unknown, tiny, mini} → {trivial, small} via a hardcoded map (operator can extend), strip prose from status into description for entries matching `^[A-Z]+\\s—\\s` patterns.",
+        "3. Anything not auto-fixable: write to a `<id>.needs_triage.json` sidecar with the violations, leave the ticket untouched in backlog.",
+        "4. Run on busydad's state/backlog.json; review the diff; apply.",
+        "5. Flip pipeline.config.yaml ticket_schema.mode to strict for busydad. Restart pipeline. Confirm zero rejections.",
+        "6. Document in TICKET-SCHEMA.md under \"Versioning\" — \"How to migrate from version N to N+1: write scripts/migrate-tickets-N-to-M.js, follow the auto-fix-then-flag pattern\"."
+      ],
+      "files_likely_affected": [
+        "scripts/migrate-tickets.js (new)",
+        "TICKET-SCHEMA.md (extend Versioning section)",
+        "pipeline.config.yaml on each project (mode flip; not in this repo)"
+      ],
+      "out_of_scope": [
+        "Schema v2 (no v2 yet; flip happens when one is needed).",
+        "Cross-project orchestration (PIPE-003 territory).",
+        "Migrating busydad's state/backlog-v2.json — that file is a separate roadmap pile, not pipeline-actionable; same migration script could process it but isn't required for PIPE-002 to be done."
+      ]
+    },
+    {
+      "id": "PIPE-003",
+      "schema_version": 1,
+      "title": "Multi-project support — per-project config registry, project switcher, parallel ticket execution",
+      "status": "requested",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "large",
+      "area": "config registry (new), src/server.js (project selector + per-project lifecycle), src/pipeline.js (parallel-runner support), public/index.html (project picker), CLI",
+      "reported": "2026-05-04",
+      "source": "Explicit user direction 2026-05-03/04: \"the pipeline should be generic - we can use it to build any project - not just busydad - should follow project based configuration\" + \"i want to be able to switch between projects, i want project to be able to parallel work on tickets\". Today the pipeline is single-project (pipeline.config.yaml hard-coded to busydad) and single-runner (one ticket at a time, code_lock per project).",
+      "description": "Generalise the pipeline to host multiple projects with a registry, expose a project selector in the dashboard + CLI, and allow tickets to run in parallel either within one project (per-ticket worktree + lock) or across projects (already largely possible, just needs UI/API).",
+      "user_impact": "Today's pipeline is a single-tenant tool effectively dedicated to busydad. Generalising unlocks: (a) running pipeline against any future project the user starts, (b) parallel ticket throughput within a project (multi-runner), (c) multiple projects active concurrently. Without this, every new project requires duplicating the pipeline binary + config.",
+      "acceptance_criteria": [
+        "GIVEN a registry file (e.g. ~/.toshelabs/projects.yaml or pipeline.projects.yaml in repo root) listing N projects with their config paths, WHEN the server starts, THEN it loads all configured projects and exposes them via /api/projects.",
+        "GIVEN multiple projects loaded, WHEN the operator selects project X via the dashboard or `--project X` CLI flag, THEN subsequent /api/run* and /api/backlog* calls operate on X's config, backlog, worktree.",
+        "GIVEN parallel execution is enabled in a project's config, WHEN multiple actionable tickets exist whose `files_likely_affected` do NOT overlap, THEN the pipeline runs them concurrently in separate worktrees with separate locks. Cherry-pick to master serialises at the end.",
+        "GIVEN two parallel tickets share `files_likely_affected` overlap, WHEN they're scheduled, THEN one is queued behind the other (pre-flight conflict avoidance, not mid-run failure).",
+        "GIVEN the dashboard, WHEN the operator views it, THEN they see a project picker showing each project's actionable count + last run status + an active-project indicator."
+      ],
+      "decisions": [
+        "Registry is file-based, not database-backed. One YAML file. Operator-edited.",
+        "Per-ticket lock replaces per-project code_lock for projects with parallel enabled. Default: parallel off (single-runner per project, current behaviour).",
+        "Cherry-pick to master remains serialised across all parallel runners — master is shared, two simultaneous cherry-picks corrupt history."
+      ],
+      "open_questions": [
+        "Q1: Project registry path — `~/.toshelabs/projects.yaml` (XDG-ish, user-global) vs `pipeline.projects.yaml` (in pipeline repo, version-controlled). Recommended: in-repo, so `git pull` brings new projects to other machines.",
+        "Q2: Parallel scheduling — file-overlap pre-flight is necessary; is `files_likely_affected` reliable enough as the conflict signal, or should the pipeline pre-run plan for each candidate ticket first to get the actual `plan.files_to_change`? Latter is correct but doubles plan-step cost.",
+        "Q3: How does PIPE-001 (plan_critic) interact with parallel — does each parallel runner get its own critic instance, or do critics queue?"
+      ],
+      "fix_plan": [
+        "Phase 1 — Registry + selector (no parallel yet)",
+        "1. Define registry schema. Add config loader that reads N projects.",
+        "2. Server: per-project config map, /api/projects, /api/projects/{id}/* routes.",
+        "3. Dashboard: project picker UI; current project highlighted; switching changes the visible backlog.",
+        "Phase 2 — Per-ticket lock (foundation for parallel)",
+        "4. Replace per-project code_lock with per-ticket lock. Single-runner projects keep equivalent behaviour (one ticket → one lock).",
+        "5. Worktree paths already namespace by ticket — verify, otherwise add.",
+        "Phase 3 — Parallel runner",
+        "6. Add config: `pipeline.parallel: { enabled: bool, max_concurrent: int }`.",
+        "7. Pre-flight conflict check from `files_likely_affected`.",
+        "8. Cherry-pick to master serialised across runners (single mutex).",
+        "9. Dashboard shows N concurrent tickets per project.",
+        "Phase 4 — Cross-project parallel",
+        "10. Already largely supported (different code_locks); add UI hint that two projects can run simultaneously."
+      ],
+      "files_likely_affected": [
+        "pipeline.projects.yaml (new, registry)",
+        "src/config.js (multi-project loader)",
+        "src/server.js (per-project routing + project_id query param)",
+        "src/pipeline.js (parallel runner support, per-ticket lock)",
+        "public/index.html (project picker UI)",
+        "TICKET-SCHEMA.md (note that schema is per-project, link to registry)"
+      ],
+      "out_of_scope": [
+        "Cross-machine pipeline coordination — single host for now.",
+        "Project-level RBAC / multi-user — single operator.",
+        "Auto-discovery of projects (scan ~/code/* for pipeline.config.yaml) — explicit registry only."
+      ]
+    },
+    {
+      "id": "PIPE-004",
+      "schema_version": 1,
+      "title": "Refuse worker edits outside configured code_dirs / docs_dir",
+      "status": "requested",
+      "priority": "P2",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/pipeline.js (PreToolUse hook for Edit/Write/MultiEdit), pipeline.config.yaml (code_dirs + docs_dir declarations)",
+      "reported": "2026-05-04",
+      "source": "Recurring class of bug: the docs_update worker step has been writing edits to canonical /home/toshe/busydad/memory/code_validation.md instead of the worktree path for weeks (BUG-262, 263, 264, 266 all leaked). Root cause was busydad CLAUDE.md hardcoding the absolute path; fixed structurally on 2026-05-03 by reorganising busydad to docs/ + state/ split. But the *mechanism* still exists: a worker can edit any path in the filesystem the subprocess can reach, and the pipeline only notices via post-hoc git diff.",
+      "description": "Add a per-project config block declaring the directories a worker is allowed to write into (`code_dirs`, `docs_dir`). Pipeline enforces via a PreToolUse hook on Edit/Write/MultiEdit/NotebookEdit: worker tool calls writing to paths outside the configured zones are rejected with a clear message. Closes the leak class regardless of project conventions.",
+      "user_impact": "Without enforcement, any future project's CLAUDE.md / docs / habits could re-introduce the same leak pattern. With enforcement, leaks are physically impossible — the worker cannot write outside the sandbox even if the prompt or convention drifts.",
+      "acceptance_criteria": [
+        "GIVEN a project config declares `code_dirs: [app/, backend/]` and `docs_dir: docs/`, WHEN a worker step issues an Edit on `/home/toshe/busydad/notes.md` (outside both), THEN the tool call is rejected with a clear PreToolUse hook error message naming the violation.",
+        "GIVEN the same config, WHEN a worker writes to `app/lib/foo.dart` or `docs/SPEC.md`, THEN the call proceeds normally.",
+        "GIVEN a step is `docs_update`, WHEN it tries to edit a path outside `docs_dir`, THEN it's rejected even if the path is inside `code_dirs` (per-step write zones — docs_update only touches docs).",
+        "GIVEN the rejection fires, WHEN the worker continues, THEN the rejection message is in the worker's tool_result stream so the LLM can adapt (typically: re-issue with the worktree-relative path).",
+        "GIVEN the project does not declare write zones, WHEN a worker edits anywhere, THEN the pipeline behaves as today (no enforcement; backwards compatible)."
+      ],
+      "decisions": [
+        "Per-step write zones, not just per-project. plan/tests_red/implement → code_dirs ∪ test_dirs. docs_update → docs_dir. review/root_cause → no writes (read-only). Configurable per step.",
+        "Enforcement via PreToolUse hook (the same mechanism Claude Code uses for permissions) — fires before the edit lands, so no rollback needed. Cleaner than post-hoc git diff inspection.",
+        "Reject message must be actionable — name the path, the configured zone, and suggest the worktree-relative equivalent if it's an obvious cwd-vs-canonical mistake."
+      ],
+      "fix_plan": [
+        "1. Define config block: per-step `write_zones: [pattern, ...]`. Defaults: plan/tests_red/implement get code_dirs+test_dirs; docs_update gets docs_dir; review/root_cause empty.",
+        "2. Implement the PreToolUse hook in spawnClaude — load the step's write_zones, intercept Edit/Write/MultiEdit/NotebookEdit, validate path against zones (glob match), reject with helpful message on miss.",
+        "3. Default write_zones to permissive (everything allowed) when not configured — backwards compat for projects that haven't migrated.",
+        "4. Configure busydad's write_zones in pipeline.config.yaml: code_dirs=[app/, backend/, feedback-admin/, extensions/, scripts/], docs_dir=docs/, test_dirs=[app/test/, backend/functions/test/].",
+        "5. Run a ticket end-to-end with enforcement on; verify docs_update can no longer leak; verify implement still touches what it needs to.",
+        "6. Document in TICKET-SCHEMA.md (project-config section) and add to PROD_SETUP.md equivalent in any future project."
+      ],
+      "files_likely_affected": [
+        "src/runner.js or src/pipeline.js (PreToolUse hook in spawnClaude)",
+        "pipeline.config.example.yaml (write_zones block per step)",
+        "src/config.js (resolve write_zone globs against project_dir)",
+        "TICKET-SCHEMA.md (note enforcement model)"
+      ],
+      "out_of_scope": [
+        "Read enforcement — workers can still read anywhere (needed for cross-cutting investigations).",
+        "Auto-detecting code_dirs from the project layout — explicit configuration only (otherwise we re-introduce the same drift problem in disguise).",
+        "Per-ticket write zone overrides — tickets don't get to widen the sandbox; if a ticket genuinely needs to touch outside, the project config gets a permanent extension."
       ]
     }
   ]
