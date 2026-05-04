@@ -1865,9 +1865,57 @@ function renderKeyValueTable(obj, opts = {}) {
   }).join('');
   return `<table style="width:100%;border-collapse:collapse">${rows}</table>`;
 }
+// ─── PIPE-005 MVP: toggle-only edit helpers ───
+const MODE_OPTIONS = ['off', 'warn', 'strict'];
+function modeSelect(currentMode, settingPath, projectId) {
+  const opts = MODE_OPTIONS.map(m => `<option value="${m}"${m === currentMode ? ' selected' : ''}>${m}</option>`).join('');
+  return `<select data-setting-path="${escapeHtml(settingPath)}" data-project-id="${escapeHtml(projectId)}" data-value-type="string" class="settings-toggle" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:11px;cursor:pointer">${opts}</select>`;
+}
+function boolToggle(currentBool, settingPath, projectId) {
+  const opts = `<option value="true"${currentBool === true ? ' selected' : ''}>true</option><option value="false"${currentBool !== true ? ' selected' : ''}>false</option>`;
+  return `<select data-setting-path="${escapeHtml(settingPath)}" data-project-id="${escapeHtml(projectId)}" data-value-type="boolean" class="settings-toggle" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:11px;cursor:pointer">${opts}</select>`;
+}
+async function applySettingChange(target) {
+  const path = target.dataset.settingPath;
+  const projectId = target.dataset.projectId;
+  const raw = target.value;
+  const value = target.dataset.valueType === 'boolean' ? (raw === 'true') : raw;
+  const original = target.dataset.original;
+  target.disabled = true;
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(projectId)}/settings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, value }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      alert(`Setting save failed: ${body.error || r.status}`);
+      target.value = original;  // rollback UI
+    } else {
+      target.dataset.original = raw;
+      // brief flash to confirm — green border for 800ms
+      target.style.borderColor = 'var(--green)';
+      setTimeout(() => { target.style.borderColor = 'var(--border)'; }, 800);
+    }
+  } catch (err) {
+    alert(`Setting save error: ${err.message}`);
+    target.value = original;
+  } finally {
+    target.disabled = false;
+  }
+}
+document.addEventListener('change', (e) => {
+  if (e.target.classList.contains('settings-toggle')) applySettingChange(e.target);
+});
+document.addEventListener('focus', (e) => {
+  if (e.target.classList.contains('settings-toggle')) e.target.dataset.original = e.target.value;
+}, true);
+
 function renderProjectSettings(payload) {
   const cfg = payload.config || {};
   const resolved = payload.resolved || {};
+  const projectId = payload.id;
   const sections = [];
 
   // ─ Core ─
@@ -1895,20 +1943,35 @@ function renderProjectSettings(payload) {
     sections.push({ title: 'Ticket filter', body: renderKeyValueTable(cfg.ticket_filter) });
   }
 
-  // ─ Schema validation ─
+  // ─ Schema validation ─ (mode is editable via toggle; rest is read-only)
   if (cfg.ticket_schema) {
-    sections.push({ title: 'Ticket schema (PIPE-002)', body: renderKeyValueTable(cfg.ticket_schema) });
+    const editable = { ...cfg.ticket_schema };
+    delete editable.mode;
+    const modeRow = `<tr><td style="padding:4px 12px 4px 0;color:var(--text-dim);vertical-align:top;white-space:nowrap">mode <span style="color:var(--text-muted);font-size:10px">[editable]</span></td><td style="padding:4px 0;vertical-align:top">${modeSelect(cfg.ticket_schema.mode || 'off', 'ticket_schema.mode', projectId)}</td></tr>`;
+    sections.push({
+      title: 'Ticket schema (PIPE-002)',
+      body: `<table style="width:100%;border-collapse:collapse">${modeRow}</table>${Object.keys(editable).length ? `<div style="margin-top:8px">${renderKeyValueTable(editable)}</div>` : ''}`,
+    });
   }
 
-  // ─ Plan critic ─
+  // ─ Plan critic ─ (enabled is editable via toggle; rest is read-only)
   if (cfg.plan_critic) {
-    sections.push({ title: 'Plan critic gate (PIPE-001)', body: renderKeyValueTable(cfg.plan_critic) });
+    const editable = { ...cfg.plan_critic };
+    delete editable.enabled;
+    const enabledRow = `<tr><td style="padding:4px 12px 4px 0;color:var(--text-dim);vertical-align:top;white-space:nowrap">enabled <span style="color:var(--text-muted);font-size:10px">[editable]</span></td><td style="padding:4px 0;vertical-align:top">${boolToggle(cfg.plan_critic.enabled !== false, 'plan_critic.enabled', projectId)}</td></tr>`;
+    sections.push({
+      title: 'Plan critic gate (PIPE-001)',
+      body: `<table style="width:100%;border-collapse:collapse">${enabledRow}</table>${Object.keys(editable).length ? `<div style="margin-top:8px">${renderKeyValueTable(editable)}</div>` : ''}`,
+    });
   }
 
   // ─ Steps + write zones ─
   if (Array.isArray(cfg.steps) && cfg.steps.length > 0) {
     const stepRows = cfg.steps.map((s) => {
-      const wz = s.write_zones ? `<span style="color:${s.write_zones.mode === 'strict' ? 'var(--red)' : s.write_zones.mode === 'warn' ? 'var(--yellow)' : 'var(--text-muted)'}">${s.write_zones.mode || 'off'}</span>${s.write_zones.allow?.length ? ` <span style="color:var(--text-muted)">(${s.write_zones.allow.length} glob${s.write_zones.allow.length === 1 ? '' : 's'})</span>` : ''}` : '<span style="color:var(--text-muted)">—</span>';
+      // Write-zone mode is the editable toggle; allow-globs count stays read-only
+      const wzMode = s.write_zones?.mode || 'off';
+      const wzGlobs = s.write_zones?.allow?.length ? ` <span style="color:var(--text-muted);font-size:11px">(${s.write_zones.allow.length} glob${s.write_zones.allow.length === 1 ? '' : 's'})</span>` : '';
+      const wz = `${modeSelect(wzMode, `steps.${s.name}.write_zones.mode`, projectId)}${wzGlobs}`;
       const tools = s.tools?.length ? `<span style="color:var(--text-muted)">${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}</span>` : '';
       return `<tr style="border-top:1px solid var(--border)">
         <td style="padding:6px 12px 6px 0;font-weight:600">${escapeHtml(s.name)}</td>

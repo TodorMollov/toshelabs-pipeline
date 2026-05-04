@@ -1,7 +1,8 @@
 import express from 'express';
 import { EventEmitter } from 'events';
-import { readFile, readFile as readFileAsync } from 'fs/promises';
+import { readFile, writeFile, readFile as readFileAsync, readFile as readFileFs, writeFile as writeFileFs } from 'fs/promises';
 import { watchFile, unwatchFile, readFileSync, readdirSync } from 'fs';
+import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
@@ -286,6 +287,130 @@ export async function startServer(config) {
       configPath: target._resolved?.configPath || null,
       active: targetId === (config._activeProjectId || null),
     });
+  });
+
+  // PIPE-005 MVP (option B): toggle-only settings edits. Allows flipping
+  // a small whitelist of fields without exposing a full YAML editor:
+  //   - ticket_schema.mode                            : off | warn | strict
+  //   - plan_critic.enabled                           : true | false
+  //   - steps[<name>].write_zones.mode                : off | warn | strict
+  //
+  // Anything else returns 400 — full structured-form editor is PIPE-005.
+  // Refused (409) during a pipeline run; a config mutation mid-run would
+  // change the live Pipeline instance's behaviour halfway through a step.
+  // Writes the YAML file in place (no .bak yet — also PIPE-005), then
+  // calls reloadConfig so the running server picks up the new values.
+  app.post('/api/projects/:id/settings', async (req, res) => {
+    if (activePipeline !== null) {
+      return res.status(409).json({ error: 'cannot edit settings while a pipeline run is in flight. Wait for it to finish or POST /api/stop first.' });
+    }
+    const targetId = req.params.id;
+    const projects = config._projects;
+    const target = projects ? projects.get(targetId) : (targetId === (config._activeProjectId || config.name || 'default') ? config : null);
+    if (!target) {
+      return res.status(404).json({ error: `project ${targetId} not found` });
+    }
+    const { path: settingPath, value } = req.body || {};
+    if (typeof settingPath !== 'string' || value === undefined) {
+      return res.status(400).json({ error: 'request body must be {path: string, value: any}' });
+    }
+
+    // Whitelist + validate the path. A regex-ish match keeps this readable.
+    const ALLOWED_MODES = new Set(['off', 'warn', 'strict']);
+    let yamlEditDescriptor;
+    if (settingPath === 'ticket_schema.mode') {
+      if (!ALLOWED_MODES.has(value)) return res.status(400).json({ error: `value must be one of [${[...ALLOWED_MODES].join(', ')}]` });
+      yamlEditDescriptor = { kind: 'simple', keys: ['ticket_schema', 'mode'], value };
+    } else if (settingPath === 'plan_critic.enabled') {
+      if (typeof value !== 'boolean') return res.status(400).json({ error: 'value must be boolean' });
+      yamlEditDescriptor = { kind: 'simple', keys: ['plan_critic', 'enabled'], value };
+    } else {
+      const stepMatch = settingPath.match(/^steps\.([A-Za-z_]+)\.write_zones\.mode$/);
+      if (stepMatch) {
+        if (!ALLOWED_MODES.has(value)) return res.status(400).json({ error: `value must be one of [${[...ALLOWED_MODES].join(', ')}]` });
+        yamlEditDescriptor = { kind: 'step', stepName: stepMatch[1], keys: ['write_zones', 'mode'], value };
+      } else {
+        return res.status(400).json({ error: `path "${settingPath}" not in the toggle-only whitelist. Allowed: ticket_schema.mode, plan_critic.enabled, steps.<name>.write_zones.mode. Full editing pending PIPE-005.` });
+      }
+    }
+
+    // Apply to the in-memory config (so /api/projects/:id/config returns
+    // the new value immediately) AND persist to the YAML file. Order:
+    // file first, then in-memory — if the write fails, the in-memory
+    // state isn't desynced from disk.
+    const yamlPath = target._resolved?.configPath;
+    if (!yamlPath) return res.status(500).json({ error: 'project has no configPath; cannot persist' });
+    let raw;
+    try {
+      raw = await readFileFs(yamlPath, 'utf-8');
+    } catch (err) {
+      return res.status(500).json({ error: `failed to read ${yamlPath}: ${err.message}` });
+    }
+
+    // Edit YAML by parsing → mutating → re-stringifying. Loses comments and
+    // formatting (acceptable for toggle-only MVP; full PIPE-005 will use a
+    // round-trip-preserving YAML editor or section-targeted regex edits).
+    let parsed;
+    try {
+      parsed = parseYaml(raw);
+    } catch (err) {
+      return res.status(500).json({ error: `existing YAML is unparseable: ${err.message}` });
+    }
+    if (yamlEditDescriptor.kind === 'simple') {
+      let cur = parsed;
+      for (let i = 0; i < yamlEditDescriptor.keys.length - 1; i++) {
+        const k = yamlEditDescriptor.keys[i];
+        if (cur[k] == null || typeof cur[k] !== 'object') cur[k] = {};
+        cur = cur[k];
+      }
+      cur[yamlEditDescriptor.keys[yamlEditDescriptor.keys.length - 1]] = yamlEditDescriptor.value;
+    } else if (yamlEditDescriptor.kind === 'step') {
+      const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+      const step = steps.find((s) => s?.name === yamlEditDescriptor.stepName);
+      if (!step) return res.status(400).json({ error: `step "${yamlEditDescriptor.stepName}" not found in config` });
+      let cur = step;
+      for (let i = 0; i < yamlEditDescriptor.keys.length - 1; i++) {
+        const k = yamlEditDescriptor.keys[i];
+        if (cur[k] == null || typeof cur[k] !== 'object') cur[k] = {};
+        cur = cur[k];
+      }
+      cur[yamlEditDescriptor.keys[yamlEditDescriptor.keys.length - 1]] = yamlEditDescriptor.value;
+    }
+
+    let serialized;
+    try {
+      serialized = stringifyYaml(parsed, { lineWidth: 0 });
+    } catch (err) {
+      return res.status(500).json({ error: `failed to serialise YAML: ${err.message}` });
+    }
+    try {
+      await writeFileFs(yamlPath, serialized, 'utf-8');
+    } catch (err) {
+      return res.status(500).json({ error: `failed to write ${yamlPath}: ${err.message}` });
+    }
+
+    // Reload BOTH (a) the projects Map entry — that's where /api/projects/:id
+    // reads from on subsequent requests, and (b) the active config holder if
+    // this project is currently active. Index.js shallow-clones the Map entry
+    // into the runtime config holder, so they're SEPARATE objects with the
+    // same configPath. Updating only one leaves the other stale.
+    try {
+      if (projects && projects.has(targetId)) {
+        await reloadConfig(projects.get(targetId));
+      }
+      if (targetId === (config._activeProjectId || config.name || 'default')) {
+        await reloadConfig(config);
+        // reloadConfig overwrites the _ fields too — restore them.
+        Object.defineProperty(config, '_projects', { value: projects, enumerable: false });
+        Object.defineProperty(config, '_activeProjectId', { value: targetId, enumerable: false, writable: true });
+      }
+    } catch (err) {
+      console.error(`[settings] write succeeded but reload failed: ${err.message}`);
+    }
+
+    emitter.emit('project_settings_updated', { id: targetId, path: settingPath, value });
+    console.log(`[settings] ${targetId}: ${settingPath} = ${JSON.stringify(value)}`);
+    res.json({ ok: true, id: targetId, path: settingPath, value });
   });
 
   app.post('/api/projects/:id/activate', async (req, res) => {
