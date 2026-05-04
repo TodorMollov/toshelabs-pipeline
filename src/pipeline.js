@@ -2577,7 +2577,19 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       extra_failures: res.extraFailures,
       new_extra_failures: newExtraFailures,
       test_output_summary: res.testOutput.split('\n').slice(-5).join('\n').trim(),
-      analyze_output_summary: res.analyzeOutput.split('\n').slice(-5).join('\n').trim(),
+      // Keep every analyzer diagnostic line (error/warning/info) + the trailing
+      // "N issues found." so heal sees ALL errors, not just the last 5 lines of
+      // raw output. Caps at 8KB to keep heal prompts bounded. Truncating to a
+      // tail (the previous behaviour) made heal converge in 2-error increments
+      // and exhaust attempts on tickets with >5 new errors (BUG-261).
+      analyze_output_summary: (() => {
+        const lines = res.analyzeOutput.split('\n');
+        const diagRe = /^\s*(error|warning|info)\s+[•·]/i;
+        const summaryRe = /\b\d+\s+issues?\s+found\b/i;
+        const kept = lines.filter((l) => diagRe.test(l) || summaryRe.test(l));
+        const block = (kept.length > 0 ? kept : lines.slice(-5)).join('\n').trim();
+        return block.length > 8000 ? block.slice(0, 8000) + `\n… [truncated; full analyzer output ${block.length}B]` : block;
+      })(),
       extra_output_summary: res.extraOutput ? res.extraOutput.trim() : undefined,
       native_step: true,
     };
