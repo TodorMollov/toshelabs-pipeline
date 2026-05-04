@@ -260,6 +260,34 @@ export async function startServer(config) {
     res.json({ active: config._activeProjectId, projects: list });
   });
 
+  // PIPE-003: full settings dump for a project. Returns the config as
+  // loaded (minus internal fields prefixed with _). Used by the dashboard
+  // settings panel to display paths, schema mode, plan_critic config,
+  // per-step write zones, etc. without making the operator open YAML files.
+  app.get('/api/projects/:id', (req, res) => {
+    const projects = config._projects;
+    const targetId = req.params.id;
+    const target = projects ? projects.get(targetId) : (targetId === (config._activeProjectId || config.name || 'default') ? config : null);
+    if (!target) {
+      return res.status(404).json({ error: `project ${targetId} not found` });
+    }
+    // Strip private/internal fields (anything starting with _) and any
+    // non-serialisable values. Keep _resolved separately so the UI can
+    // show the absolute paths the pipeline actually uses.
+    const safe = {};
+    for (const [k, v] of Object.entries(target)) {
+      if (k.startsWith('_')) continue;
+      try { JSON.stringify(v); safe[k] = v; } catch { /* skip non-serialisable */ }
+    }
+    res.json({
+      id: targetId,
+      config: safe,
+      resolved: target._resolved || null,
+      configPath: target._resolved?.configPath || null,
+      active: targetId === (config._activeProjectId || null),
+    });
+  });
+
   app.post('/api/projects/:id/activate', async (req, res) => {
     if (activePipeline !== null) {
       return res.status(409).json({ error: 'cannot switch projects while a pipeline run is in flight. Wait for it to finish or POST /api/stop first.' });

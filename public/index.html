@@ -831,6 +831,19 @@
 </head>
 <body>
 
+<!-- PROJECT SETTINGS MODAL (PIPE-003) -->
+<div id="projectSettingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:min(900px,90vw);max-height:85vh;overflow:auto;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <h2 style="margin:0;font-size:14px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text)" id="projectSettingsTitle">Project Settings</h2>
+      <button id="projectSettingsClose" style="background:transparent;color:var(--text-dim);border:none;font-size:20px;cursor:pointer;padding:0 4px">×</button>
+    </div>
+    <div id="projectSettingsBody" style="padding:18px;font-size:12px;color:var(--text)">
+      <div style="color:var(--text-muted)">Loading…</div>
+    </div>
+  </div>
+</div>
+
 <!-- HEADER -->
 <div class="header">
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
@@ -843,6 +856,7 @@
     <select id="projectPicker" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">
       <option value="">— loading —</option>
     </select>
+    <button id="projectSettingsBtn" title="View project settings" style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">⚙</button>
   </div>
   <div class="spacer"></div>
   <div class="context-meter">
@@ -1831,6 +1845,146 @@ async function activateProject(id) {
 }
 document.getElementById('projectPicker').addEventListener('change', (e) => {
   if (e.target.value) activateProject(e.target.value);
+});
+
+// ─── PIPE-003: project settings modal ───
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function renderKeyValueTable(obj, opts = {}) {
+  const entries = Object.entries(obj || {});
+  if (entries.length === 0) return `<div style="color:var(--text-muted);font-style:italic">— empty —</div>`;
+  const rows = entries.map(([k, v]) => {
+    let displayValue;
+    if (v == null) displayValue = '<span style="color:var(--text-muted)">—</span>';
+    else if (typeof v === 'object') displayValue = `<pre style="margin:0;font-size:11px;color:var(--text-dim);background:var(--bg);padding:6px;border-radius:3px;overflow-x:auto;max-width:600px">${escapeHtml(JSON.stringify(v, null, 2))}</pre>`;
+    else if (typeof v === 'boolean') displayValue = `<span style="color:${v ? 'var(--green)' : 'var(--text-dim)'}">${v}</span>`;
+    else displayValue = `<code style="background:var(--bg);padding:2px 6px;border-radius:3px;font-size:11px">${escapeHtml(v)}</code>`;
+    return `<tr><td style="padding:4px 12px 4px 0;color:var(--text-dim);vertical-align:top;white-space:nowrap">${escapeHtml(k)}</td><td style="padding:4px 0;vertical-align:top">${displayValue}</td></tr>`;
+  }).join('');
+  return `<table style="width:100%;border-collapse:collapse">${rows}</table>`;
+}
+function renderProjectSettings(payload) {
+  const cfg = payload.config || {};
+  const resolved = payload.resolved || {};
+  const sections = [];
+
+  // ─ Core ─
+  sections.push({
+    title: 'Core',
+    body: renderKeyValueTable({
+      id: payload.id,
+      active: payload.active,
+      name: cfg.name,
+      project_dir: cfg.project_dir,
+      config_file: payload.configPath,
+    }),
+  });
+
+  // ─ Paths (resolved absolute) ─
+  if (resolved && Object.keys(resolved).length > 0) {
+    const pathKeys = ['backlog','archive','closedBugs','validationRules','codeLock','pipelineDir','workerOutputDir','buildLogDir','projectWorktree','projectWorktreeBranch'];
+    const pathTable = {};
+    for (const k of pathKeys) if (resolved[k] != null) pathTable[k] = resolved[k];
+    sections.push({ title: 'Resolved paths', body: renderKeyValueTable(pathTable) });
+  }
+
+  // ─ Backlog filtering ─
+  if (cfg.ticket_filter) {
+    sections.push({ title: 'Ticket filter', body: renderKeyValueTable(cfg.ticket_filter) });
+  }
+
+  // ─ Schema validation ─
+  if (cfg.ticket_schema) {
+    sections.push({ title: 'Ticket schema (PIPE-002)', body: renderKeyValueTable(cfg.ticket_schema) });
+  }
+
+  // ─ Plan critic ─
+  if (cfg.plan_critic) {
+    sections.push({ title: 'Plan critic gate (PIPE-001)', body: renderKeyValueTable(cfg.plan_critic) });
+  }
+
+  // ─ Steps + write zones ─
+  if (Array.isArray(cfg.steps) && cfg.steps.length > 0) {
+    const stepRows = cfg.steps.map((s) => {
+      const wz = s.write_zones ? `<span style="color:${s.write_zones.mode === 'strict' ? 'var(--red)' : s.write_zones.mode === 'warn' ? 'var(--yellow)' : 'var(--text-muted)'}">${s.write_zones.mode || 'off'}</span>${s.write_zones.allow?.length ? ` <span style="color:var(--text-muted)">(${s.write_zones.allow.length} glob${s.write_zones.allow.length === 1 ? '' : 's'})</span>` : ''}` : '<span style="color:var(--text-muted)">—</span>';
+      const tools = s.tools?.length ? `<span style="color:var(--text-muted)">${s.tools.length} tool${s.tools.length === 1 ? '' : 's'}</span>` : '';
+      return `<tr style="border-top:1px solid var(--border)">
+        <td style="padding:6px 12px 6px 0;font-weight:600">${escapeHtml(s.name)}</td>
+        <td style="padding:6px 12px 6px 0;color:var(--text-dim)">${escapeHtml(s.model || '—')}</td>
+        <td style="padding:6px 12px 6px 0;color:var(--text-dim)">${escapeHtml(s.max_turns || '—')}</td>
+        <td style="padding:6px 12px 6px 0">${tools}</td>
+        <td style="padding:6px 0">${wz}</td>
+      </tr>`;
+    }).join('');
+    sections.push({
+      title: 'Steps',
+      body: `<table style="width:100%;border-collapse:collapse">
+        <thead><tr style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">
+          <th style="text-align:left;padding:4px 12px 4px 0">Name</th>
+          <th style="text-align:left;padding:4px 12px 4px 0">Model</th>
+          <th style="text-align:left;padding:4px 12px 4px 0">Max turns</th>
+          <th style="text-align:left;padding:4px 12px 4px 0">Tools</th>
+          <th style="text-align:left;padding:4px 0">Write zones (PIPE-004)</th>
+        </tr></thead>
+        <tbody>${stepRows}</tbody>
+      </table>`,
+    });
+  }
+
+  // ─ Context files ─
+  if (Array.isArray(cfg.context_files) && cfg.context_files.length > 0) {
+    sections.push({
+      title: 'Context files',
+      body: `<ul style="margin:0;padding-left:18px;color:var(--text-dim)">${cfg.context_files.map((f) => `<li><code style="font-size:11px">${escapeHtml(f)}</code></li>`).join('')}</ul>`,
+    });
+  }
+
+  // ─ Raw (escape hatch) ─
+  sections.push({
+    title: 'Raw config (collapsed)',
+    body: `<details><summary style="cursor:pointer;color:var(--text-dim);font-size:11px">Show full JSON</summary><pre style="margin:8px 0 0 0;font-size:11px;background:var(--bg);padding:10px;border-radius:4px;overflow:auto;max-height:300px">${escapeHtml(JSON.stringify(cfg, null, 2))}</pre></details>`,
+  });
+
+  return sections.map((s) => `
+    <section style="margin-bottom:18px">
+      <h3 style="margin:0 0 8px 0;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">${escapeHtml(s.title)}</h3>
+      ${s.body}
+    </section>
+  `).join('');
+}
+async function openProjectSettings() {
+  const modal = document.getElementById('projectSettingsModal');
+  const body = document.getElementById('projectSettingsBody');
+  const title = document.getElementById('projectSettingsTitle');
+  modal.style.display = 'flex';
+  body.innerHTML = '<div style="color:var(--text-muted)">Loading…</div>';
+  try {
+    const status = await fetch('/api/status').then(r => r.json());
+    const id = status.activeProjectId || 'default';
+    title.textContent = `Project Settings — ${id}`;
+    const r = await fetch(`/api/projects/${encodeURIComponent(id)}`);
+    if (!r.ok) {
+      body.innerHTML = `<div style="color:var(--red)">Failed to load: ${r.status}</div>`;
+      return;
+    }
+    const payload = await r.json();
+    body.innerHTML = renderProjectSettings(payload);
+  } catch (e) {
+    body.innerHTML = `<div style="color:var(--red)">Error: ${escapeHtml(e.message)}</div>`;
+  }
+}
+function closeProjectSettings() {
+  document.getElementById('projectSettingsModal').style.display = 'none';
+}
+document.getElementById('projectSettingsBtn').addEventListener('click', openProjectSettings);
+document.getElementById('projectSettingsClose').addEventListener('click', closeProjectSettings);
+document.getElementById('projectSettingsModal').addEventListener('click', (e) => {
+  if (e.target.id === 'projectSettingsModal') closeProjectSettings();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && document.getElementById('projectSettingsModal').style.display === 'flex') closeProjectSettings();
 });
 
 // ─── Init ───
