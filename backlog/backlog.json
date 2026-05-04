@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-04",
-  "_last_session_note": "2026-05-04 — Three more shipped: PIPE-005 toggle MVP (c913184, schema mode + plan_critic.enabled + per-step write_zones.mode), PIPE-006 MCP server (77cc7aa). PIPE-005 (full editor), PIPE-007 (self-improvement docs) remain requested for future sessions.",
+  "_last_session_note": "2026-05-04 — PIPE-008 shipped (55be660): real cross-project concurrent pipelines. Operator pushed back on the earlier \"comes for free\" claim that turned out to be incomplete. Refactor adds project-scoped run/stop endpoints, drops the activate-409, tags every Pipeline event with its project for SSE multiplexing.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -372,6 +372,30 @@
         "Building self-hosting capability (pipeline-against-itself). Explicitly NOT a goal.",
         "CI/CD for pipeline changes (no automated tests on commit). Future.",
         "Pipeline release versioning. Future."
+      ]
+    },
+    {
+      "id": "PIPE-008",
+      "schema_version": 1,
+      "title": "Per-project Pipeline — concurrent runs across projects (drop activate-409)",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/server.js (activePipelines map, project-scoped routes, status shape), public/index.html (SSE event filter, picker indicator)",
+      "reported": "2026-05-04",
+      "shipped_at": "2026-05-04",
+      "landed_commit": "55be660",
+      "shipped_note": "Replaces single activePipeline with Map<projectId, Pipeline>. Adds project-scoped run/stop/status endpoints. Drops activate 409. Per-project event tagging via emitter wrapper. Dashboard event filter + ● running indicator in picker. Verified: busydad 7-ticket queue running, pension-ai activated mid-run with no 409, perProject map correctly reports busydad running and pension-ai idle.",
+      "source": "Operator pushed back 2026-05-04: 'i thought we can run two pipelines in parallel on different projects'. PIPE-003's original out-of-scope only covered intra-project parallel; cross-project parallel was claimed 'comes for free' but the implementation kept a single global activePipeline. This refactor closes that gap.",
+      "description": "Replace the global activePipeline with a Map<projectId, Pipeline>. Each Pipeline gets a project-tagging emitter wrapper. Per-project run/stop endpoints. Drop the activate-409 because switching projects is now just a display preference. Backwards-compat top-level endpoints dispatch to the active project's pipeline.",
+      "user_impact": "Two projects can run pipelines simultaneously without one blocking the other. Operator can switch the dashboard view between busydad and pension-ai mid-run, see both in the picker (● indicator), and inspect each project's settings independently.",
+      "acceptance_criteria": [
+        "GIVEN project A's pipeline is running, WHEN the operator activates project B, THEN no 409 fires.",
+        "GIVEN both projects loaded, WHEN POST /api/projects/A/run/all is called, THEN A starts and POST /api/projects/B/run/all also starts (no cross-blocking).",
+        "GIVEN both running, WHEN POST /api/projects/A/stop is called, THEN A halts and B keeps running.",
+        "GIVEN /api/status, WHEN polled, THEN runningProjects[] reflects all active pipelines and perProject{} is per-project running flags.",
+        "GIVEN dashboard SSE, WHEN events with project: A arrive while project B is the active view, THEN they don't render in the terminal feed but the picker indicator updates."
       ]
     }
   ]
