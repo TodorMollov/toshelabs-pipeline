@@ -296,6 +296,18 @@
     opacity: 0.5;
   }
 
+  /* Pipeline-state status colors on the left border. The :not(.active)
+     qualifier keeps the cyan active-row indicator dominant when both
+     classes are present. */
+  .ticket-item.status-failed:not(.active),
+  .ticket-item.status-crashed:not(.active) { border-left-color: var(--red); }
+  .ticket-item.status-blocked:not(.active) { border-left-color: var(--yellow); }
+  .ticket-item.status-in_progress:not(.active) {
+    border-left-color: var(--yellow);
+    animation: pulse 1.5s infinite;
+  }
+  .ticket-item.status-done:not(.active) { border-left-color: var(--green); }
+
   .ticket-top {
     display: flex;
     align-items: center;
@@ -824,6 +836,14 @@
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
   <div class="status-pill idle" id="statusPill">Idle</div>
   <a href="/reports.html" style="margin-left:14px;color:var(--text-dim);font-size:12px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px">Reports &rarr;</a>
+  <!-- PIPE-003: project picker. Populated from /api/projects. Switching is
+       refused server-side while a run is in flight (server returns 409). -->
+  <div style="display:flex;align-items:center;gap:6px;margin-left:14px">
+    <span style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">Project</span>
+    <select id="projectPicker" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer">
+      <option value="">— loading —</option>
+    </select>
+  </div>
   <div class="spacer"></div>
   <div class="context-meter">
     <span>CTX</span>
@@ -925,11 +945,42 @@
 </div>
 
 <script>
-const STEPS = ['plan','tests_red','implement','tests_green','review','root_cause','docs_update'];
+const STEPS = ['plan','plan_critic','tests_red','implement','tests_green','review','root_cause','docs_update'];
 const state = { running: false, activeTicket: null, startTime: null, completed: 0, thinkRounds: 0 };
 let allTickets = [];
 let currentActionable = [];
 let ticketQuery = ''; // lowercased search text; empty = no filter
+// { ticketId: { status, blocked_step } } — drives the per-row color cue
+// in the sidebar. Hydrated by loadPipelineStates() on init and refreshed
+// on ticket lifecycle events.
+let pipelineStates = {};
+
+async function loadPipelineStates() {
+  try {
+    const r = await fetch('/api/pipeline-states');
+    if (!r.ok) return;
+    pipelineStates = await r.json();
+    applyPipelineStatesToDOM();
+  } catch { /* best-effort */ }
+}
+
+// Update status-* classes on each existing .ticket-item in place. Avoids
+// the side effects of a full rerender (loss of .active, scroll position,
+// expanded <details> groups). Adds/removes one class per row; cheap.
+function applyPipelineStatesToDOM() {
+  const STATUS_CLASSES = ['status-failed','status-crashed','status-blocked','status-in_progress','status-done'];
+  document.querySelectorAll('.ticket-item').forEach(el => {
+    el.classList.remove(...STATUS_CLASSES);
+    const s = pipelineStates[el.dataset.id]?.status;
+    if (s) el.classList.add(`status-${s}`);
+  });
+}
+
+// Safety-net poll: SSE event handlers refresh on step/ticket transitions,
+// but a page loaded mid-ticket would otherwise wait until the next
+// transition to update. 10s is short enough to feel live without flooding
+// the server (the endpoint is a small JSON dump of state files).
+setInterval(loadPipelineStates, 10000);
 
 // Match by id substring, title substring, and description substring.
 // Match is AND across whitespace-separated tokens so "BUG 210 mot" finds
@@ -1038,7 +1089,9 @@ function renderTicketItem(t, actionIds) {
   const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
   const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
   const testTag = isTest ? '<span class="ticket-tag test">test</span>' : '';
-  return `<div class="ticket-item" data-id="${t.id}">
+  const stateStatus = pipelineStates[t.id]?.status;
+  const statusCls = stateStatus ? ` status-${stateStatus}` : '';
+  return `<div class="ticket-item${statusCls}" data-id="${t.id}">
     <div class="ticket-top">
       <span class="ticket-id ${idCls}">${t.id}</span>
       <span class="ticket-priority ${pCls}">${t.priority||''}</span>
@@ -1280,8 +1333,8 @@ function handleEvent(ev, d, serverTs) {
   _currentEventTs = serverTs || null;
   switch (ev) {
     case 'run_requested': setRunning(true); break;
-    case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); break;
-    case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; break;
+    case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
+    case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; loadPipelineStates(); break;
     case 'step_start':
       setStepStatus(d.step, 'active');
       state.stepStartTime = Date.now();
@@ -1295,6 +1348,7 @@ function handleEvent(ev, d, serverTs) {
         const m = d.metrics;
         appendTerminal(`[step] ${d.ticket}/${d.step} · ${m.inputTokens.toLocaleString()} in / ${m.outputTokens.toLocaleString()} out · ${m.toolCalls} tools`, (m.model || 'system'), { duration: m.durationFormatted, pct: m.usagePercent });
       }
+      loadPipelineStates();
       break;
     case 'step_skipped': setStepStatus(d.step, d.reason === 'already done' ? 'done' : ''); break;
     case 'step_gate':
@@ -1485,6 +1539,7 @@ function handleEvent(ev, d, serverTs) {
       document.getElementById('statusPill').textContent = 'Failed';
       document.getElementById('statStatus').textContent = 'Failed';
       document.getElementById('statStatus').style.color = 'var(--red)';
+      loadPipelineStates();
       break;
     case 'pipeline_blocked': appendTerminal(`BLOCKED: code lock held by ${d.holder}`, 'system'); setRunning(false); break;
     case 'pipeline_empty': appendTerminal('No actionable tickets', 'system'); setRunning(false); break;
@@ -1501,9 +1556,39 @@ function handleEvent(ev, d, serverTs) {
     case 'step_attempt_done': appendTerminal(`[${d.model}] ${d.step} attempt ${d.attempt} · ${d.inputTokens?.toLocaleString() || 0} in · ${d.outputTokens?.toLocaleString() || 0} out · ${d.toolCalls || 0} tools${d.maxTurnsHit ? ' · MAX TURNS' : ''}`, 'system'); break;
     case 'ticket_done': appendTerminal(`── ticket done: ${d.ticket} ──`, 'divider'); break;
     case 'ticket_report': appendTerminal(`Report: ${d.ticket} — ${d.totalDurationFormatted} · ${d.totalOutputTokens?.toLocaleString() || 0} out · ${d.totalFilesChanged || 0} files${d.usagePercent != null ? ' · 5h: '+d.usagePercent+'%' : ''}`, 'system'); break;
-    case 'ticket_blocked': appendTerminal(`BLOCKED: ${d.ticket} at ${d.step}`, 'system'); break;
+    case 'ticket_blocked': appendTerminal(`BLOCKED: ${d.ticket} at ${d.step}`, 'system'); loadPipelineStates(); break;
     case 'step_gate_failed': appendTerminal(`Gate FAILED: ${d.step} after ${d.attempts} attempts — ${d.failures?.join(', ')}`, 'system'); break;
     case 'mechanical_docs': appendTerminal(`[auto] Updated ${d.file}`, 'system'); break;
+
+    // PIPE-002: schema validator emits this when a backlog ticket fails the v1 contract.
+    // Show the field-level reasons so the operator can fix the ticket without reading the
+    // sidecar JSON file.
+    case 'ticket_rejected': {
+      const v = (d.violations || []).slice(0, 3).map(x => `${x.field}: ${x.message || x.rule}`).join(' | ');
+      const more = (d.violations || []).length > 3 ? ` (+${d.violations.length - 3} more)` : '';
+      appendTerminal(`<span class="fail">SCHEMA REJECT [${d.mode}]</span> ${d.ticket} — ${v}${more}`, 'system');
+      break;
+    }
+
+    // PIPE-004: write-zone enforcement emits this when a step touched files outside
+    // its declared write zones (or leaked into canonical project_dir).
+    case 'write_zone_violation': {
+      const paths = (d.violations || []).slice(0, 5).map(v => `${v.kind === 'canonical_leak' ? 'LEAK' : 'OUT'} ${v.path}`).join(' | ');
+      const more = (d.violations || []).length > 5 ? ` (+${d.violations.length - 5} more)` : '';
+      appendTerminal(`<span class="fail">WRITE-ZONE [${d.mode}]</span> ${d.ticket}/${d.step} — ${paths}${more}`, 'system');
+      break;
+    }
+
+    // PIPE-003: project switcher confirms activation. Re-sync the picker label and
+    // refresh the backlog (different project = different actionable list).
+    case 'project_activated': {
+      appendTerminal(`Project switched to ${d.id}${d.name && d.name !== d.id ? ` (${d.name})` : ''}`, 'system');
+      const picker = document.getElementById('projectPicker');
+      if (picker) picker.value = d.id;
+      refreshBacklog();
+      loadPipelineStates();
+      break;
+    }
   }
   if (state.startTime) document.getElementById('statElapsed').textContent = formatElapsed(Date.now() - state.startTime);
 }
@@ -1713,13 +1798,50 @@ function savePanelWidths() {
 
 initPanelResize();
 
+// ─── PIPE-003: project picker init + switching ───
+async function loadProjects() {
+  try {
+    const r = await fetch('/api/projects');
+    if (!r.ok) return;
+    const { active, projects } = await r.json();
+    const picker = document.getElementById('projectPicker');
+    if (!picker) return;
+    picker.innerHTML = projects
+      .map(p => `<option value="${p.id}"${p.id === active ? ' selected' : ''}>${p.name}${p.id !== p.name ? ` (${p.id})` : ''}</option>`)
+      .join('');
+    picker.disabled = projects.length < 2;
+    if (projects.length < 2) picker.title = 'Only one project loaded. Add YAML files under ~/.toshelabs/projects/ to enable switching.';
+    else picker.title = '';
+  } catch (e) { console.warn('[projects] load failed', e); }
+}
+async function activateProject(id) {
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(id)}/activate`, { method: 'POST' });
+    const body = await r.json();
+    if (!r.ok) {
+      alert(`Cannot switch project: ${body.error || r.status}`);
+      // restore picker to whatever the server still considers active
+      loadProjects();
+      return;
+    }
+    // The project_activated event fires from the server and re-syncs everything;
+    // just nudge the local title for instant feedback.
+    document.title = `${body.name || id} — TosheLabs Pipeline`;
+  } catch (e) { console.warn('[projects] activate failed', e); }
+}
+document.getElementById('projectPicker').addEventListener('change', (e) => {
+  if (e.target.value) activateProject(e.target.value);
+});
+
 // ─── Init ───
 connectSSE();
 updateUsageWidget();
+loadProjects();
 fetch('/api/backlog').then(r=>r.json()).then(data => {
   allTickets = data.all || [];
   currentActionable = data.actionable || [];
   rerenderTicketList();
+  loadPipelineStates();
 });
 
 // ─── Ticket search wiring ───
