@@ -23,6 +23,7 @@ import {
   cherryPickToMaster,
 } from './worktree.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
+import { checkWriteZones, formatViolations } from './write-zones.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -1833,12 +1834,24 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
       // Snapshot git state before code-writing steps
       let gitSnapshotBefore = null;
+      let canonicalSnapshotBefore = null;
       if (['implement', 'tests_red', 'docs_update'].includes(stepConfig.name)) {
         try {
           const tracked = execSync('git diff --name-only HEAD', { cwd: this.cwd, encoding: 'utf-8' }).trim();
           const untracked = execSync('git ls-files --others --exclude-standard', { cwd: this.cwd, encoding: 'utf-8' }).trim();
           gitSnapshotBefore = [tracked, untracked].filter(Boolean).join('\n');
         } catch { /* ignore */ }
+        // Capture canonical project_dir snapshot too — used by PIPE-004
+        // write-zone enforcement to detect canonical-project leaks (worker
+        // edits the operator's primary checkout instead of the worktree).
+        // Only relevant when worktree mode is active (cwd != project_dir).
+        if (this.config.project_dir && this.config.project_dir !== this.cwd) {
+          try {
+            const tracked = execSync('git diff --name-only HEAD', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
+            const untracked = execSync('git ls-files --others --exclude-standard', { cwd: this.config.project_dir, encoding: 'utf-8' }).trim();
+            canonicalSnapshotBefore = [tracked, untracked].filter(Boolean).join('\n');
+          } catch { /* ignore */ }
+        }
       }
 
       const attemptLabel = isRetry ? `heal-${attempt}` : 'run';
@@ -1974,6 +1987,43 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       // Auto-populate files from git
       await this.autoPopulateFiles(stepConfig, pipelineState, ticket, gitSnapshotBefore, stepStartTime);
       pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
+
+      // PIPE-004: write-zone enforcement. Catches two failure classes:
+      //   1. Worktree-internal misroute (file inside worktree but outside
+      //      step's allowed globs — e.g. docs_update touched app/lib/foo.dart).
+      //   2. Canonical-project leak (worker edited operator's primary
+      //      checkout instead of the worktree — the docs_update class of
+      //      bug that produced weeks of memory/code_validation.md leaks
+      //      before the 2026-05-03 busydad reorg).
+      //
+      // Off by default for backwards-compat. Enable per step in
+      // pipeline.config.yaml with `write_zones: { mode: warn|strict, allow: [...] }`.
+      // In strict mode a violation throws and the step fails; in warn mode
+      // we only emit the event so the operator can see the leak in the
+      // dashboard without halting the run.
+      if (stepConfig.write_zones && stepConfig.write_zones.mode && stepConfig.write_zones.mode !== 'off') {
+        const wzMode = stepConfig.write_zones.mode;
+        const allow = stepConfig.write_zones.allow || [];
+        const violations = checkWriteZones({
+          worktreeCwd: this.cwd,
+          canonicalProjectDir: this.config.project_dir,
+          worktreeSnapshotBefore: gitSnapshotBefore,
+          canonicalSnapshotBefore,
+          allowGlobs: allow,
+        });
+        if (violations.length > 0) {
+          this.emit('write_zone_violation', {
+            ticket: ticket.id,
+            step: stepConfig.name,
+            mode: wzMode,
+            violations,
+          });
+          console.warn(`[write-zones:${wzMode}] ${ticket.id}/${stepConfig.name}: ${violations.length} violation(s):\n${formatViolations(violations)}`);
+          if (wzMode === 'strict') {
+            throw new Error(`Step ${stepConfig.name} wrote outside configured zones (${violations.length} violation${violations.length === 1 ? '' : 's'}). See event log for paths.`);
+          }
+        }
+      }
 
       // Validate
       const stepArtifacts = pipelineState.steps[stepConfig.name] || {};

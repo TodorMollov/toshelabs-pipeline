@@ -115,6 +115,21 @@ ticket_schema:
   mode: off
   accepts_schema_versions: [1]
   overrides: {}
+
+# PIPE-004: per-step write-zone enforcement. Each step in the `steps:`
+# block below can declare a `write_zones` block:
+#
+#   write_zones:
+#     mode: off | warn | strict
+#     allow:
+#       - app/**
+#       - docs/**
+#
+# At step end the orchestrator inspects git diff in (a) the worktree and
+# (b) the canonical project_dir. Files dirty after the step that don't
+# match any glob trigger a `write_zone_violation` event. In strict mode
+# the step fails. Off by default per step (backwards-compat). Catches
+# the docs_update-leak class of bug regardless of project conventions.
   # Example overrides:
   #   overrides:
   #     type:
