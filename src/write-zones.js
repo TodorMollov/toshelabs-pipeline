@@ -47,7 +47,7 @@ import { existsSync } from 'fs';
  *   ?      — single char except `/`
  * Anchored: pattern must match the full path (no implicit prefix).
  */
-function globMatch(pattern, path) {
+export function globMatch(pattern, path) {
   // Translate glob → regex
   let re = '';
   for (let i = 0; i < pattern.length; i++) {

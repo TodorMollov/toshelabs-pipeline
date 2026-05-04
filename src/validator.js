@@ -68,6 +68,16 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
         }
         break;
 
+      case 'type_is_array':
+        // Empty arrays count as valid — used by plan_critic where an empty
+        // findings array means "no objections" (a legitimate honest result,
+        // distinct from a missing field which means the worker didn't write
+        // a structured output).
+        if (!Array.isArray(value)) {
+          failures.push(`${rule.field}: expected array, got ${value === undefined ? 'undefined' : typeof value}`);
+        }
+        break;
+
       case 'true_if_findings': {
         const findings = getNestedField(artifacts, 'findings');
         const stepStatus = getNestedField(artifacts, 'status');

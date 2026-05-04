@@ -23,7 +23,7 @@ import {
   cherryPickToMaster,
 } from './worktree.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
-import { checkWriteZones, formatViolations } from './write-zones.js';
+import { checkWriteZones, formatViolations, globMatch as globMatchSimple } from './write-zones.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -524,10 +524,37 @@ export class Pipeline {
           await this.savePipelineJson(ticket.id, pipelineState);
           this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason: 'condition not met' });
           stepMetrics.push({ step: stepConfig.name, model: '-', durationMs: 0, durationFormatted: '-', inputTokens: 0, outputTokens: 0, toolCalls: 0, filesChanged: 0, gate: '-', status: 'skipped' });
-          // Sanctioned skip: orchestrator deliberately set not_applicable.
-          // Counts as "handled this run" so the merge guard doesn't flag it.
           executedThisRun.add(stepConfig.name);
-          // Restore session — skipped step shouldn't kill session for the next reuse_session step
+          this.sessionId = prevSessionId;
+          continue;
+        }
+      }
+
+      // PIPE-001: plan_critic gate (single-arm, per operator decision
+      // 2026-05-04). Critic runs when EITHER the ticket is non-trivial
+      // complexity OR the plan touches a load-bearing file. Anything
+      // smaller AND not load-bearing is skipped — the critic's $0.70/run
+      // cost isn't justified for a typo fix in a screen-level widget.
+      if (stepConfig.name === 'plan_critic') {
+        const enabled = this.config.plan_critic?.enabled !== false;
+        const loadBearing = this.config.plan_critic?.load_bearing_files || [];
+        const planFiles = (pipelineState.steps?.plan?.files_to_change || [])
+          .map((f) => (typeof f === 'string' ? f : f.path))
+          .filter(Boolean);
+        const matchesLoadBearing = planFiles.some((p) =>
+          loadBearing.some((g) => globMatchSimple(g, p))
+        );
+        const complexityArm = (ticket.complexity && ticket.complexity !== 'trivial');
+        const shouldRun = enabled && (complexityArm || matchesLoadBearing);
+        if (!shouldRun) {
+          const reason = !enabled
+            ? 'plan_critic disabled in config'
+            : `complexity=${ticket.complexity || 'unset'} (trivial-class) AND no load-bearing file in plan.files_to_change`;
+          pipelineState.steps[stepConfig.name] = { status: 'not_applicable', reason };
+          await this.savePipelineJson(ticket.id, pipelineState);
+          this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason });
+          stepMetrics.push({ step: stepConfig.name, model: '-', durationMs: 0, durationFormatted: '-', inputTokens: 0, outputTokens: 0, toolCalls: 0, filesChanged: 0, gate: '-', status: 'skipped' });
+          executedThisRun.add(stepConfig.name);
           this.sessionId = prevSessionId;
           continue;
         }
