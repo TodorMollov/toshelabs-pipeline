@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-04",
-  "_last_session_note": "2026-05-04 — Added PIPE-002 (schema backfill + flip to strict), PIPE-003 (multi-project + parallel work), PIPE-004 (refuse worker edits outside configured zones). All emerge from the same architectural conversation that produced PIPE-001 — coherent direction: pipeline as a generic, multi-project orchestrator with hard contracts at every input boundary.",
+  "_last_session_note": "2026-05-04 — PIPE-001 + PIPE-003 open questions resolved by operator. PIPE-001: dropped tags arm (gate is now complexity OR load-bearing files only); critic gets all tools; re-pass enabled; dismissed_findings audit path approved. PIPE-003: registry is directory ~/.toshelabs/projects/ with one file per project; intra-project parallel descoped (master/rate-limit/worktree shared-state hazards). Implementation order: PIPE-002 → PIPE-004 → PIPE-001 → PIPE-003.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -17,31 +17,34 @@
       "user_impact": "Catches the failure mode that produces L10N-class escapes — coherent wrongness across plan/tests/implementation built on a single false belief. Each escape today costs multiple downstream tickets to remediate (BUG-261A, BUG-261B, BUG-267 for L10N-1 alone) plus user trust. Catch-rate target: would have caught L10N-1, BUG-261 root cause, and at least one of BUG-262 / BUG-266 in backtest.",
       "acceptance_criteria": [
         "GIVEN a ticket whose `complexity` is not `trivial`, WHEN the pipeline transitions out of the `plan` step, THEN the new `plan_critic` step runs before `tests_red` is started.",
-        "GIVEN a ticket whose plan touches any load-bearing file (`app/lib/app.dart`, `app/lib/main.dart`, anything under `app/lib/core/auth/`, `app/lib/core/routing/`, `firestore.rules`, `storage.rules`, any Drift migration, any file under `app/lib/l10n/`), WHEN the plan completes, THEN `plan_critic` runs regardless of `complexity`.",
-        "GIVEN a ticket tagged with any risk-area tag (`locale`, `theme`, `auth`, `payments`, `platform-channels`, `app-check`, `security-rules`, `schema-migration`), WHEN the plan completes, THEN `plan_critic` runs regardless of `complexity`.",
-        "GIVEN a ticket whose `complexity` is `trivial` AND that does not touch a load-bearing file AND has no risk-area tag, WHEN the plan completes, THEN `plan_critic` is skipped and the pipeline proceeds directly to `tests_red`.",
+        "GIVEN a ticket of ANY complexity (including trivial/small) whose plan touches any load-bearing file, WHEN the plan completes, THEN `plan_critic` runs regardless. Side rule: if a small/trivial-complexity ticket plan ends up touching a load-bearing file, the planner SHOULD also reconsider whether the complexity tag was honest — bumping a load-bearing change from trivial to medium prevents the regression-test gap that small/trivial tickets explicitly defer.",
+        "GIVEN a ticket whose `complexity` is `trivial` AND that does not touch a load-bearing file, WHEN the plan completes, THEN `plan_critic` is skipped and the pipeline proceeds directly to `tests_red`.",
         "GIVEN `plan_critic` runs, WHEN it produces output, THEN the output validates against a strict JSON schema: array of objects with required keys `claim_under_test` (string, must quote text from the plan), `concrete_falsifier` (string, must be a specific input value, not a category), `proposed_test` (string, runnable test description). Free-form prose, vague objections, or findings without all three fields are rejected by the validator and do not count as findings.",
         "GIVEN `plan_critic` returns one or more valid findings, WHEN the pipeline transitions to `tests_red`, THEN the tests_red prompt is given the findings as MANDATORY test cases (must be present in `test_files`/`test_names` of the tests_red output, otherwise tests_red fails its `covers_plan_criteria` rule).",
-        "GIVEN `plan_critic` finds at least one issue, WHEN the plan is revised, THEN the pipeline allows AT MOST ONE revision loop (plan_critic → plan_revise → plan_critic). After one revision, the plan ships and downstream phases proceed even if the second critic pass would still object — preventing infinite loops.",
-        "GIVEN `plan_critic` runs, WHEN it exceeds 25,000 tokens of output, THEN it is terminated and whatever valid findings it has produced are used. NO wall-clock cap — Opus with grounding (Read + WebFetch) realistically runs 2-4 minutes on adversarial review of a non-trivial plan; capping wall-clock would cut Opus mid-thought and waste tokens already spent. Absence of findings under the token cap is treated as 'no objections'.",
+        "GIVEN `plan_critic` finds at least one issue AND the planner revises the plan, WHEN the revised plan is produced, THEN `plan_critic` runs ONCE more on the revision (loop bound = 1). If the second pass still objects, the plan ships and downstream phases proceed — preventing infinite loops.",
+        "GIVEN `plan_critic` runs, WHEN it exceeds 90 seconds wall-clock OR 25,000 tokens of output, THEN it is terminated; whatever valid findings it has produced are used; absence of findings under cap is treated as 'no objections'.",
         "GIVEN the `plan_critic` step itself errors (model error, timeout, infra failure), WHEN the pipeline is configured with `plan_critic.heal_attempts = 0`, THEN the step does not retry; the operator is paged and the ticket halts at this step rather than silently skipping.",
-        "GIVEN the new phase is added, WHEN the existing pipeline-state schema is updated, THEN every ticket file in `projects/{name}/pipeline-state/` includes a `plan_critic` block (status, completed_at, findings[], skipped_reason if applicable). Old files without the block are treated as `skipped: legacy` and do not break replay.",
+        "GIVEN the new phase is added, WHEN the existing pipeline-state schema is updated, THEN every ticket file in `projects/{name}/pipeline-state/` includes a `plan_critic` block (status, completed_at, findings[], dismissed_findings[], skipped_reason if applicable). Old files without the block are treated as `skipped: legacy` and do not break replay.",
+        "GIVEN the planner explicitly disagrees with a critic finding (knows it's out of scope), WHEN the planner produces the revised plan, THEN it MAY include a `dismissed_findings: [{finding_id, rationale}]` array. Dismissed findings are preserved in pipeline-state for audit. Silent dismissal (omitting a finding without acknowledging it in dismissed_findings) is forbidden — tests_red MUST cover every non-dismissed finding.",
         "Backtest: GIVEN we re-run `plan_critic` against the archived plans for L10N-1, BUG-261 (root cause), BUG-262, and two arbitrary 'shipped fine' tickets, WHEN we measure findings, THEN L10N-1's plan must produce a finding whose `claim_under_test` quotes the AppLocalizations languageCode sentence AND whose `concrete_falsifier` is a non-en languageCode (e.g. `bg_BG`, `de_DE`). Catch rate on the three real bug plans must be ≥ 2/3. False-positive rate on the two control plans must be < 3 findings each (calibration check)."
       ],
       "decisions": [
         "Model = Opus (not Sonnet). Rationale: by busydad CLAUDE.md rule 28, all analysis is Opus; Sonnet only writes code from a clear spec. Plan-critic IS analysis — the highest-judgment phase in the pipeline. Putting Sonnet on the rebuttal of an Opus plan is structurally backwards (weaker model, same prior bias). Cost is acceptable: ~$0.70/ticket Opus, gated to ~70% of tickets, ~$5/night. One escaped L10N-class bug costs more in remediation alone.",
         "Insertion point = between `plan` and `tests_red` (NOT post-implement). Catching flaws before code is written avoids the cost of bouncing implement → tests → back to plan, and keeps the critic findings scoped to a stable artefact (the plan) rather than a moving one (the diff).",
         "Output contract = strict JSON ({claim_under_test, concrete_falsifier, proposed_test}). Rationale: free-form critique is the failure mode we're trying to leave behind. If the critic cannot produce a concrete falsifier, the finding is not real — vague concerns inflate the test suite without raising quality.",
-        "Loop bound = 1 (one critic → one revise → ship). Rationale: an unbounded loop with two LLM agents will find infinite plausible objections. One round captures most of the value; further rounds have rapidly diminishing returns and risk creating analysis paralysis on every ticket.",
-        "Grounding = web fetch + repo file read enabled for the critic. Rationale: L10N-1's specific failure was misunderstanding framework behaviour. A critic with no access to actual flutter source / docs has the same prior as the planner and will rubber-stamp the same false claims (LLM-vs-LLM theatre). With grounding, the critic can verify 'AppLocalizations.delegate.isSupported' by reading the generated source.",
-        "Keep the existing `think_challenge` self-prompt on the plan step. The two are complementary: think_challenge nudges the planner toward humility cheaply; plan_critic provides an independent adversarial pass with grounding. Removing think_challenge saves nothing measurable and weakens the cheap first line of defence."
+        "Loop bound = 1 (one critic → one revise → one re-critic → ship). Operator decision 2026-05-04: re-pass enabled to capture revision-quality value, but bound stays at 1 to avoid infinite revision/objection loops.",
+        "Grounding = web fetch + repo file read enabled for the critic. Operator decision 2026-05-04: critic gets ALL tools (Read, WebFetch, Grep, Glob, Bash for read-only inspection). Rationale: L10N-1's specific failure was misunderstanding framework behaviour. A critic with no access to actual flutter source / docs has the same prior as the planner and will rubber-stamp the same false claims (LLM-vs-LLM theatre). With grounding, the critic can verify 'AppLocalizations.delegate.isSupported' by reading the generated source.",
+        "Keep the existing `think_challenge` self-prompt on the plan step. The two are complementary: think_challenge nudges the planner toward humility cheaply; plan_critic provides an independent adversarial pass with grounding. Removing think_challenge saves nothing measurable and weakens the cheap first line of defence.",
+        "Gate is single-arm (operator decision 2026-05-04, dropping the original three-arm proposal): `complexity != trivial` OR `plan.files_to_change ∩ load_bearing_files ≠ ∅`. The original `risk_area_tags` arm was dropped — tags are too much backlog-hygiene burden across multiple projects, and the load-bearing files glob covers the same ground for any project that maintains its file list.",
+        "Side rule (operator decision 2026-05-04): if a small/trivial-complexity ticket's plan ends up touching a load-bearing file, the planner SHOULD reconsider whether the complexity was honest — small/trivial tickets explicitly skip regression testing, and load-bearing files demand it. The critic still runs in this case, but the ticket should likely be re-graded to medium.",
+        "Planner override path (operator decision 2026-05-04): the planner MAY dismiss a critic finding by adding it to a `dismissed_findings: [{finding_id, rationale}]` array on the revised plan. Dismissals are preserved in pipeline-state for audit. NO silent dismissal — tests_red enforces coverage of every non-dismissed finding."
       ],
       "open_questions": [
-        "Q1: Confirm the load-bearing files list. Proposed: app/lib/app.dart, app/lib/main.dart, app/lib/core/auth/**, app/lib/core/routing/**, app/lib/l10n/**, firestore.rules, storage.rules, any Drift migration, any file under backend/functions/src/auth/. Each entry can be re-debated, but the list MUST be explicit (auto-detection would invite drift).",
-        "Q2: Confirm the risk-area tag set. Proposed: locale, theme, auth, payments, platform-channels, app-check, security-rules, schema-migration. Add a backlog convention: tickets in these areas MUST set the corresponding tag (validate on backlog write). Any others worth adding (e.g. notifications, sync, file-upload)?",
-        "Q3: Should `plan_critic` be allowed to call `Bash` for read-only commands (grep, file read) during the run, or restricted to file Read + WebFetch? Recommended: Read + WebFetch only. Bash invites scope creep and unbounded runtime.",
-        "Q4: When the critic produces findings AND the plan is revised, should the revised plan re-trigger `plan_critic` (one re-pass per the loop bound = 1 rule above) or skip directly to `tests_red`? Recommended: re-pass, since the loop bound is 1. The second pass is the 'did the revision actually address it' check. If the loop bound is 0, skip.",
-        "Q5: How do we surface an 'I disagree with the critic' override path for the planner? E.g. critic says 'this assumption could break in case X', planner explicitly knows X is out of scope. Recommended: planner can suppress a finding by quoting it in a `dismissed_findings` array with a one-line rationale; the dismissal is preserved in pipeline-state for audit. Do NOT allow silent dismissal."
+        "RESOLVED Q1 (load-bearing files list — busydad starting set): app/lib/app.dart, app/lib/main.dart, app/lib/core/routing/**, app/lib/core/auth/**, app/lib/l10n/**, app/lib/data/sync/**, app/lib/data/local/database.dart, app/lib/data/migrations/**, backend/functions/src/parseInput/**, backend/functions/src/auth/**, firestore.rules, storage.rules. Per-project, declared in pipeline.config.yaml under `plan_critic.load_bearing_files`. Operator approved 2026-05-04 + author may extend.",
+        "RESOLVED Q2 (risk-area tags): dropped. Gate is single-arm — complexity OR load-bearing files only. Tags add too much backlog-hygiene burden across projects.",
+        "RESOLVED Q3 (critic tool budget): all tools (Read, WebFetch, Grep, Glob, read-only Bash). Operator approved 2026-05-04.",
+        "RESOLVED Q4 (re-pass on revision): enabled. One critic → revise → one re-critic → ship. Loop bound = 1.",
+        "RESOLVED Q5 (planner override): dismissed_findings array with rationale, preserved in pipeline-state. No silent dismissal."
       ],
       "fix_plan": [
         "Phase 0 — Spec & approval",
@@ -125,61 +128,62 @@
     {
       "id": "PIPE-003",
       "schema_version": 1,
-      "title": "Multi-project support — per-project config registry, project switcher, parallel ticket execution",
+      "title": "Multi-project support — per-project config registry, project switcher (parallel work descoped)",
       "status": "requested",
       "priority": "P1",
       "type": "feature",
-      "complexity": "large",
+      "complexity": "medium",
       "area": "config registry (new), src/server.js (project selector + per-project lifecycle), src/pipeline.js (parallel-runner support), public/index.html (project picker), CLI",
       "reported": "2026-05-04",
-      "source": "Explicit user direction 2026-05-03/04: \"the pipeline should be generic - we can use it to build any project - not just busydad - should follow project based configuration\" + \"i want to be able to switch between projects, i want project to be able to parallel work on tickets\". Today the pipeline is single-project (pipeline.config.yaml hard-coded to busydad) and single-runner (one ticket at a time, code_lock per project).",
-      "description": "Generalise the pipeline to host multiple projects with a registry, expose a project selector in the dashboard + CLI, and allow tickets to run in parallel either within one project (per-ticket worktree + lock) or across projects (already largely possible, just needs UI/API).",
+      "source": "Explicit user direction 2026-05-03/04: 'the pipeline should be generic - we can use it to build any project - not just busydad - should follow project based configuration' + 'i want to be able to switch between projects'. Today the pipeline is single-project (pipeline.config.yaml hard-coded to busydad). Operator descoped intra-project parallel ticket execution 2026-05-04 — too many shared-state hazards (master, rate limit, worktree object storage); cross-project parallel comes for free since different projects already have different locks and different masters.",
+      "description": "Generalise the pipeline to host multiple projects with a directory-based registry, expose a project selector in the dashboard + CLI, and cleanly isolate per-project state. Cross-project parallel runs (two projects' pipelines active simultaneously) come for free since projects already use separate code_locks. Intra-project parallel ticket execution is OUT of scope per operator decision.",
       "user_impact": "Today's pipeline is a single-tenant tool effectively dedicated to busydad. Generalising unlocks: (a) running pipeline against any future project the user starts, (b) parallel ticket throughput within a project (multi-runner), (c) multiple projects active concurrently. Without this, every new project requires duplicating the pipeline binary + config.",
       "acceptance_criteria": [
-        "GIVEN a registry file (e.g. ~/.toshelabs/projects.yaml or pipeline.projects.yaml in repo root) listing N projects with their config paths, WHEN the server starts, THEN it loads all configured projects and exposes them via /api/projects.",
-        "GIVEN multiple projects loaded, WHEN the operator selects project X via the dashboard or `--project X` CLI flag, THEN subsequent /api/run* and /api/backlog* calls operate on X's config, backlog, worktree.",
-        "GIVEN parallel execution is enabled in a project's config, WHEN multiple actionable tickets exist whose `files_likely_affected` do NOT overlap, THEN the pipeline runs them concurrently in separate worktrees with separate locks. Cherry-pick to master serialises at the end.",
-        "GIVEN two parallel tickets share `files_likely_affected` overlap, WHEN they're scheduled, THEN one is queued behind the other (pre-flight conflict avoidance, not mid-run failure).",
-        "GIVEN the dashboard, WHEN the operator views it, THEN they see a project picker showing each project's actionable count + last run status + an active-project indicator."
+        "GIVEN a directory `~/.toshelabs/projects/` containing one YAML file per project (busydad.yaml, projectx.yaml, etc.), WHEN the server starts, THEN it loads every project found in the directory and exposes them via /api/projects.",
+        "GIVEN multiple projects loaded, WHEN the operator selects project X via the dashboard or `--project X` CLI flag, THEN subsequent /api/run* and /api/backlog* calls operate on X's config, backlog, worktree, and pipeline-state directory.",
+        "GIVEN the dashboard, WHEN the operator views it, THEN they see a project picker showing each project's actionable count + last run status + an active-project indicator.",
+        "GIVEN two operators run pipelines for two different projects on the same machine concurrently (not the same project, two different ones), WHEN both run, THEN they don't conflict — different code_locks, different worktrees, different masters.",
+        "GIVEN a project whose config does not declare `load_bearing_files` (PIPE-001 setting), WHEN plan_critic would gate, THEN it falls back to running on every non-trivial ticket (no path-glob arm; complexity arm only)."
       ],
       "decisions": [
-        "Registry is file-based, not database-backed. One YAML file. Operator-edited.",
-        "Per-ticket lock replaces per-project code_lock for projects with parallel enabled. Default: parallel off (single-runner per project, current behaviour).",
-        "Cherry-pick to master remains serialised across all parallel runners — master is shared, two simultaneous cherry-picks corrupt history."
+        "Registry = directory ~/.toshelabs/projects/, one file per project (NOT a single central manifest). Operator decision 2026-05-04. Rationale: simpler ops — adding a project is `cp template.yaml ~/.toshelabs/projects/newproj.yaml` and edit, no merge conflicts on a shared registry file. Pipeline enumerates the directory at startup.",
+        "Operator manages git for ~/.toshelabs/ via their existing mechanism (everything in ~/.toshelabs/ is already in git per user 2026-05-04). Pipeline does not touch git for that directory.",
+        "Intra-project parallel ticket execution = OUT of scope (operator decision 2026-05-04). Reasons: (a) master is shared; two cherry-picks at once corrupt history. (b) `files_likely_affected` is human-authored and unreliable, so file-overlap pre-flight is a guess. (c) Single Claude subscription rate-limit is shared; double-spend hits the 5h cap faster. (d) Worktree shared object storage has concurrent-git edge cases. Cross-project parallel is fine and gets supported for free.",
+        "Project ID = filename without .yaml extension (busydad.yaml → 'busydad'). No separate `id:` field needed inside the file. Single source of truth (the filename) prevents drift."
       ],
-      "open_questions": [
-        "Q1: Project registry path — `~/.toshelabs/projects.yaml` (XDG-ish, user-global) vs `pipeline.projects.yaml` (in pipeline repo, version-controlled). Recommended: in-repo, so `git pull` brings new projects to other machines.",
-        "Q2: Parallel scheduling — file-overlap pre-flight is necessary; is `files_likely_affected` reliable enough as the conflict signal, or should the pipeline pre-run plan for each candidate ticket first to get the actual `plan.files_to_change`? Latter is correct but doubles plan-step cost.",
-        "Q3: How does PIPE-001 (plan_critic) interact with parallel — does each parallel runner get its own critic instance, or do critics queue?"
-      ],
+      "open_questions": [],
       "fix_plan": [
-        "Phase 1 — Registry + selector (no parallel yet)",
-        "1. Define registry schema. Add config loader that reads N projects.",
-        "2. Server: per-project config map, /api/projects, /api/projects/{id}/* routes.",
-        "3. Dashboard: project picker UI; current project highlighted; switching changes the visible backlog.",
-        "Phase 2 — Per-ticket lock (foundation for parallel)",
-        "4. Replace per-project code_lock with per-ticket lock. Single-runner projects keep equivalent behaviour (one ticket → one lock).",
-        "5. Worktree paths already namespace by ticket — verify, otherwise add.",
-        "Phase 3 — Parallel runner",
-        "6. Add config: `pipeline.parallel: { enabled: bool, max_concurrent: int }`.",
-        "7. Pre-flight conflict check from `files_likely_affected`.",
-        "8. Cherry-pick to master serialised across runners (single mutex).",
-        "9. Dashboard shows N concurrent tickets per project.",
-        "Phase 4 — Cross-project parallel",
-        "10. Already largely supported (different code_locks); add UI hint that two projects can run simultaneously."
+        "Phase 1 — Multi-config loader",
+        "1. src/config.js: add loadAllConfigs(registryDir) that enumerates ~/.toshelabs/projects/*.yaml and returns a Map<projectId, config>. Fall back to single-config mode if registry dir doesn't exist (backwards compat for existing pipeline.config.yaml setups).",
+        "2. Each config carries its own _resolved paths (project_dir, backlog, worktree, etc.) — already per-config, no changes needed.",
+        "Phase 2 — Server routing",
+        "3. Server: maintain a Map<projectId, projectState> instead of single config + activePipeline. Each project gets its own EventEmitter (or namespaced events on a shared emitter — TBD).",
+        "4. /api/projects → list all loaded projects + their last status.",
+        "5. Project-scoped routes: /api/projects/{id}/backlog, /api/projects/{id}/run, /api/projects/{id}/status, etc.",
+        "6. Backwards-compat: top-level /api/backlog, /api/run still work, dispatch to a 'default' project (the first one or one named 'default').",
+        "Phase 3 — Dashboard",
+        "7. Project picker UI in public/index.html. Persist active-project selection in localStorage. Show actionable count per project in the picker.",
+        "8. Event stream: SSE /events?project=X filters to that project's events; ?project=all multiplexes.",
+        "Phase 4 — CLI",
+        "9. Add --project flag to the run command. Default to 'default' when single-config mode (no registry).",
+        "Phase 5 — Migration",
+        "10. Move busydad's pipeline.config.yaml → ~/.toshelabs/projects/busydad.yaml. Update CLAUDE.md and any operator docs that reference the old path.",
+        "11. Test: start server, see busydad in project list, run a busydad ticket via project-scoped API, verify isolated state."
       ],
       "files_likely_affected": [
-        "pipeline.projects.yaml (new, registry)",
-        "src/config.js (multi-project loader)",
-        "src/server.js (per-project routing + project_id query param)",
-        "src/pipeline.js (parallel runner support, per-ticket lock)",
+        "src/config.js (multi-config loader + registry enumeration)",
+        "src/server.js (per-project routing, project-scoped event filter)",
         "public/index.html (project picker UI)",
-        "TICKET-SCHEMA.md (note that schema is per-project, link to registry)"
+        "src/index.js / CLI entry (--project flag)",
+        "TICKET-SCHEMA.md (note schema is per-project, point at registry layout)",
+        "README.md (multi-project setup instructions)",
+        "~/.toshelabs/projects/busydad.yaml (new, migrated from pipeline.config.yaml)"
       ],
       "out_of_scope": [
+        "Intra-project parallel ticket execution (operator decision 2026-05-04: out of scope due to master/rate-limit/worktree shared-state hazards).",
         "Cross-machine pipeline coordination — single host for now.",
         "Project-level RBAC / multi-user — single operator.",
-        "Auto-discovery of projects (scan ~/code/* for pipeline.config.yaml) — explicit registry only."
+        "Auto-discovery (scan ~/code/* for pipeline.config.yaml files) — explicit registry only."
       ]
     },
     {
