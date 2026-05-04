@@ -544,12 +544,20 @@ export class Pipeline {
         const matchesLoadBearing = planFiles.some((p) =>
           loadBearing.some((g) => globMatchSimple(g, p))
         );
-        const complexityArm = (ticket.complexity && ticket.complexity !== 'trivial');
+        // Operator decision 2026-05-04: critic runs on medium/large
+        // complexity only — small and trivial tickets skip the complexity
+        // arm because the cost (~$0.70 Opus + ~3 min wall-clock) isn't
+        // justified for contained changes. Load-bearing-arm overrides
+        // regardless: if a small/trivial plan touches a load-bearing
+        // file, the critic still runs (and the planner SHOULD reconsider
+        // whether the complexity grade was honest).
+        const SKIP_COMPLEXITIES = new Set(['trivial', 'small']);
+        const complexityArm = ticket.complexity && !SKIP_COMPLEXITIES.has(ticket.complexity);
         const shouldRun = enabled && (complexityArm || matchesLoadBearing);
         if (!shouldRun) {
           const reason = !enabled
             ? 'plan_critic disabled in config'
-            : `complexity=${ticket.complexity || 'unset'} (trivial-class) AND no load-bearing file in plan.files_to_change`;
+            : `complexity=${ticket.complexity || 'unset'} (trivial/small-class) AND no load-bearing file in plan.files_to_change`;
           pipelineState.steps[stepConfig.name] = { status: 'not_applicable', reason };
           await this.savePipelineJson(ticket.id, pipelineState);
           this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason });
