@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-04",
-  "_last_session_note": "2026-05-04 — All four tickets shipped this session: PIPE-002 (5d0104e schema backfill), PIPE-004 (a3dc137 write-zone enforcement), PIPE-003 (d89a818 multi-project), PIPE-001 (f3f4db8 plan_critic infrastructure). PIPE-001 deferred items: backtest run, tests_red consumption, dismissed_findings audit path, re-pass loop — file as PIPE-005 if/when needed.",
+  "_last_session_note": "2026-05-04 — Three more shipped: PIPE-005 toggle MVP (c913184, schema mode + plan_critic.enabled + per-step write_zones.mode), PIPE-006 MCP server (77cc7aa). PIPE-005 (full editor), PIPE-007 (self-improvement docs) remain requested for future sessions.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -242,6 +242,137 @@
       "landed_commit": "a3dc137",
       "shipped_note": "Post-hoc detection via git diff inspection in worktree + canonical project_dir. busydad implement + docs_update opted into warn mode. DEFERRED: PreToolUse hook for true sandboxing; flip warn → strict once trusted.",
       "shipped_at": "2026-05-04"
+    },
+    {
+      "id": "PIPE-005",
+      "schema_version": 1,
+      "title": "Full project settings editing in the dashboard — structured forms per section",
+      "status": "requested",
+      "priority": "P3",
+      "type": "ux",
+      "complexity": "medium",
+      "area": "public/index.html (forms), src/server.js (PUT /api/projects/:id/config), src/config.js (atomic write + reload)",
+      "reported": "2026-05-04",
+      "source": "Operator request 2026-05-04: read-only settings panel shipped today (commit 72f0dbf) is insufficient — operator wants in-UI editing without opening YAML files. Toggle-only MVP (ticket_schema.mode, plan_critic.enabled, per-step write_zones.mode) shipping in a separate commit; this ticket covers the full structured-form editor.",
+      "description": "Per-section forms in the existing settings modal: ticket_filter (multi-select chips for status/priority/type orderings), ticket_schema (mode dropdown + overrides editor), plan_critic (enabled toggle + glob list editor), steps (per-step editor: model dropdown, max_turns numeric, tools chip-list, write_zones mode + allow-globs editor). Save writes the YAML atomically and triggers reloadConfig. Refused (409) during a pipeline run. Backup-before-write to the file's sibling .yaml.bak so a bad save can be rolled back. Show a diff preview on save with a confirm step.",
+      "user_impact": "Today operators edit pipeline.config.yaml or ~/.toshelabs/projects/*.yaml in a text editor and reload. For frequent flips (warn → strict, enabling plan_critic, adjusting write_zones globs) the YAML round-trip slows down iteration. Forms also catch typos that YAML doesn't (wrong mode value, malformed glob).",
+      "acceptance_criteria": [
+        "GIVEN no pipeline run is active, WHEN the operator changes a setting in the modal and clicks Save, THEN the project's YAML file is updated, reloadConfig is called, and the UI re-fetches /api/projects/:id to show the new state.",
+        "GIVEN a pipeline run IS active, WHEN the operator clicks Save, THEN the server returns 409 with a clear message and the modal surfaces it; no file write happens.",
+        "GIVEN any form field, WHEN the operator enters an invalid value (e.g. status not in enum, glob with malformed syntax), THEN the field is highlighted and Save is disabled until corrected.",
+        "GIVEN the YAML file before save, WHEN Save succeeds, THEN a sibling .yaml.bak is written first containing the pre-save content. Rollback = manual mv (or a future Restore button).",
+        "GIVEN a multi-section save (operator edited 3 sections at once), WHEN Save is clicked, THEN it's atomic — either all changes land or none."
+      ],
+      "fix_plan": [
+        "1. Server: PUT /api/projects/:id/config — body = full YAML-equivalent JSON. Backup, write, reloadConfig, return new resolved state.",
+        "2. UI: convert each section in the modal to a form. Submit-once-on-save (not per-field).",
+        "3. Add a Save button + diff-preview overlay. Confirm before commit.",
+        "4. Disable forms during a run; show a banner.",
+        "5. Document the .yaml.bak rollback path in TICKET-SCHEMA.md or a new docs/SETTINGS-EDITING.md."
+      ],
+      "out_of_scope": [
+        "Adding/removing entire steps (steps[] structural edits) — too easy to break the pipeline; operators do this in YAML.",
+        "Editing top-level metadata (project_dir, name) from the UI — these are identity fields, changing them is a project rename.",
+        "Schema overrides editor — covered separately in PIPE-005a if it gets filed; the JSON view in the modal is enough for now."
+      ]
+    },
+    {
+      "id": "PIPE-006",
+      "schema_version": 1,
+      "title": "MCP server — frontend interface for tickets + schema; files remain backend",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/mcp/* (new), package.json (add @modelcontextprotocol/sdk), CLAUDE.md template for projects, TICKET-SCHEMA.md (consume-via-MCP section)",
+      "reported": "2026-05-04",
+      "source": "Operator decision 2026-05-04 — chose option A from the schema-publishing discussion. Today the schema is shipped as static files (TICKET-SCHEMA.md, schemas/ticket.v1.schema.json) and per-project CLAUDE.md additions. New projects need manual setup, schema bumps need manual re-pointing across every consumer, and there's no uniform way for an LLM in projectX to author a conformant ticket without re-implementing the contract.",
+      "description": "Expose the pipeline as an MCP server. Tools: list_projects(), get_schema(project), list_tickets(project, status?), get_ticket(project, id), create_ticket(project, ticket), update_ticket(project, id, patch), archive_ticket(project, id). Storage stays as the existing per-project YAML/JSON files (backwards-compat, hand-editable, gitignored). Validation server-side via the existing src/ticket-schema.js. Any Claude session that connects gets the schema at handshake and can author conformant tickets without copying the contract into its CLAUDE.md.",
+      "user_impact": "(a) Schema bumps propagate automatically — no per-project CLAUDE.md re-pointing. (b) New projects join the ecosystem by adding the MCP server connection, no boilerplate. (c) Cross-project visibility — list_tickets across all projects becomes a single call. (d) Foundational for PIPE-007 (pipeline self-improvement workflow) — the pipeline can have its own MCP-served backlog that any Claude session can write to.",
+      "acceptance_criteria": [
+        "GIVEN a Claude session connects to the MCP server, WHEN it calls get_schema('busydad'), THEN it receives the v1 schema with busydad's overrides applied (v2 status, P4 priority, chore/docs/manual types).",
+        "GIVEN a Claude session calls create_ticket('busydad', {...}), WHEN the ticket conforms to the schema, THEN it lands in busydad's state/backlog.json with schema_version=1 and the pipeline picks it up on next /api/backlog refresh.",
+        "GIVEN the same call with a non-conformant ticket, WHEN create_ticket runs, THEN it returns an error with field-level violations (same shape as ticket_rejected events) and writes nothing.",
+        "GIVEN multiple projects loaded, WHEN list_projects() is called, THEN it returns the same list as /api/projects.",
+        "GIVEN the busydad CLAUDE.md update, WHEN a new Claude session opens in busydad, THEN it's instructed to use the MCP create_ticket tool instead of editing state/backlog.json directly. Direct-edit still works (backwards-compat) but is documented as a fallback.",
+        "GIVEN the pipeline server is running, WHEN the MCP server is invoked (stdio transport), THEN it shares process state with the running pipeline (same emitter, same projects map). NOT a separate process — same Node process, MCP transport added alongside HTTP server."
+      ],
+      "decisions": [
+        "Files-as-backend (option A from the discussion). Storage doesn't move; just the API surface is unified.",
+        "Stdio transport (the standard for local MCP servers). HTTPS/SSE transport optional for cross-machine; defer.",
+        "MCP server runs in the same process as the pipeline server. Avoids state drift between two processes (event emitter, projects map, active project). Trade-off: pipeline crash = MCP also dies; acceptable since both are operator-managed local services.",
+        "Validation is shared with the HTTP path via the existing src/ticket-schema.js. Single source of truth — no chance of MCP and HTTP disagreeing on what's valid."
+      ],
+      "open_questions": [
+        "Q1: Tool naming — toshelabs.tickets.create vs create_ticket? Recommend the latter (shorter, MCP convention).",
+        "Q2: Authentication — none initially (local stdio only). Revisit if HTTPS transport is added.",
+        "Q3: Per-project MCP scoping — should there be a parameter on every tool call, or should the MCP session bind to one project at handshake? Recommend per-call parameter (more flexible; cross-project queries work without re-handshake)."
+      ],
+      "fix_plan": [
+        "Phase 1 — Skeleton",
+        "1. Add @modelcontextprotocol/sdk dep. Wire src/mcp/server.js to startServer() so it starts alongside HTTP.",
+        "2. Implement list_projects, get_schema, list_tickets — read-only first.",
+        "Phase 2 — Mutations",
+        "3. Implement create_ticket, update_ticket, archive_ticket. Use the same writeBacklog helper that existing routes use; keep behaviour identical.",
+        "4. Validation: every mutation runs through validateTicket with the project's effective schema (default + overrides).",
+        "Phase 3 — Documentation",
+        "5. TICKET-SCHEMA.md: add 'Authoring via MCP' section showing the recommended path.",
+        "6. busydad/CLAUDE.md: add 'When creating tickets, prefer the MCP create_ticket tool over editing state/backlog.json directly. Schema is fetched live via get_schema(busydad).'",
+        "Phase 4 — Validation",
+        "7. Test from a separate Claude session: connect to MCP, fetch schema, create a ticket, verify it appears in busydad's backlog AND passes the existing /api/backlog actionable query."
+      ],
+      "files_likely_affected": [
+        "src/mcp/server.js (new)",
+        "src/mcp/tools/{list_projects,get_schema,list_tickets,get_ticket,create_ticket,update_ticket,archive_ticket}.js (new)",
+        "src/server.js (start MCP alongside HTTP)",
+        "src/index.js (CLI flag --no-mcp if operator wants to disable)",
+        "src/backlog.js (writeBacklog helper, refactored from the existing inline writes)",
+        "package.json (@modelcontextprotocol/sdk dep)",
+        "TICKET-SCHEMA.md (Authoring via MCP section)",
+        "/home/toshe/busydad/CLAUDE.md (point at MCP)"
+      ],
+      "out_of_scope": [
+        "HTTPS / SSE transport — local stdio only for MVP.",
+        "Authentication / per-project ACL — single operator, single machine.",
+        "Migration to a real DB (option B from the discussion) — files stay; revisit when juggling 3+ projects.",
+        "Jira proxy (option C) — not the direction this project is heading."
+      ],
+      "landed_commit": "77cc7aa",
+      "shipped_at": "2026-05-04",
+      "shipped_note": "MCP server in-process with HTTP, files-as-backend. 7 tools shipped (list_projects, get_schema, list_tickets, get_ticket, create_ticket, update_ticket, archive_ticket). Stateless transport per SDK example. Validation runs server-side via shared src/ticket-schema.js. End-to-end smoke test passed: bad id rejected with pattern violation, valid ticket created/listed/archived round-trip clean. Out of scope: busydad CLAUDE.md update pointing at MCP (separate repo), HTTPS/auth (single-operator local), MCP resources surface."
+    },
+    {
+      "id": "PIPE-007",
+      "schema_version": 1,
+      "title": "Pipeline self-improvement workflow — track bugs/features for the pipeline itself",
+      "status": "requested",
+      "priority": "P3",
+      "type": "ops",
+      "complexity": "small",
+      "area": "backlog/backlog.json (the pipeline's own backlog), docs (a new docs/PIPELINE-DEV.md), CLAUDE.md at the pipeline repo root",
+      "reported": "2026-05-04",
+      "source": "Operator question 2026-05-04: 'can the pipeline run tickets against itself? — perhaps not. then how do we capture bugs/features for the pipeline?' Today: pipeline bugs and features go into ~/toshelabs-pipeline/backlog/backlog.json (the pipeline's own backlog file, used in this session for PIPE-001..006). They're worked on through interactive sessions like this one, NOT through the pipeline's own SDLC, because the pipeline operates on external project repos (busydad) — running the pipeline against itself has circular-dependency risks (pipeline modifies pipeline mid-run).",
+      "description": "Document the pipeline's own self-improvement workflow as the explicit, sanctioned process: PIPE-* tickets live in ~/toshelabs-pipeline/backlog/backlog.json, conform to schema v1, are filed by the operator (or by Claude sessions through PIPE-006's MCP create_ticket once that lands), and are worked on in interactive sessions. The pipeline does NOT run against itself — that's a deliberate choice, not a missing feature. Once PIPE-006 lands, the pipeline's own backlog becomes MCP-accessible like any other project, so any Claude session can file pipeline tickets without re-implementing the schema.",
+      "acceptance_criteria": [
+        "GIVEN the pipeline repo, WHEN the operator (or an LLM) wants to file a pipeline bug or feature, THEN they have a clear documented path: append a ticket to ~/toshelabs-pipeline/backlog/backlog.json conforming to schema v1.",
+        "GIVEN PIPE-006 has shipped, WHEN an LLM session calls create_ticket('toshelabs-pipeline', {...}), THEN it works the same as any project's create_ticket and lands in the pipeline's backlog file.",
+        "GIVEN a docs/PIPELINE-DEV.md file, WHEN a new operator (or an onboarding session) reads it, THEN the self-improvement workflow is described in <100 lines: schema applies, tickets live in backlog/, no pipeline-against-itself runs, work happens interactively, MCP is the recommended authoring path post-PIPE-006."
+      ],
+      "decisions": [
+        "Pipeline does NOT run against itself. Reason: circular dependency. Pipeline runs by spawning Claude CLI, which would be modifying the pipeline source while the pipeline is interpreting it. Worktrees mitigate but don't eliminate the risk; the cost of a corrupted pipeline mid-self-modification is too high relative to the benefit (manual interactive sessions work fine).",
+        "Self-improvement is operator-driven + interactive. Always.",
+        "Once PIPE-006 ships, the pipeline becomes a 'project' in its own MCP namespace — same authoring path as any other project. No special-case API."
+      ],
+      "fix_plan": [
+        "1. Write docs/PIPELINE-DEV.md (new file in pipeline repo) — captures the self-improvement workflow.",
+        "2. Update README.md with a link to docs/PIPELINE-DEV.md from the contribution / development section.",
+        "3. Once PIPE-006 lands, update PIPELINE-DEV.md with the MCP create_ticket recipe."
+      ],
+      "out_of_scope": [
+        "Building self-hosting capability (pipeline-against-itself). Explicitly NOT a goal.",
+        "CI/CD for pipeline changes (no automated tests on commit). Future.",
+        "Pipeline release versioning. Future."
+      ]
     }
   ]
 }
