@@ -1,12 +1,56 @@
 import { readFile, writeFile } from 'fs/promises';
+import { resolve } from 'path';
+import { validateAndPartition, DEFAULT_SCHEMA_V1 } from './ticket-schema.js';
 
 /**
- * Load and filter tickets from backlog.json
+ * Load and filter tickets from backlog.json.
+ *
+ * Applies ticket-schema validation per `config.ticket_schema` (mode: off |
+ * warn | strict). Rejected tickets get sidecar files at
+ * `pipeline-state/{id}.rejected.json` and are emitted on `config._emitter`
+ * as `ticket_rejected` events. In `strict` mode they're excluded from the
+ * returned list; in `warn` mode they pass through with violations recorded.
+ *
+ * Default mode is `off` — backwards compatible with project configs that
+ * predate the schema. Opt in via `ticket_schema.mode: warn|strict`.
  */
 export async function loadBacklog(config) {
   const raw = await readFile(config._resolved.backlog, 'utf-8');
   const data = JSON.parse(raw);
-  return data.tickets || [];
+  const tickets = data.tickets || [];
+
+  const schemaCfg = config.ticket_schema || {};
+  const mode = schemaCfg.mode || 'off';
+  if (mode === 'off') return tickets;
+
+  const acceptedVersions = schemaCfg.accepts_schema_versions || [1];
+  const overrides = schemaCfg.overrides || {};
+  const sidecarPathFor = (id) => resolve(config._resolved.pipelineDir, `${id}.rejected.json`);
+
+  const { accepted, rejected } = await validateAndPartition(tickets, {
+    schema: DEFAULT_SCHEMA_V1,
+    overrides,
+    mode,
+    sidecarPathFor,
+    acceptedVersions,
+  });
+
+  if (rejected.length > 0) {
+    const summary = rejected.map((r) => `${r.id} (${r.violations.length} violation${r.violations.length === 1 ? '' : 's'})`).join(', ');
+    console.warn(`[schema:${mode}] ${rejected.length} ticket${rejected.length === 1 ? '' : 's'} failed validation: ${summary}`);
+    if (config._emitter) {
+      for (const r of rejected) {
+        config._emitter.emit('ticket_rejected', {
+          timestamp: r.timestamp,
+          ticket: r.id,
+          mode,
+          violations: r.violations,
+        });
+      }
+    }
+  }
+
+  return accepted;
 }
 
 /**

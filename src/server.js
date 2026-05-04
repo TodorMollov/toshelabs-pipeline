@@ -77,6 +77,12 @@ export async function startServer(config) {
   const emitter = new EventEmitter();
   emitter.setMaxListeners(50);
 
+  // Expose the emitter on the config object so non-Pipeline consumers
+  // (e.g. loadBacklog's schema validator) can emit events without needing
+  // to be passed an emitter explicitly. Pipeline instances still get
+  // `emitter` via opts and own the lifecycle of their own emits.
+  config._emitter = emitter;
+
   // Pipeline state
   let activePipeline = null;
 

@@ -72,24 +72,26 @@ See `pipeline.config.example.yaml`. Key sections:
 
 ## Backlog shape
 
-`backlog.json`:
+The pipeline accepts tickets that conform to a versioned schema. Full contract — required/optional fields, enums, rejection behaviour, multi-project notes, and how to instruct LLMs to produce conformant tickets — lives in **[TICKET-SCHEMA.md](./TICKET-SCHEMA.md)**.
+
+Minimum required ticket:
 
 ```json
 {
-  "tickets": [
-    {
-      "id": "T-100",
-      "title": "Short description",
-      "type": "feature | bug | enhancement | refactor | test | performance | ux",
-      "priority": "P0 | P1 | P2 | P3",
-      "status": "requested | in_progress | done | blocked | ...",
-      "criteria": ["one bullet per deliverable"]
-    }
-  ]
+  "id": "T-100",
+  "schema_version": 1,
+  "title": "Short imperative description, 10–200 chars",
+  "type": "bug | feature | enhancement | refactor | test | performance | ux | ops",
+  "priority": "P0 | P1 | P2 | P3",
+  "complexity": "trivial | small | medium | large",
+  "status": "requested | in_progress | blocked | done | monitor",
+  "description": "≥ 50 chars of actual context"
 }
 ```
 
-Tickets move through statuses as the pipeline runs. `done` / `v2` / `deferred` / `manual` / `moot` / `decided` / `subsumed` are excluded from scheduling by default (configurable).
+Status is a closed set of five values. Concepts like "deferred", "subsumed", "moot", "decided" live as **fields** (`defer_until`, `subsumed_by`, `resolution`, `decision_note`) on `done`-status tickets — not as separate statuses. See TICKET-SCHEMA.md for the full list and rationale.
+
+Tickets that don't validate are skipped from the actionable queue and emit a `ticket_rejected` event with field-level reasons (sidecar at `pipeline-state/{id}.rejected.json`). The pipeline does not silently coerce or auto-fix tickets — producers (operator, LLM, scripts) are responsible for shape.
 
 ## Endpoints
 

@@ -90,9 +90,34 @@ project_profile:
 
 # Ticket filtering
 ticket_filter:
-  exclude_status: [done, v2, deferred, manual, moot, decided, subsumed]
+  exclude_status: [done, monitor]
   priority_order: [P0, P1, P2, P3]
-  type_order: [bug, feature, enhancement, refactor, test, performance, ux]
+  type_order: [bug, feature, enhancement, refactor, test, performance, ux, ops]
+
+# Ticket schema validation. See TICKET-SCHEMA.md for the contract.
+#
+# Modes:
+#   off    — validator does not run (default; backwards-compat for projects
+#            that predate the schema).
+#   warn   — runs and logs violations + emits ticket_rejected events, but
+#            tickets still proceed. Use during migration.
+#   strict — violations cause the ticket to be excluded from the queue;
+#            sidecar at pipeline-state/{id}.rejected.json records why.
+#
+# When mode is warn or strict, every ticket must declare schema_version and
+# satisfy the v1 contract (id, title, status, priority, type, complexity,
+# description). Use overrides to extend or replace enum vocabularies for
+# project-specific needs.
+ticket_schema:
+  mode: off
+  accepts_schema_versions: [1]
+  overrides: {}
+  # Example overrides:
+  #   overrides:
+  #     type:
+  #       add: [marketing, content]      # extends the default enum
+  #     complexity:
+  #       replace: [xs, s, m, l, xl]     # replaces the default enum entirely
 
 # Session management (Max plan)
 session:

@@ -1,0 +1,83 @@
+{
+  "schema": "backlog-v1",
+  "updated_at": "2026-05-03",
+  "_last_session_note": "2026-05-03 — Backlog created. PIPE-001 added: insert a dedicated `plan_critic` phase between `plan` and `tests_red` to catch unverified claims that the planner committed as resolved edge cases. Motivated by L10N-1 escape (busydad BUG-261/BUG-267).",
+  "tickets": [
+    {
+      "id": "PIPE-001",
+      "title": "Add `plan_critic` phase between plan and tests_red — falsify plan claims before code is written",
+      "status": "requested",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "pipeline.config.yaml, prompts/plan_critic.md (new), src/* (phase wiring), pipeline-state schema (new step entry), prompts/tests_red.md (consume critic findings)",
+      "reported": "2026-05-03",
+      "source": "Concrete escape: busydad ticket L10N-1 (commit f90db04, v1.0.99). Pipeline ran plan → tests_red → implement → review → done, all phases green, but the plan's `edge_cases` array contained the unverified claim 'AppLocalizations.delegate.isSupported checks languageCode only — en_GB matches \"en\", so app strings still load correctly'. That claim is false (the generated AppLocalizations delegate matches the full Locale, not just languageCode). Tests_red wrote tests consistent with the wrong claim; implement built code consistent with it; review compared code to plan and passed both wrong-against-wrong. Result: every Bulgarian-locale phone (and ~47 other Material-supported / AppLocalizations-unsupported locales) crashed on first frame in production. The existing `think_challenge` self-prompt on the plan step is not enough — it ran on L10N-1 and still missed it. Self-critique inside the same session is structurally weaker than a separate session with a separate prompt and grounding access. Full forensic in busydad memory/backlog.json BUG-267.source.",
+      "description": "Insert a new pipeline phase named `plan_critic` between `plan` and `tests_red`. Phase reads the plan output (especially `edge_cases`, `risk`, and any sentence asserting framework / library / runtime behaviour) and emits structured findings, each of which must include a concrete falsifying input and a proposed test that would fail if the claim is wrong. Findings are auto-promoted into mandatory tests_red cases. Phase runs in a fresh Claude session with adversarial framing and grounding access (web fetch + framework source read), so it has actual ground truth, not just the same prior that produced the buggy plan.",
+      "user_impact": "Catches the failure mode that produces L10N-class escapes — coherent wrongness across plan/tests/implementation built on a single false belief. Each escape today costs multiple downstream tickets to remediate (BUG-261A, BUG-261B, BUG-267 for L10N-1 alone) plus user trust. Catch-rate target: would have caught L10N-1, BUG-261 root cause, and at least one of BUG-262 / BUG-266 in backtest.",
+      "acceptance_criteria": [
+        "GIVEN a ticket whose `complexity` is not `trivial`, WHEN the pipeline transitions out of the `plan` step, THEN the new `plan_critic` step runs before `tests_red` is started.",
+        "GIVEN a ticket whose plan touches any load-bearing file (`app/lib/app.dart`, `app/lib/main.dart`, anything under `app/lib/core/auth/`, `app/lib/core/routing/`, `firestore.rules`, `storage.rules`, any Drift migration, any file under `app/lib/l10n/`), WHEN the plan completes, THEN `plan_critic` runs regardless of `complexity`.",
+        "GIVEN a ticket tagged with any risk-area tag (`locale`, `theme`, `auth`, `payments`, `platform-channels`, `app-check`, `security-rules`, `schema-migration`), WHEN the plan completes, THEN `plan_critic` runs regardless of `complexity`.",
+        "GIVEN a ticket whose `complexity` is `trivial` AND that does not touch a load-bearing file AND has no risk-area tag, WHEN the plan completes, THEN `plan_critic` is skipped and the pipeline proceeds directly to `tests_red`.",
+        "GIVEN `plan_critic` runs, WHEN it produces output, THEN the output validates against a strict JSON schema: array of objects with required keys `claim_under_test` (string, must quote text from the plan), `concrete_falsifier` (string, must be a specific input value, not a category), `proposed_test` (string, runnable test description). Free-form prose, vague objections, or findings without all three fields are rejected by the validator and do not count as findings.",
+        "GIVEN `plan_critic` returns one or more valid findings, WHEN the pipeline transitions to `tests_red`, THEN the tests_red prompt is given the findings as MANDATORY test cases (must be present in `test_files`/`test_names` of the tests_red output, otherwise tests_red fails its `covers_plan_criteria` rule).",
+        "GIVEN `plan_critic` finds at least one issue, WHEN the plan is revised, THEN the pipeline allows AT MOST ONE revision loop (plan_critic → plan_revise → plan_critic). After one revision, the plan ships and downstream phases proceed even if the second critic pass would still object — preventing infinite loops.",
+        "GIVEN `plan_critic` runs, WHEN it exceeds 25,000 tokens of output, THEN it is terminated and whatever valid findings it has produced are used. NO wall-clock cap — Opus with grounding (Read + WebFetch) realistically runs 2-4 minutes on adversarial review of a non-trivial plan; capping wall-clock would cut Opus mid-thought and waste tokens already spent. Absence of findings under the token cap is treated as 'no objections'.",
+        "GIVEN the `plan_critic` step itself errors (model error, timeout, infra failure), WHEN the pipeline is configured with `plan_critic.heal_attempts = 0`, THEN the step does not retry; the operator is paged and the ticket halts at this step rather than silently skipping.",
+        "GIVEN the new phase is added, WHEN the existing pipeline-state schema is updated, THEN every ticket file in `projects/{name}/pipeline-state/` includes a `plan_critic` block (status, completed_at, findings[], skipped_reason if applicable). Old files without the block are treated as `skipped: legacy` and do not break replay.",
+        "Backtest: GIVEN we re-run `plan_critic` against the archived plans for L10N-1, BUG-261 (root cause), BUG-262, and two arbitrary 'shipped fine' tickets, WHEN we measure findings, THEN L10N-1's plan must produce a finding whose `claim_under_test` quotes the AppLocalizations languageCode sentence AND whose `concrete_falsifier` is a non-en languageCode (e.g. `bg_BG`, `de_DE`). Catch rate on the three real bug plans must be ≥ 2/3. False-positive rate on the two control plans must be < 3 findings each (calibration check)."
+      ],
+      "decisions": [
+        "Model = Opus (not Sonnet). Rationale: by busydad CLAUDE.md rule 28, all analysis is Opus; Sonnet only writes code from a clear spec. Plan-critic IS analysis — the highest-judgment phase in the pipeline. Putting Sonnet on the rebuttal of an Opus plan is structurally backwards (weaker model, same prior bias). Cost is acceptable: ~$0.70/ticket Opus, gated to ~70% of tickets, ~$5/night. One escaped L10N-class bug costs more in remediation alone.",
+        "Insertion point = between `plan` and `tests_red` (NOT post-implement). Catching flaws before code is written avoids the cost of bouncing implement → tests → back to plan, and keeps the critic findings scoped to a stable artefact (the plan) rather than a moving one (the diff).",
+        "Output contract = strict JSON ({claim_under_test, concrete_falsifier, proposed_test}). Rationale: free-form critique is the failure mode we're trying to leave behind. If the critic cannot produce a concrete falsifier, the finding is not real — vague concerns inflate the test suite without raising quality.",
+        "Loop bound = 1 (one critic → one revise → ship). Rationale: an unbounded loop with two LLM agents will find infinite plausible objections. One round captures most of the value; further rounds have rapidly diminishing returns and risk creating analysis paralysis on every ticket.",
+        "Grounding = web fetch + repo file read enabled for the critic. Rationale: L10N-1's specific failure was misunderstanding framework behaviour. A critic with no access to actual flutter source / docs has the same prior as the planner and will rubber-stamp the same false claims (LLM-vs-LLM theatre). With grounding, the critic can verify 'AppLocalizations.delegate.isSupported' by reading the generated source.",
+        "Keep the existing `think_challenge` self-prompt on the plan step. The two are complementary: think_challenge nudges the planner toward humility cheaply; plan_critic provides an independent adversarial pass with grounding. Removing think_challenge saves nothing measurable and weakens the cheap first line of defence."
+      ],
+      "open_questions": [
+        "Q1: Confirm the load-bearing files list. Proposed: app/lib/app.dart, app/lib/main.dart, app/lib/core/auth/**, app/lib/core/routing/**, app/lib/l10n/**, firestore.rules, storage.rules, any Drift migration, any file under backend/functions/src/auth/. Each entry can be re-debated, but the list MUST be explicit (auto-detection would invite drift).",
+        "Q2: Confirm the risk-area tag set. Proposed: locale, theme, auth, payments, platform-channels, app-check, security-rules, schema-migration. Add a backlog convention: tickets in these areas MUST set the corresponding tag (validate on backlog write). Any others worth adding (e.g. notifications, sync, file-upload)?",
+        "Q3: Should `plan_critic` be allowed to call `Bash` for read-only commands (grep, file read) during the run, or restricted to file Read + WebFetch? Recommended: Read + WebFetch only. Bash invites scope creep and unbounded runtime.",
+        "Q4: When the critic produces findings AND the plan is revised, should the revised plan re-trigger `plan_critic` (one re-pass per the loop bound = 1 rule above) or skip directly to `tests_red`? Recommended: re-pass, since the loop bound is 1. The second pass is the 'did the revision actually address it' check. If the loop bound is 0, skip.",
+        "Q5: How do we surface an 'I disagree with the critic' override path for the planner? E.g. critic says 'this assumption could break in case X', planner explicitly knows X is out of scope. Recommended: planner can suppress a finding by quoting it in a `dismissed_findings` array with a one-line rationale; the dismissal is preserved in pipeline-state for audit. Do NOT allow silent dismissal."
+      ],
+      "fix_plan": [
+        "Phase 0 — Spec & approval",
+        "1. Write docs/proposals/PLAN-CRITIC.md: rationale (L10N-1 worked example), the three-arm gate, phase contract, output schema, loop bound, token cap (no wall-clock cap — Opus needs ~3 min), backtest plan. Get operator sign-off on the open questions Q1-Q5 before any code.",
+        "Phase 1 — Backtest harness (validates the design before we ship it)",
+        "2. Build a small harness in scripts/ that loads a historical plan JSON, runs the proposed plan_critic prompt against it (Opus, no wall-clock cap, 25K output cap, structured output), and emits the findings. Run against archived plans for L10N-1, BUG-261, BUG-262, and two 'shipped fine' control tickets (operator picks). Record per-run wall time so we can size monitoring/alerting later — informational, not a gate.",
+        "3. Acceptance bar (matches AC backtest entry): L10N-1 plan must yield a finding quoting the AppLocalizations languageCode sentence with a non-en falsifier; total catch ≥ 2/3 on the bug set; controls < 3 findings each. If the bar is not met, iterate on the prompt before shipping.",
+        "Phase 2 — Implement the phase",
+        "4. New file prompts/plan_critic.md. Adversarial framing. Required output schema embedded. Explicit anti-vagueness rules ('reject any finding without a concrete falsifier'). Grounding instructions: when a plan asserts third-party / framework behaviour, verify by reading the relevant source or docs before producing a finding (or before letting the claim pass).",
+        "5. Edit pipeline.config.yaml: add `plan_critic` step between `plan` and `tests_red`. Fields: prompt_template, model=opus, max_output_tokens=25000, heal_attempts=0, allowed_tools=[Read, WebFetch]. NO wall-clock cap — Opus on adversarial review with grounding takes ~3 minutes; constraint is the token budget, not the clock.",
+        "6. Edit pipeline.config.yaml gate: add `gate` block on the plan_critic step expressing the three-arm rule. Implementation: src/* gating helper that takes (ticket, plan_output) and returns boolean. Read the load-bearing files list and risk-area tag set from config, not hard-coded.",
+        "7. Update pipeline-state schema (pipeline-schema.md or equivalent in src/): new `plan_critic` block with fields {status, started_at, completed_at, gated_in (bool + reason), findings: [{claim_under_test, concrete_falsifier, proposed_test, dismissed: bool, dismissed_rationale: string|null}], skipped_reason}.",
+        "Phase 3 — Wire findings into tests_red",
+        "8. Edit prompts/tests_red.md to inject `plan_critic.findings` (non-dismissed) as MANDATORY test cases. Add a validator rule (`covers_plan_critic_findings`) that fails tests_red if any non-dismissed finding lacks a corresponding test_name in tests_red output.",
+        "Phase 4 — Validation",
+        "9. Dry-run on a low-stakes ticket from busydad backlog (operator picks). Confirm the new phase runs, gate behaves, output validates, tests_red consumes findings.",
+        "10. Run against next 5-10 nightly tickets. Collect: was it gated in or skipped, how many findings, were they real, did tests_red incorporate them, did the ticket complete green. Tune the prompt if false-positive rate > 30% or catch rate is invisible.",
+        "Phase 5 — Document",
+        "11. Update README.md with the new phase. Add a one-pager docs/PLAN-CRITIC.md summarising the contract for future operators."
+      ],
+      "files_likely_affected": [
+        "/home/toshe/toshelabs-pipeline/docs/proposals/PLAN-CRITIC.md (new)",
+        "/home/toshe/toshelabs-pipeline/docs/PLAN-CRITIC.md (new — operator-facing summary)",
+        "/home/toshe/toshelabs-pipeline/prompts/plan_critic.md (new)",
+        "/home/toshe/toshelabs-pipeline/prompts/tests_red.md (edit — consume findings)",
+        "/home/toshe/toshelabs-pipeline/pipeline.config.yaml (edit — add step + gate config)",
+        "/home/toshe/toshelabs-pipeline/src/* (edit — phase wiring, gate helper, schema update; exact files TBD on inspection)",
+        "/home/toshe/toshelabs-pipeline/scripts/plan-critic-backtest.* (new — harness for Phase 1)",
+        "/home/toshe/toshelabs-pipeline/README.md (edit — document new phase)"
+      ],
+      "out_of_scope": [
+        "Tightening the `complexity` enum in busydad's memory/backlog.json (currently 24+ free-form strings observed). Filed separately.",
+        "Adding adversarial steps to other phases (review, implement). The plan is the highest-leverage point; revisit after PIPE-001 has 4 weeks of production data.",
+        "Replacing the existing `think_challenge` self-prompt on the plan step. Complementary, not redundant.",
+        "Cross-ticket pattern detection ('the last 5 plans all assumed X'). Future work."
+      ]
+    }
+  ]
+}
