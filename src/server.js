@@ -238,7 +238,7 @@ export async function startServer(config) {
     const actionable = filterAndSort(tickets, config);
     let v2Tickets = [];
     try {
-      const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
+      const v2Raw = await readFile(resolve(config.project_dir, config.backlog_v2_file || 'state/backlog-v2.json'), 'utf-8');
       const parsed = JSON.parse(v2Raw).tickets || [];
       v2Tickets = parsed.map((t) => ({ ...t, backlog: 'v2' }));
     } catch {}
@@ -305,7 +305,7 @@ export async function startServer(config) {
       const tickets = await loadBacklog(config);
       let v2Tickets = [];
       try {
-        const v2Raw = await readFile(resolve(config.project_dir, 'memory/backlog-v2.json'), 'utf-8');
+        const v2Raw = await readFile(resolve(config.project_dir, config.backlog_v2_file || 'state/backlog-v2.json'), 'utf-8');
         v2Tickets = JSON.parse(v2Raw).tickets || [];
       } catch {}
       const all = [...tickets, ...v2Tickets];

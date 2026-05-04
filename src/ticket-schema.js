@@ -30,7 +30,7 @@ import { dirname } from 'path';
 export const DEFAULT_SCHEMA_V1 = {
   required: ['id', 'schema_version', 'title', 'status', 'priority', 'type', 'complexity', 'description'],
   fields: {
-    id: { type: 'string', pattern: /^[A-Z][A-Z0-9]*-\d+[A-Z]?$/ },
+    id: { type: 'string', pattern: /^[A-Z][A-Z0-9]*-\d+[A-Za-z][A-Za-z0-9]*$|^[A-Z][A-Z0-9]*-\d+$/ },
     schema_version: { type: 'integer', enum: [1] },
     title: { type: 'string', min_length: 10, max_length: 200 },
     status: { type: 'string', enum: ['requested', 'in_progress', 'blocked', 'done', 'monitor'] },

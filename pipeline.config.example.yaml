@@ -88,6 +88,9 @@ project_profile:
     #     timeout_sec: 120
     #     trigger_file_prefix: "backend/"
 
+# Optional v2/roadmap backlog (loaded for dashboard display, never actionable).
+# backlog_v2_file: state/backlog-v2.json
+
 # Ticket filtering
 ticket_filter:
   exclude_status: [done, monitor]
