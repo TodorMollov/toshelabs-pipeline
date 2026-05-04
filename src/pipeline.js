@@ -2024,11 +2024,25 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       });
 
       if (validation.pass) {
-        // 2026-04-28: per-step git commits removed. Steps' work product is
-        // just the working-tree edits (committed as one ticket commit at
-        // success, reverted to baseline tag on failure). Step boundaries
-        // exist in the state file (steps[X].status, run_id, attempts) — no
-        // longer in git history.
+        // Orchestrator owns step lifecycle. The schema gate (validateStep)
+        // is the contract; if it passed, the step is done. The worker's
+        // own `status` field is no longer trusted as input — heal cycles
+        // routinely persist outputs that omit `status:"done"` (the worker
+        // edits the failing fields and writes the file back without
+        // re-asserting the lifecycle field), and the previous post-loop
+        // guard would then block a ticket whose every gate had passed
+        // (BUG-261 plan, BUG-261B plan, etc.).
+        //
+        // Exception: a worker-emitted `status === 'blocked'` is a deliberate
+        // stop signal (the worker decided it can't proceed). Respect that
+        // even on gate-pass — it falls through to the blocked-handler below.
+        const cur = pipelineState.steps[stepConfig.name] || {};
+        if (cur.status !== 'blocked') {
+          cur.status = 'done';
+          cur.completed_at = cur.completed_at || new Date().toISOString();
+          pipelineState.steps[stepConfig.name] = cur;
+          await this.savePipelineJson(ticket.id, pipelineState);
+        }
         return { pipelineState, lastResult: result.result, attempts: attempt, maxTurnsHit: lastMaxTurnsHit, gateFailuresByAttempt };
       }
       // Remember the failures this attempt produced before deciding what to do next.
