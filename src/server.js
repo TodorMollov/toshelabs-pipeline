@@ -637,6 +637,97 @@ export async function startServer(config) {
     res.json({ ok: true, id: targetId, path: settingPath, value });
   });
 
+  // PIPE-005: full config replace. Writes a fresh YAML to the project's
+  // configPath, with a sibling .yaml.bak backup of the previous content
+  // so a bad save can be rolled back manually. Refused if THIS project's
+  // pipeline is running. Reload semantics match the toggle endpoint
+  // above (both projects Map entry AND active config holder).
+  //
+  // Body: { config: <full YAML-equivalent JSON> }. The body's config
+  // must include name + project_dir matching the route param (no
+  // accidental project rename / repath via this endpoint).
+  app.put('/api/projects/:id/config', async (req, res) => {
+    const targetId = req.params.id;
+    if (activePipelines.has(targetId)) {
+      return res.status(409).json({ error: `cannot edit settings while project ${targetId}'s pipeline is running. POST /api/projects/${targetId}/stop first or wait for it to finish.` });
+    }
+    const projects = config._projects;
+    const target = projects ? projects.get(targetId) : (targetId === (config._activeProjectId || config.name || 'default') ? config : null);
+    if (!target) return res.status(404).json({ error: `project ${targetId} not found` });
+
+    const newConfig = req.body?.config;
+    if (!newConfig || typeof newConfig !== 'object') {
+      return res.status(400).json({ error: 'request body must be { config: <object> }' });
+    }
+    // Identity guard: name + project_dir must match the existing
+    // project. Renaming a project is a separate operation; this
+    // endpoint is for editing a project's settings in place.
+    if (newConfig.name && newConfig.name !== target.name) {
+      return res.status(400).json({ error: `body.config.name (${newConfig.name}) must match existing name (${target.name}). Renaming is not supported via this endpoint.` });
+    }
+    if (newConfig.project_dir && newConfig.project_dir !== target.project_dir) {
+      return res.status(400).json({ error: `body.config.project_dir cannot be changed via this endpoint. Existing: ${target.project_dir}. Submitted: ${newConfig.project_dir}.` });
+    }
+
+    const yamlPath = target._resolved?.configPath;
+    if (!yamlPath) return res.status(500).json({ error: 'project has no configPath; cannot persist' });
+
+    let prevRaw;
+    try {
+      prevRaw = await readFileFs(yamlPath, 'utf-8');
+    } catch (err) {
+      return res.status(500).json({ error: `failed to read ${yamlPath}: ${err.message}` });
+    }
+    // Sanity: serialise the new config first; if YAML serialisation
+    // throws, we abort BEFORE touching disk.
+    let serialized;
+    try {
+      // Strip any private fields the client might have echoed back.
+      const clean = {};
+      for (const [k, v] of Object.entries(newConfig)) if (!k.startsWith('_')) clean[k] = v;
+      serialized = stringifyYaml(clean, { lineWidth: 0 });
+    } catch (err) {
+      return res.status(400).json({ error: `failed to serialise config: ${err.message}` });
+    }
+
+    // Backup, then write. Operator can `mv {path}.yaml.bak {path}` to
+    // roll back if the new config breaks something on next load.
+    const backupPath = `${yamlPath}.bak`;
+    try {
+      await writeFileFs(backupPath, prevRaw, 'utf-8');
+    } catch (err) {
+      return res.status(500).json({ error: `failed to write backup ${backupPath}: ${err.message}` });
+    }
+    try {
+      await writeFileFs(yamlPath, serialized, 'utf-8');
+    } catch (err) {
+      return res.status(500).json({ error: `failed to write ${yamlPath}: ${err.message}` });
+    }
+
+    // Reload BOTH (a) the projects Map entry — that's where
+    // /api/projects/:id reads from — and (b) the active config holder
+    // if this project is currently active.
+    try {
+      if (projects && projects.has(targetId)) {
+        await reloadConfig(projects.get(targetId));
+      }
+      if (targetId === (config._activeProjectId || config.name || 'default')) {
+        await reloadConfig(config);
+        Object.defineProperty(config, '_projects', { value: projects, enumerable: false });
+        Object.defineProperty(config, '_activeProjectId', { value: targetId, enumerable: false, writable: true });
+      }
+    } catch (err) {
+      console.error(`[settings] write succeeded but reload failed: ${err.message}`);
+      return res.status(500).json({
+        error: `wrote config but reload failed: ${err.message}. To roll back: mv ${backupPath} ${yamlPath} && curl -X POST http://localhost:${config.server.port}/api/backlog/refresh`,
+      });
+    }
+
+    emitter.emit('project_settings_updated', { id: targetId, path: '<full-config>', value: '<replaced>' });
+    console.log(`[settings] ${targetId}: full config replaced (backup at ${backupPath})`);
+    res.json({ ok: true, id: targetId, backupPath });
+  });
+
   app.post('/api/projects/:id/activate', async (req, res) => {
     // PIPE-008: dropping the running-pipeline guard. Activate is now a
     // *display* preference — switches which project the dashboard's
@@ -1142,26 +1233,53 @@ export async function startServer(config) {
 
   // Bulk pipeline-state status for the sidebar's per-ticket color cue.
   // Returns { ticketId: { status, blocked_step? } } — slim payload, only
-  // the fields the sidebar needs to color a row. Skips `*.failed-*.json`
-  // history files; only the active `{id}.json` per ticket is returned.
+  // the fields the sidebar needs.
+  //
+  // PIPE-011 fixes:
+  //   - async fs.readFile (parallel) instead of synchronous readFileSync
+  //     (serial + blocks the event loop on every poll).
+  //   - filename filter is explicit: ACTIVE state files only, where the
+  //     filename matches the v1 ticket-id shape exactly + `.json`.
+  //     Archive files (`{id}.failed-{date}.json`, `.salvaged-`, `.closed-`)
+  //     are skipped because the dashboard wants the LIVE per-ticket
+  //     status, not historical attempts.
+  //   - JSON parse errors are logged (file name + first 200 chars of
+  //     error) instead of silently swallowed; the entry is omitted but
+  //     the corruption is visible.
   app.get('/api/pipeline-states', async (req, res) => {
     try {
       const dir = config._resolved.pipelineDir;
       const out = {};
-      const files = readdirSync(dir).filter((f) => /^[A-Za-z0-9_-]+\.json$/.test(f));
-      for (const f of files) {
-        const ticketId = f.slice(0, -5);
+      // Active state file = same shape as ticket id (BUG-261, T-359,
+      // BUG-261A, PIPE-001, T-202v1) followed by `.json`. Archive
+      // variants always have a `.` between the id and a suffix like
+      // `failed-...`, so requiring exactly `<id>.json` excludes them.
+      const ACTIVE_RE = /^([A-Z][A-Z0-9]*-\d+[A-Za-z0-9]*)\.json$/;
+      let names;
+      try {
+        names = readdirSync(dir);
+      } catch {
+        // pipeline-state dir doesn't exist yet for fresh projects.
+        return res.json({});
+      }
+      const activeFiles = names.filter((f) => ACTIVE_RE.test(f));
+      const results = await Promise.all(activeFiles.map(async (f) => {
+        const ticketId = f.replace(/\.json$/, '');
         try {
-          const raw = readFileSync(resolve(dir, f), 'utf-8');
+          const raw = await readFile(resolve(dir, f), 'utf-8');
           const state = JSON.parse(raw);
-          out[ticketId] = {
-            status: state.status || null,
-            blocked_step: state.blocked_step || null,
-          };
-        } catch { /* skip unreadable */ }
+          return [ticketId, { status: state.status || null, blocked_step: state.blocked_step || null }];
+        } catch (err) {
+          console.warn(`[pipeline-states] could not read ${f}: ${(err.message || String(err)).slice(0, 200)}`);
+          return null;
+        }
+      }));
+      for (const r of results) {
+        if (r) out[r[0]] = r[1];
       }
       res.json(out);
     } catch (err) {
+      console.error('[pipeline-states] route error:', err.stack || err.message);
       res.status(500).json({ error: err.message });
     }
   });

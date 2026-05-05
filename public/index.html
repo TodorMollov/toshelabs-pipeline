@@ -836,7 +836,10 @@
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:min(900px,90vw);max-height:85vh;overflow:auto;display:flex;flex-direction:column">
     <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)">
       <h2 style="margin:0;font-size:14px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text)" id="projectSettingsTitle">Project Settings</h2>
-      <button id="projectSettingsClose" style="background:transparent;color:var(--text-dim);border:none;font-size:20px;cursor:pointer;padding:0 4px">×</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button id="projectSettingsEditBtn" title="Edit the project's full YAML config (PIPE-005). Refused while this project's pipeline is running. Backup written to <path>.yaml.bak before save." style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer">Edit YAML</button>
+        <button id="projectSettingsClose" style="background:transparent;color:var(--text-dim);border:none;font-size:20px;cursor:pointer;padding:0 4px">×</button>
+      </div>
     </div>
     <div id="projectSettingsBody" style="padding:18px;font-size:12px;color:var(--text)">
       <div style="color:var(--text-muted)">Loading…</div>
@@ -2122,6 +2125,10 @@ function renderProjectSettings(payload) {
     </section>
   `).join('');
 }
+// Stash the current project id + raw config so the YAML editor can send
+// a PUT against the right thing.
+let _settingsModalState = { projectId: null, originalConfig: null };
+
 async function openProjectSettings() {
   const modal = document.getElementById('projectSettingsModal');
   const body = document.getElementById('projectSettingsBody');
@@ -2138,15 +2145,150 @@ async function openProjectSettings() {
       return;
     }
     const payload = await r.json();
+    _settingsModalState = { projectId: id, originalConfig: payload.config };
     body.innerHTML = renderProjectSettings(payload);
   } catch (e) {
     body.innerHTML = `<div style="color:var(--red)">Error: ${escapeHtml(e.message)}</div>`;
   }
 }
+
+// PIPE-005: full-config editor mode. Replaces the read-only structured
+// view with a textarea pre-filled with the project's config as
+// formatted JSON. Operator edits, hits Save, server parses + writes
+// YAML + reloads. Backup goes to <path>.yaml.bak.
+//
+// Why JSON not YAML: YAML serialisation client-side would need an extra
+// dep (js-yaml ~30KB). JSON is structurally equivalent for this purpose
+// — server stringifies as YAML on save. Diff preview is rendered as
+// JSON for the same reason.
+function openProjectSettingsEditMode() {
+  const { projectId, originalConfig } = _settingsModalState;
+  if (!projectId || !originalConfig) {
+    alert('No project loaded.'); return;
+  }
+  const body = document.getElementById('projectSettingsBody');
+  const formatted = JSON.stringify(originalConfig, null, 2);
+  body.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="background:var(--bg);border:1px solid var(--border);padding:8px 10px;border-radius:4px;color:var(--text-muted);font-size:11px">
+        Editing <strong>${escapeHtml(projectId)}</strong>'s full config as JSON. Save converts to YAML and writes to <code>${escapeHtml(_settingsModalState.originalConfig.name === projectId ? '~/.toshelabs/projects/' + projectId + '.yaml' : '<configPath>')}</code>.
+        Backup: same path with <code>.yaml.bak</code> suffix. Refused if this project's pipeline is running. <code>name</code> + <code>project_dir</code> are immutable via this endpoint — change them in the file directly if needed.
+      </div>
+      <textarea id="projectSettingsTextarea" spellcheck="false" style="font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:10px;width:100%;height:50vh;resize:vertical;line-height:1.4">${escapeHtml(formatted)}</textarea>
+      <div id="projectSettingsEditError" style="color:var(--red);font-size:11px;display:none"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="projectSettingsCancelEdit" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer">Cancel</button>
+        <button id="projectSettingsPreviewSave" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer">Preview &amp; Save…</button>
+      </div>
+    </div>`;
+  document.getElementById('projectSettingsCancelEdit').addEventListener('click', openProjectSettings);
+  document.getElementById('projectSettingsPreviewSave').addEventListener('click', () => previewAndSave());
+}
+
+async function previewAndSave() {
+  const { projectId, originalConfig } = _settingsModalState;
+  const ta = document.getElementById('projectSettingsTextarea');
+  const errEl = document.getElementById('projectSettingsEditError');
+  errEl.style.display = 'none'; errEl.textContent = '';
+  let parsed;
+  try {
+    parsed = JSON.parse(ta.value);
+  } catch (e) {
+    errEl.textContent = 'Invalid JSON: ' + e.message;
+    errEl.style.display = 'block';
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    errEl.textContent = 'Config must be an object.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  // Diff: show keys whose values changed vs original. Top-level diff
+  // is enough for most edits; anything deeper the operator can see
+  // by re-opening the modal.
+  const changes = [];
+  const origKeys = new Set(Object.keys(originalConfig));
+  const newKeys = new Set(Object.keys(parsed));
+  for (const k of newKeys) {
+    if (k.startsWith('_')) continue;
+    const before = originalConfig[k];
+    const after = parsed[k];
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      changes.push({ key: k, before, after, kind: origKeys.has(k) ? 'changed' : 'added' });
+    }
+  }
+  for (const k of origKeys) {
+    if (k.startsWith('_')) continue;
+    if (!newKeys.has(k)) {
+      changes.push({ key: k, before: originalConfig[k], after: undefined, kind: 'removed' });
+    }
+  }
+
+  if (changes.length === 0) {
+    errEl.textContent = 'No changes detected — nothing to save.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  // Render a confirm modal inline
+  const body = document.getElementById('projectSettingsBody');
+  const summary = changes.map((c) => {
+    const kindColor = c.kind === 'added' ? 'var(--green)' : c.kind === 'removed' ? 'var(--red)' : 'var(--yellow)';
+    return `<div style="margin-bottom:6px"><span style="color:${kindColor};font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:0.5px">${c.kind}</span> <code style="font-size:11px">${escapeHtml(c.key)}</code></div>`;
+  }).join('');
+  body.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <h3 style="margin:0;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">Confirm save — ${escapeHtml(projectId)}</h3>
+      <div style="font-size:12px">${changes.length} field${changes.length === 1 ? '' : 's'} will change:</div>
+      <div style="background:var(--bg);border:1px solid var(--border);padding:10px;border-radius:4px;max-height:30vh;overflow:auto">${summary}</div>
+      <div id="projectSettingsSaveError" style="color:var(--red);font-size:11px;display:none"></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button id="projectSettingsBackToEdit" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer">Back</button>
+        <button id="projectSettingsCommitSave" style="background:var(--green-dim,#2a4a2a);color:var(--text);border:1px solid var(--green);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600">Save &amp; reload</button>
+      </div>
+    </div>`;
+  document.getElementById('projectSettingsBackToEdit').addEventListener('click', () => {
+    // Restore the textarea with the same edits intact (reuse parsed)
+    _settingsModalState.pendingEdit = parsed;
+    openProjectSettingsEditMode();
+    const t = document.getElementById('projectSettingsTextarea');
+    if (t) t.value = JSON.stringify(parsed, null, 2);
+  });
+  document.getElementById('projectSettingsCommitSave').addEventListener('click', async () => {
+    const errEl = document.getElementById('projectSettingsSaveError');
+    errEl.style.display = 'none';
+    const btn = document.getElementById('projectSettingsCommitSave');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const r = await fetch(`/api/projects/${encodeURIComponent(projectId)}/config`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: parsed }),
+      });
+      const body = await r.json();
+      if (!r.ok) {
+        errEl.textContent = body.error || `HTTP ${r.status}`;
+        errEl.style.display = 'block';
+        btn.disabled = false; btn.textContent = 'Save & reload';
+        return;
+      }
+      // Re-open in read mode showing the new config
+      await openProjectSettings();
+      appendTerminal(`Saved ${projectId} config (backup at ${body.backupPath})`, 'system');
+    } catch (e) {
+      errEl.textContent = e.message;
+      errEl.style.display = 'block';
+      btn.disabled = false; btn.textContent = 'Save & reload';
+    }
+  });
+}
+
 function closeProjectSettings() {
   document.getElementById('projectSettingsModal').style.display = 'none';
 }
 document.getElementById('projectSettingsBtn').addEventListener('click', openProjectSettings);
+document.getElementById('projectSettingsEditBtn').addEventListener('click', openProjectSettingsEditMode);
 document.getElementById('projectSettingsClose').addEventListener('click', closeProjectSettings);
 document.getElementById('projectSettingsModal').addEventListener('click', (e) => {
   if (e.target.id === 'projectSettingsModal') closeProjectSettings();

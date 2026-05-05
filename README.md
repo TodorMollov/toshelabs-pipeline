@@ -236,6 +236,10 @@ case for audit.
 `test/checkpoint.test.js`. Each case spins up an isolated repo in
 `/tmp` — the real project tree is never touched.
 
+## Working on the pipeline itself
+
+The pipeline operates on other projects (e.g. busydad, pension-ai) — it does not run against itself. Pipeline bugs and features get filed in `backlog/backlog.json` and worked on by **operator + Claude Code interactive sessions**. See [docs/PIPELINE-DEV.md](./docs/PIPELINE-DEV.md) for the full workflow + restart-after-edit etiquette + ticket shape conventions.
+
 ## Known limits
 
 - Single-project per config — the pipeline runs against one `project_dir`.
