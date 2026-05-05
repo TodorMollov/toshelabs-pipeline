@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-05",
-  "_last_session_note": "2026-05-05 — PIPE-005 + PIPE-007 + PIPE-011 shipped (f4e7b76). Pipeline backlog now 11/11 done.",
+  "_last_session_note": "2026-05-05 — Autonomous overnight run encountered: (a) plan_critic 180s timeout on real busydad tickets (PIPE-013 to calibrate via backtest); (b) /api/stop only kills the step, not the queue (PIPE-014). plan_critic disabled on busydad for the rest of the run.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -507,6 +507,63 @@
       "landed_commit": "f4e7b76",
       "shipped_at": "2026-05-05",
       "shipped_note": "async fs.readFile in Promise.all, explicit active-state filter, parse-error logs file name. Dashboard sidebar reflects only live tickets, archive variants hidden."
+    },
+    {
+      "id": "PIPE-013",
+      "schema_version": 1,
+      "title": "plan_critic budget calibration via backtest harness — re-enable after",
+      "status": "requested",
+      "priority": "P2",
+      "type": "ops",
+      "complexity": "small",
+      "area": "scripts/plan-critic-backtest.js (run it), pipeline.config.yaml + ~/.toshelabs/projects/busydad.yaml plan_critic settings",
+      "reported": "2026-05-05",
+      "source": "BUG-1001 hit a 180s plan_critic timeout in the autonomous overnight run. heal did not fire because shouldHeal returns false on timeout (intentional — same budget reproduces the non-result). Result: ticket failed at first attempt. plan_critic.enabled flipped to false on busydad to unblock the queue.",
+      "description": "PIPE-001 spec said the backtest harness (scripts/plan-critic-backtest.js) should be run BEFORE shipping the critic to validate the prompt + budget against archived plans. We never ran it. Run it now: feed L10N-1 + BUG-261 + BUG-262 archived plans + 2 control plans, measure typical convergence time, calibrate plan_critic.max_seconds to a value that gives the critic real time to investigate (probably 5-10 min for non-trivial busydad tickets) without burning all night on a single bad ticket. Then re-enable plan_critic.enabled=true on busydad.",
+      "user_impact": "Today plan_critic is shipped but inert (disabled on busydad). The L10N-class catch the critic was supposed to provide isnt active — any ticket whose plan asserts wrong framework behavior could ship a regression. Calibration unblocks the safety net.",
+      "acceptance_criteria": [
+        "GIVEN scripts/plan-critic-backtest.js, WHEN run with --bug-plan L10N-1 + BUG-261 + BUG-262 + --control-plan x2, THEN it produces a JSON report and prints PASS/FAIL against the acceptance bar.",
+        "GIVEN backtest passes, WHEN max_seconds is set to the 95th percentile observed convergence time + 60s buffer, THEN plan_critic.enabled is flipped to true on busydad and a smoke-test ticket runs cleanly through the critic."
+      ],
+      "fix_plan": [
+        "1. Run the backtest: node scripts/plan-critic-backtest.js --bug-plan ... --control-plan ... > backtest-report.json",
+        "2. Inspect convergence times. Pick a max_seconds value (95p + 60s buffer is a starting point).",
+        "3. Edit ~/.toshelabs/projects/busydad.yaml: plan_critic.enabled: true, plan_critic step max_seconds: <new value>.",
+        "4. Smoke-test: run a small ticket that touches a load-bearing file. Verify critic runs, converges, writes findings.",
+        "5. If still flaky: iterate on the prompt OR move to a step-by-step investigator pattern (PIPE-013b future work)."
+      ],
+      "out_of_scope": [
+        "Heal-on-timeout for plan_critic — shouldHeal-blocks-on-timeout is intentional (a second attempt with the same budget reliably reproduces the non-result). Bump the budget instead, or split the work.",
+        "Per-ticket dynamic budgets based on complexity — premature."
+      ]
+    },
+    {
+      "id": "PIPE-014",
+      "schema_version": 1,
+      "title": "/api/stop should halt the queue, not just kill the current step",
+      "status": "requested",
+      "priority": "P2",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (stopPipeline), src/pipeline.js (run loop graceful-exit signal)",
+      "reported": "2026-05-05",
+      "source": "During autonomous overnight run on 2026-05-05 I called POST /api/projects/busydad/stop to halt the run before editing config. The active step’s subprocess was SIGTERMed (correct per PIPE-009) but Pipeline.run() then iterated to the next ticket and kept going. /api/status still showed running:true. Had to fall back to ./start.sh stop to actually halt.",
+      "description": "PIPE-009 made stop kill the active step. But Pipeline.run() catches step exceptions and moves to the next ticket — the queue continues. Need a stop_requested flag that the run() loop checks between tickets so the run actually halts after the current ticket fails/finishes. Implementation: Pipeline.requestStop() sets a flag; run() checks it at the top of the per-ticket iteration; if set, breaks the loop and exits cleanly. stopPipeline calls requestStop() before stopActiveSubprocess.",
+      "user_impact": "Operators who hit Stop expect the queue to halt, not the next ticket to start a few seconds later. Today they have to either ./start.sh stop the whole server or chain N stop calls (one per remaining ticket).",
+      "acceptance_criteria": [
+        "GIVEN a 5-ticket queue running, WHEN POST /api/projects/:id/stop is called mid-step, THEN the active step is SIGTERMed AND the queue is halted (no next ticket starts).",
+        "GIVEN the same scenario, WHEN /api/status is queried 10s later, THEN running:false for that project.",
+        "GIVEN the orchestrator’s crash recovery, WHEN /api/projects/:id/run/all is called next, THEN the in-progress ticket is resumed cleanly via the existing crash-recovery path."
+      ],
+      "fix_plan": [
+        "1. src/pipeline.js: add this.stopRequested = false in constructor, requestStop() method that sets it to true.",
+        "2. run() loop: check this.stopRequested at the TOP of the per-ticket for-loop. If true, break + emit pipeline_stopped_by_request.",
+        "3. src/server.js stopPipeline: call pipeline.requestStop() before stopActiveSubprocess. Order matters — set the flag first so the queue exit path runs after the step throws.",
+        "4. Test: 3-ticket queue, hit stop after ticket 1, confirm ticket 2 doesnt start."
+      ],
+      "out_of_scope": [
+        "Mid-step graceful-stop checkpoints (let the step finish then stop). Filed historically as PIPE-009b future work; same reason as before — minutes-of-wait isnt useful semantic."
+      ]
     }
   ]
 }
