@@ -1644,8 +1644,15 @@ function handleEvent(ev, d, serverTs) {
       appendTerminal(`Project switched to ${d.id}${d.name && d.name !== d.id ? ` (${d.name})` : ''}`, 'system');
       const picker = document.getElementById('projectPicker');
       if (picker) picker.value = d.id;
+      state.activeProjectId = d.id;
       refreshBacklog();
       loadPipelineStates();
+      // PIPE-008: state.running is per-active-project. The switched-to
+      // project might be running OR idle; query the server's
+      // activeProjectRunning to flip the buttons + pill correctly.
+      fetch('/api/status').then(r => r.json()).then(s => {
+        setRunning(!!s.activeProjectRunning);
+      }).catch(() => {});
       break;
     }
   }

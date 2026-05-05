@@ -40,8 +40,14 @@ async function main() {
     }
     activeId = opts.project;
   } else {
-    // Prefer the legacy config's project (loaded under its `name` field or 'default')
-    activeId = [...projects.keys()][0];
+    // Prefer (in order): the project whose name matches the legacy
+    // config (if loaded), then the first non-template project (id
+    // doesn't start with `_`), then the first registry entry as last
+    // resort. Treating `_*.yaml` as placeholder/template by convention
+    // — if you want a project to be eligible as default, give it a
+    // real id.
+    const ids = [...projects.keys()];
+    activeId = ids.find((id) => !id.startsWith('_')) || ids[0];
   }
   // CRITICAL: shallow-clone the active project's config into a NEW
   // mutable holder. The `projects` Map stores the canonical configs

@@ -98,7 +98,25 @@ export async function startServer(config) {
   const activePipelines = new Map();
 
   function pipelineRunningForAny() { return activePipelines.size > 0; }
-  function pipelineFor(projectId) { return activePipelines.get(projectId) || null; }
+  // Returns the live Pipeline instance (NOT the map entry — entries are
+  // {pipeline, donePromise} so the server can drain on shutdown).
+  function pipelineFor(projectId) {
+    const entry = activePipelines.get(projectId);
+    return entry ? entry.pipeline : null;
+  }
+  // Resolve a project's config from id. Used by both startPipeline and
+  // the per-project HTTP handlers so they can't disagree about what
+  // "project X" resolves to. Returns null if the project isn't loaded —
+  // callers should 404.
+  function configForProject(projectId) {
+    if (!projectId) return null;
+    const projectsMap = config._projects;
+    if (projectsMap) return projectsMap.get(projectId) || null;
+    // Single-config mode (no registry): the active config IS the only project.
+    const activeId = config._activeProjectId || config.name;
+    if (projectId === activeId) return config;
+    return null;
+  }
 
   // Start a Pipeline for the given project. Returns the Pipeline instance.
   // Throws if the project doesn't exist OR a pipeline is already running
@@ -111,25 +129,31 @@ export async function startServer(config) {
       err.code = 'ALREADY_RUNNING';
       throw err;
     }
-    const projectsMap = config._projects;
-    const projectCfg = projectsMap ? projectsMap.get(projectId) : (projectId === (config._activeProjectId || config.name || 'default') ? config : null);
+    const projectCfg = configForProject(projectId);
     if (!projectCfg) {
       const err = new Error(`project ${projectId} not loaded`);
       err.code = 'NOT_FOUND';
       throw err;
     }
-    // Project-tagging emitter: anything the Pipeline emits gets the
-    // project id stamped onto the event payload before the global
-    // emitter sees it. Lets the dashboard filter SSE events by the
-    // currently-displayed project.
+    // Project-tagging emitter: stamps the project id AFTER any payload
+    // fields (so the wrapper's tag is authoritative; Pipeline can't
+    // mistag by including its own `project` key). Proxies on/off/once/
+    // emit so any future Pipeline code that calls .on() doesn't crash.
     const projectEmitter = {
       emit(event, data) {
-        return emitter.emit(event, { project: projectId, ...(data || {}) });
+        return emitter.emit(event, { ...(data || {}), project: projectId });
       },
+      on: emitter.on.bind(emitter),
+      once: emitter.once.bind(emitter),
+      off: emitter.off.bind(emitter),
+      removeListener: emitter.removeListener.bind(emitter),
+      removeAllListeners: emitter.removeAllListeners.bind(emitter),
     };
     const pipeline = new Pipeline(projectCfg, { ...opts, emitter: projectEmitter });
-    activePipelines.set(projectId, pipeline);
-    pipeline.run()
+    // Store the run promise alongside the instance so callers can drain
+    // ("await all running pipelines to finish") on graceful shutdown,
+    // not just signal them.
+    const donePromise = pipeline.run()
       .catch((err) => {
         console.error(`[pipeline:${projectId}] error:`, err);
         emitter.emit('pipeline_error', { project: projectId, error: err.message });
@@ -138,22 +162,42 @@ export async function startServer(config) {
         activePipelines.delete(projectId);
         emitter.emit('pipeline_stopped', { project: projectId });
       });
+    activePipelines.set(projectId, { pipeline, donePromise });
     return pipeline;
   }
 
-  // Stop a Pipeline for the given project. Returns { stopped: bool, killed: bool }.
-  // hard=true SIGTERMs the active Claude subprocess immediately.
+  // Stop a Pipeline for the given project.
+  //
+  // hard=false (default): release the project's code_lock and walk away.
+  //   The in-flight Claude subprocess KEEPS RUNNING until it completes
+  //   naturally; pipeline.run()'s .finally() will fire when it does, at
+  //   which point the map entry's already gone and pipeline_stopped is
+  //   emitted (with no harm — listeners idempotent). This matches what
+  //   the pre-refactor code did. It does NOT mean "stop after current
+  //   step" (the old comment was aspirational; Pipeline has no such
+  //   hook). True graceful-stop is filed as future work.
+  // hard=true: SIGTERM the active Claude subprocess; the step throws,
+  //   pipeline.run() rejects, .finally() cleans up the map entry. The
+  //   subprocess is gone in seconds rather than minutes.
+  //
+  // Returns { stopped, killed, reason? }. stopped=false means there was
+  // no pipeline to stop.
   async function stopPipeline(projectId, hard = false) {
-    const pipeline = activePipelines.get(projectId);
-    if (!pipeline) {
+    const entry = activePipelines.get(projectId);
+    if (!entry) {
       return { stopped: false, killed: false, reason: 'no pipeline running for this project' };
     }
+    const { pipeline } = entry;
     let killed = false;
     if (hard && typeof pipeline.stopActiveSubprocess === 'function') {
       killed = pipeline.stopActiveSubprocess();
     }
     await pipeline.releaseLock();
-    activePipelines.delete(projectId);
+    // Don't pre-emptively delete the map entry — pipeline.run()'s
+    // .finally() handles that. Deleting here would race the .finally,
+    // produce a duplicate pipeline_stopped emission, and break the
+    // "drain all" semantic (caller can no longer await the donePromise
+    // for confirmation that the run actually wound down).
     return { stopped: true, killed };
   }
 
@@ -242,8 +286,14 @@ export async function startServer(config) {
     // Best-effort lock release so the next start doesn't have to detect a
     // stale lock (the stale-lock path still covers SIGKILL). Fire-and-forget
     // because we're about to exit anyway.
-    for (const pipeline of activePipelines.values()) {
-      try { pipeline.releaseLock?.().catch(() => {}); } catch {}
+    // Each map entry is {pipeline, donePromise}. releaseLock is async;
+    // optional-chaining returns undefined when absent, and `.catch` on
+    // undefined throws — so guard the method explicitly.
+    for (const entry of activePipelines.values()) {
+      const p = entry?.pipeline;
+      if (p && typeof p.releaseLock === 'function') {
+        try { p.releaseLock().catch(() => {}); } catch {}
+      }
     }
     opsLogger.close();
     // Small delay so the final write flushes before we exit.
@@ -312,19 +362,30 @@ export async function startServer(config) {
     req.on('close', () => emitter.off('_sse', handler));
   });
 
-  // API: pipeline status. Backwards-compat surface preserved:
-  //   running: bool         — true if THE ACTIVE PROJECT is running
-  //                           (matches the dashboard status pill semantic)
-  // Plus PIPE-008 additions:
-  //   runningProjects: [id] — every project with an active Pipeline
-  //   perProject: { id: { running: bool } } — full per-project map
+  // API: pipeline status. Field semantics:
+  //   running:              bool — true if ANY project's pipeline is
+  //                                running (matches pre-PIPE-008
+  //                                semantic; preserves backwards-compat
+  //                                for monitors that polled this).
+  //   activeProjectRunning: bool — true only if the ACTIVE project's
+  //                                pipeline is running. Use this for
+  //                                "the dashboard's currently-displayed
+  //                                project's status pill."
+  //   runningProjects: [id]      — every project with an active run.
+  //   perProject: { id: { running: bool } } — full per-project map.
+  //
+  // The two booleans diverge when the operator switches the picker
+  // mid-run: `running` stays true (something IS running), but
+  // `activeProjectRunning` flips to false because the picker now
+  // points at an idle project.
   app.get('/api/status', (req, res) => {
     const activeId = config._activeProjectId || null;
     const runningProjects = [...activePipelines.keys()];
     const perProject = {};
     for (const id of runningProjects) perProject[id] = { running: true };
     res.json({
-      running: activeId ? activePipelines.has(activeId) : pipelineRunningForAny(),
+      running: pipelineRunningForAny(),
+      activeProjectRunning: activeId ? activePipelines.has(activeId) : false,
       runningProjects,
       perProject,
       eventCount: eventLog.length,
@@ -698,40 +759,70 @@ export async function startServer(config) {
   // PIPE-008: shared helpers for run-all and run-ticket. Both project-
   // scoped (POST /api/projects/:id/run/...) and top-level backwards-
   // compat (POST /api/run/...; dispatches to active project) use these.
+
+  // Single error-mapper so the same Pipeline error codes return the
+  // same HTTP statuses everywhere. Logs include the project id so
+  // multi-project log streams stay readable.
+  function sendStartError(res, projectId, err) {
+    if (err.code === 'ALREADY_RUNNING') return res.status(409).json({ error: err.message });
+    if (err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
+    console.error(`[pipeline:${projectId}] start failed:`, err.stack || err.message);
+    return res.status(500).json({ error: err.message });
+  }
+
   async function handleRunAll(projectId, body, res) {
     const dryRun = body?.dryRun || false;
+    // Hard-fail BEFORE touching anything: project must be loaded. Don't
+    // fall back to the active project — that would silently route the
+    // request to the wrong pipeline.
+    const projectCfg = configForProject(projectId);
+    if (!projectCfg) {
+      return res.status(404).json({ error: `project ${projectId} not loaded` });
+    }
+    // Read the backlog FIRST. Two reasons: (1) if loadBacklog throws,
+    // we 500 cleanly without leaving a half-started pipeline; (2) the
+    // ticketCount in the response is computed from the same snapshot
+    // the pipeline is about to consume, not from a second read after
+    // start (which could disagree with what the pipeline actually runs).
+    let actionableCount;
+    try {
+      const tickets = await loadBacklog(projectCfg);
+      actionableCount = filterAndSort(tickets, projectCfg).length;
+    } catch (err) {
+      console.error(`[pipeline:${projectId}] backlog load failed:`, err.stack || err.message);
+      return res.status(500).json({ error: `backlog load failed: ${err.message}` });
+    }
     try {
       emitter.emit('run_requested', { project: projectId, ticket: 'all', dryRun });
       startPipeline(projectId, { dryRun });
-      const projectsMap = config._projects;
-      const projectCfg = projectsMap?.get(projectId) || config;
-      const tickets = await loadBacklog(projectCfg);
-      const actionable = filterAndSort(tickets, projectCfg);
-      res.json({ status: 'started', project: projectId, ticketCount: actionable.length, dryRun });
+      res.json({ status: 'started', project: projectId, ticketCount: actionableCount, dryRun });
     } catch (err) {
-      if (err.code === 'ALREADY_RUNNING') return res.status(409).json({ error: err.message });
-      if (err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
-      console.error('startPipeline error:', err);
-      res.status(500).json({ error: err.message });
+      sendStartError(res, projectId, err);
     }
   }
   function handleRunTicket(projectId, ticketId, body, res) {
     const dryRun = body?.dryRun || false;
+    if (!configForProject(projectId)) {
+      return res.status(404).json({ error: `project ${projectId} not loaded` });
+    }
     try {
       emitter.emit('run_requested', { project: projectId, ticket: ticketId, dryRun });
       startPipeline(projectId, { ticketId, dryRun });
       res.json({ status: 'started', project: projectId, ticket: ticketId, dryRun });
     } catch (err) {
-      if (err.code === 'ALREADY_RUNNING') return res.status(409).json({ error: err.message });
-      if (err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
-      console.error('startPipeline error:', err);
-      res.status(500).json({ error: err.message });
+      sendStartError(res, projectId, err);
     }
   }
-  function activeProjectIdOr404(res) {
-    const id = config._activeProjectId || config.name || 'default';
+  // Returns the active project id, or null after writing a 400. The
+  // previous fallback to literal `'default'` made the 400 unreachable
+  // and silently routed top-level requests to a project literally named
+  // 'default' even when none was configured. Now: if neither
+  // _activeProjectId nor config.name is set, the caller gets a clear
+  // 400 telling them to use the project-scoped endpoint.
+  function activeProjectIdOr400(res) {
+    const id = config._activeProjectId || config.name;
     if (!id) {
-      res.status(400).json({ error: 'no active project; use /api/projects/:id/run/* instead' });
+      res.status(400).json({ error: 'no active project set; use /api/projects/:id/run/* with an explicit project id, or POST /api/projects/:id/activate first' });
       return null;
     }
     return id;
@@ -739,13 +830,13 @@ export async function startServer(config) {
 
   // API: run a single ticket on the ACTIVE project (backwards-compat)
   app.post('/api/run/ticket/:ticketId', async (req, res) => {
-    const projectId = activeProjectIdOr404(res); if (!projectId) return;
+    const projectId = activeProjectIdOr400(res); if (!projectId) return;
     handleRunTicket(projectId, req.params.ticketId, req.body, res);
   });
 
   // API: run all actionable tickets on the ACTIVE project (backwards-compat)
   app.post('/api/run/all', async (req, res) => {
-    const projectId = activeProjectIdOr404(res); if (!projectId) return;
+    const projectId = activeProjectIdOr400(res); if (!projectId) return;
     handleRunAll(projectId, req.body, res);
   });
 
@@ -759,15 +850,20 @@ export async function startServer(config) {
 
   // PIPE-008: project-scoped stop. Stops the pipeline running for that
   // specific project (if any). Other projects' pipelines are untouched.
+  // 404 not 400: the request is well-formed; the resource just doesn't
+  // exist (no running pipeline for that id).
   app.post('/api/projects/:id/stop', async (req, res) => {
     const hard = req.query?.hard === 'true' || req.body?.hard === true;
     const projectId = req.params.id;
+    if (!configForProject(projectId)) {
+      return res.status(404).json({ error: `project ${projectId} not loaded` });
+    }
     if (activePipelines.has(projectId)) {
       emitter.emit('stop_requested', { project: projectId, hard });
       const result = await stopPipeline(projectId, hard);
       return res.json({ status: 'stopped', project: projectId, hard, subprocessKilled: result.killed });
     }
-    return res.status(400).json({ error: `no pipeline running for project ${projectId}` });
+    return res.status(404).json({ error: `no pipeline running for project ${projectId}` });
   });
 
   // API: stop pipeline. Default semantics are "stop after current step"
@@ -790,9 +886,13 @@ export async function startServer(config) {
       return res.json({ status: 'stopped', project: projectId, hard, subprocessKilled: result.killed });
     }
 
-    // Orphan path: activePipeline was nulled (Pipeline.run() resolved/rejected)
-    // but a Claude child may still be alive editing files. Before this branch
-    // existed the endpoint would 400 and leave the subprocess orphaned.
+    // Orphan path: no map entry for the active project (Pipeline.run()
+    // already resolved/rejected and .finally() cleaned up) but a Claude
+    // child may still be alive editing files. Before this branch existed
+    // the endpoint would 400 and leave the subprocess orphaned. Note:
+    // post-PIPE-008 this scans for orphans server-wide, not per-project
+    // — the spawn relationship doesn't carry project metadata, so any
+    // orphaned `claude` child of this server gets cleaned up.
     const orphans = findOrphanClaudeChildren();
     if (orphans.length === 0) {
       return res.status(400).json({ error: 'No pipeline running' });
