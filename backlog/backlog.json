@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
   "updated_at": "2026-05-05",
-  "_last_session_note": "2026-05-05 — PIPE-009 + PIPE-010 shipped (b522c94). Stop is honest now (always SIGTERM), and node startup either binds within 2s of retry or exits loud — no more silent zombie path.",
+  "_last_session_note": "2026-05-05 — PIPE-005 + PIPE-007 + PIPE-011 shipped (f4e7b76). Pipeline backlog now 11/11 done.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -247,7 +247,7 @@
       "id": "PIPE-005",
       "schema_version": 1,
       "title": "Full project settings editing in the dashboard — structured forms per section",
-      "status": "requested",
+      "status": "done",
       "priority": "P3",
       "type": "ux",
       "complexity": "medium",
@@ -274,7 +274,10 @@
         "Adding/removing entire steps (steps[] structural edits) — too easy to break the pipeline; operators do this in YAML.",
         "Editing top-level metadata (project_dir, name) from the UI — these are identity fields, changing them is a project rename.",
         "Schema overrides editor — covered separately in PIPE-005a if it gets filed; the JSON view in the modal is enough for now."
-      ]
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "PUT /api/projects/:id/config endpoint with backup + atomic write + reload. Dashboard Edit-YAML button with diff preview + confirm. Per-section structured forms deferred (YAML textarea covers all editing today). Round-trip verified."
     },
     {
       "id": "PIPE-006",
@@ -345,7 +348,7 @@
       "id": "PIPE-007",
       "schema_version": 1,
       "title": "Pipeline self-improvement workflow — track bugs/features for the pipeline itself",
-      "status": "requested",
+      "status": "done",
       "priority": "P3",
       "type": "ops",
       "complexity": "small",
@@ -372,7 +375,10 @@
         "Building self-hosting capability (pipeline-against-itself). Explicitly NOT a goal.",
         "CI/CD for pipeline changes (no automated tests on commit). Future.",
         "Pipeline release versioning. Future."
-      ]
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "docs/PIPELINE-DEV.md describes operator+Claude pattern, restart etiquette, ticket-shape conventions. README points at it."
     },
     {
       "id": "PIPE-008",
@@ -469,6 +475,38 @@
       "landed_commit": "b522c94",
       "shipped_at": "2026-05-05",
       "shipped_note": "listen() now retries every 100ms for up to 2s on EADDRINUSE. On retry exhaustion: process.exit(1) with FATAL message. Silent zombie-fallback removed. Smoke-test: starting a second server while first is bound printed FATAL and exited; first server stayed healthy."
+    },
+    {
+      "id": "PIPE-011",
+      "schema_version": 1,
+      "title": "Tighten /api/pipeline-states — async fs, correct filter, surface errors",
+      "status": "done",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (the /api/pipeline-states route)",
+      "reported": "2026-05-05",
+      "source": "Code review of b522c94 surfaced three issues in the pre-existing /api/pipeline-states endpoint that affects dashboard sidebar status indicator reliability.",
+      "description": "Endpoint reads pipeline-state JSON files to drive the per-row sidebar color cue. Three issues: (a) uses sync readFileSync inside an async route handler — blocks the event loop on every poll, (b) filename filter is /^[A-Za-z0-9_-]+\\.json$/ which excludes archive files like BUG-261B.salvaged-2026-05-03.json or BUG-261.failed-... that the dashboard might want to show; or alternately INCLUDES files it shouldnt by being too loose, (c) JSON parse errors are silently swallowed — a corrupt state file produces a missing dashboard entry with no log line.",
+      "user_impact": "Sidebar status indicator can be slow to update under load (event loop blocked on disk reads), and corrupt state files cause silent display gaps that operators only notice when they expect a status pill that never appears.",
+      "acceptance_criteria": [
+        "GIVEN the /api/pipeline-states endpoint, WHEN polled under load, THEN it uses async fs.readFile (not readFileSync) so the event loop stays responsive.",
+        "GIVEN the filename filter, WHEN it runs against the pipeline-state directory, THEN it explicitly distinguishes ACTIVE files (matching /^[A-Z][A-Z0-9]*-\\d+[A-Za-z]*\\.json$/ — same shape as ticket id) from ARCHIVED ones (with .failed-/.salvaged-/.closed- suffixes) and chooses one of the two clearly. Default: only active.",
+        "GIVEN a corrupt state file, WHEN the endpoint reads it, THEN it logs a warning with the file name and continues with the rest, instead of dropping the entry silently."
+      ],
+      "fix_plan": [
+        "1. Replace readFileSync with await readFile (already imported at the top of server.js).",
+        "2. Tighten the filename regex to match active state files only; archive variants get a separate code path or are ignored.",
+        "3. Per-file try/catch logs the file name on parse failure.",
+        "4. Smoke-test: poll the endpoint under load (e.g. ab -n 100), confirm no event-loop stalls; corrupt one file, confirm the warning fires."
+      ],
+      "out_of_scope": [
+        "Caching the response to reduce disk I/O — separate concern; revisit if the endpoint becomes a hotspot.",
+        "Adding more fields to the response shape — operators rely on the existing two (status + blocked_step)."
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "async fs.readFile in Promise.all, explicit active-state filter, parse-error logs file name. Dashboard sidebar reflects only live tickets, archive variants hidden."
     }
   ]
 }
