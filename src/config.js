@@ -2,6 +2,7 @@ import { readFile, readdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
 import { resolve, dirname, basename } from 'path';
+import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 
 // Pipeline working data ({tickets-state, worker-output, build-log}) lives
@@ -9,9 +10,24 @@ import { homedir } from 'os';
 // being worked on. Pre-2026-04-28 these paths were relative to project_dir
 // and polluted the project repo with pipeline-only state files. Now they
 // follow the pipeline binary.
+//
+// PIPE-012 fix (2026-05-05): pipelineHome is derived from THIS file's
+// location, not from the config file's location. Pre-fix: it was
+// `dirname(absConfigPath)`, which worked when configs lived at
+// ~/toshelabs-pipeline/pipeline.config.yaml (legacy single-config mode)
+// but broke under PIPE-003 multi-project — registry configs at
+// ~/.toshelabs/projects/*.yaml gave pipelineHome=~/.toshelabs/projects,
+// then projectWorkDir=~/.toshelabs/projects/projects/{name} (duplicate
+// 'projects/' segment). Result: every registry-loaded project leaked
+// pipeline-state, worker-output, and worktree into the registry dir.
+// Override via PIPELINE_HOME env var if you want pipeline working data
+// to live elsewhere (e.g. on a separate disk).
+const PIPELINE_HOME = process.env.PIPELINE_HOME
+  || resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
 function resolveAll(absConfigPath, config) {
   const projectDir = config.project_dir;
-  const pipelineHome = dirname(absConfigPath);
+  const pipelineHome = PIPELINE_HOME;
   const projectName = config.name || 'default';
   const projectWorkDir = resolve(pipelineHome, 'projects', projectName);
   return {
