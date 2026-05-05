@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
-  "updated_at": "2026-05-04",
-  "_last_session_note": "2026-05-04 — PIPE-008 shipped (55be660): real cross-project concurrent pipelines. Operator pushed back on the earlier \"comes for free\" claim that turned out to be incomplete. Refactor adds project-scoped run/stop endpoints, drops the activate-409, tags every Pipeline event with its project for SSE multiplexing.",
+  "updated_at": "2026-05-05",
+  "_last_session_note": "2026-05-05 — PIPE-009 + PIPE-010 shipped (b522c94). Stop is honest now (always SIGTERM), and node startup either binds within 2s of retry or exits loud — no more silent zombie path.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -397,6 +397,78 @@
         "GIVEN /api/status, WHEN polled, THEN runningProjects[] reflects all active pipelines and perProject{} is per-project running flags.",
         "GIVEN dashboard SSE, WHEN events with project: A arrive while project B is the active view, THEN they don't render in the terminal feed but the picker indicator updates."
       ]
+    },
+    {
+      "id": "PIPE-009",
+      "schema_version": 1,
+      "title": "Drop soft-stop semantic — /api/stop always SIGTERM (hard=false today is a lie)",
+      "status": "done",
+      "priority": "P2",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (stopPipeline + /api/stop + /api/projects/:id/stop), public/index.html (stop button no longer takes a ?hard parameter), docs (TICKET-SCHEMA.md or future API doc)",
+      "reported": "2026-05-05",
+      "source": "Operator audit 2026-05-05: 'what does stop do now?' Reading the code revealed that /api/stop with hard=false (the default) calls pipeline.releaseLock() then returns status:'stopped' — but the pipeline keeps running. Subprocess unaffected, current step continues, next step starts, next ticket starts. The run only stops when it would have finished anyway. The lockfile gets deleted, which is genuinely dangerous: another process seeing the lock gone could think nothing is running and try to start a parallel pipeline against the same worktree.",
+      "description": "Remove the hard parameter from /api/stop and /api/projects/:id/stop. Both endpoints always SIGTERM the active Claude subprocess via Pipeline.stopActiveSubprocess() (which itself escalates to SIGKILL after 5s grace). Soft-stop semantic deleted entirely — it was misleading and the lock-release-without-stop side effect was actively harmful (race window where the lock looks free but a worker is still alive). Operators who want 'don't add more tickets but let the current one finish' get that semantic via a separate endpoint, filed as future work (PIPE-009b: drain endpoint).",
+      "user_impact": "(a) Stop button feels honest — clicking it actually stops the run, not just deletes the lockfile while the pipeline keeps eating tokens. (b) Eliminates the race where the lock appears free during a still-live run.",
+      "acceptance_criteria": [
+        "GIVEN /api/stop is POSTed with no body or query params, WHEN the active project's pipeline is running, THEN the active Claude subprocess receives SIGTERM, the step throws, pipeline.run() rejects, and the map entry is cleaned within seconds.",
+        "GIVEN /api/projects/:id/stop is POSTed, WHEN that specific project's pipeline is running, THEN same behavior, scoped to that project.",
+        "GIVEN a run is stopped, WHEN /api/status is queried, THEN running:false (no more lying that nothing's running while it actually is).",
+        "GIVEN the dashboard Stop button, WHEN clicked, THEN it sends POST /api/stop (no ?hard param) and the pipeline pill flips to Idle within seconds, not 'whenever the queue happens to drain'.",
+        "GIVEN the previously-existing hard query param or body field, WHEN sent, THEN it's ignored (no breakage; just a no-op since hard is now implicit always)."
+      ],
+      "decisions": [
+        "Operator decision 2026-05-05: option (b) from the discussion — remove soft-stop entirely instead of trying to make it actually stop something. The 'set a flag and stop at next checkpoint' alternative (option (a)) was discussed and rejected: a step boundary can be minutes away (flutter test, implement step) and minutes-of-graceful-stop isn't a useful semantic.",
+        "Subprocess SIGTERM with 5s SIGKILL escalation is the right default. Pipeline.stopActiveSubprocess already implements this; just always call it.",
+        "Drain semantic ('don't pull the next ticket') is filed as PIPE-009b future work, not bundled here."
+      ],
+      "fix_plan": [
+        "1. src/server.js stopPipeline: drop the hard parameter; always call stopActiveSubprocess. Update the comment to describe the actual behavior (no more 'soft stop = release lock and walk away' — that path is gone).",
+        "2. /api/stop and /api/projects/:id/stop: ignore hard query/body params (or 400 if anyone sends one — TBD; ignore is cheaper for backwards-compat).",
+        "3. public/index.html stop button: drop any ?hard=true wiring; just POST /api/stop.",
+        "4. Test: kick off busydad's queue, hit Stop, verify pipeline_stopped fires within seconds and the next /api/status shows running:false."
+      ],
+      "out_of_scope": [
+        "PIPE-009b drain endpoint (don't pull next ticket; let current finish). Separate ticket.",
+        "Changing Pipeline.stopActiveSubprocess's SIGTERM→SIGKILL escalation timing.",
+        "Adding a confirmation modal on the dashboard Stop button."
+      ],
+      "landed_commit": "b522c94",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "Stop is always decisive. /api/stop and /api/projects/:id/stop both SIGTERM the active subprocess (escalates to SIGKILL after 5s grace). Soft-stop deleted. Smoke-test: /api/stop idle returned 400 expected, restart cycle clean, no zombie."
+    },
+    {
+      "id": "PIPE-010",
+      "schema_version": 1,
+      "title": "Node startup defense against EADDRINUSE — retry listen, then exit(1) loud",
+      "status": "done",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (app.listen error handling + retry loop)",
+      "reported": "2026-05-05",
+      "source": "Operator hit a server zombie state on 2026-05-05: an old node-pipeline process was alive but the kernel hadn't released port 3847 yet when start.sh tried to launch the new one. Node fell into a 'Port already in use — running without UI server' fallback path: the process kept running but never bound the HTTP server, so MCP and the dashboard were unreachable. The operator only noticed when another session tried to use MCP. start.sh fix shipped in 9fc9dc8 (SIGTERM-then-poll-1s-then-SIGKILL) prevents the bind race externally, but the underlying Node behavior is still in the source as a fallback to a degraded mode that's worse than crashing.",
+      "description": "Replace Node's silent 'running without UI server' fallback with: (a) retry listen() every 100ms for up to 2s on EADDRINUSE — covers the residual race even if start.sh's SIGKILL fallback fired and the kernel needs an extra moment to reap the socket; (b) after 2s of retry, process.exit(1) with a clear log message naming the conflicting port. Refusing to start is better than running headless — the supervisor (start.sh, systemd, whatever) restarts; the operator notices immediately if the conflict persists.",
+      "user_impact": "Defense in depth with the start.sh fix. Today: if start.sh's pkill fails for any reason (parent dies between SIGTERM and SIGKILL, kernel reaping is slow, etc.), Node still falls into zombie mode and the operator gets a half-broken pipeline. With this: Node either binds successfully on retry, or exits loud and start.sh handles the restart.",
+      "acceptance_criteria": [
+        "GIVEN port :3847 is held by a dying process, WHEN node src/index.js --server is invoked, THEN listen() retries every 100ms for up to 2s before giving up.",
+        "GIVEN the retry succeeds, WHEN the dashboard is opened, THEN it works normally — no startup gap visible to the operator beyond the brief retry window.",
+        "GIVEN the retry exhausts (port still held after 2s), WHEN node fails the final listen attempt, THEN process.exit(1) with a stderr log: 'FATAL: port 3847 still bound after 2s retry; aborting.' (or similar).",
+        "GIVEN the current 'running without UI server' fallback, WHEN it would have fired today, THEN it does NOT fire — there is no longer a silent-degraded-mode path."
+      ],
+      "fix_plan": [
+        "1. src/server.js: wrap app.listen in a small retry loop. Either custom logic or use a library; custom is fine since the requirement is small.",
+        "2. Replace any existing console.log('Port 3847 already in use — running without UI server') (or whatever the exact string is) with the exit(1) path.",
+        "3. Test: kick off busydad pipeline, kill the server with start.sh stop+immediate-start, verify Node retries cleanly and binds within ~1s instead of falling through."
+      ],
+      "out_of_scope": [
+        "Configurable retry duration (2s is enough; if you need more, fix the cause not the symptom).",
+        "Health-check endpoint changes — orthogonal."
+      ],
+      "landed_commit": "b522c94",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "listen() now retries every 100ms for up to 2s on EADDRINUSE. On retry exhaustion: process.exit(1) with FATAL message. Silent zombie-fallback removed. Smoke-test: starting a second server while first is bound printed FATAL and exited; first server stayed healthy."
     }
   ]
 }
