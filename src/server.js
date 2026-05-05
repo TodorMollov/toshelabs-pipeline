@@ -166,30 +166,29 @@ export async function startServer(config) {
     return pipeline;
   }
 
-  // Stop a Pipeline for the given project.
+  // PIPE-009: stop is always decisive — SIGTERM the active Claude
+  // subprocess (Pipeline.stopActiveSubprocess escalates to SIGKILL after
+  // 5s if it didn't take). The subprocess dies in seconds, the step
+  // throws, pipeline.run() rejects, .finally() cleans up the map entry.
   //
-  // hard=false (default): release the project's code_lock and walk away.
-  //   The in-flight Claude subprocess KEEPS RUNNING until it completes
-  //   naturally; pipeline.run()'s .finally() will fire when it does, at
-  //   which point the map entry's already gone and pipeline_stopped is
-  //   emitted (with no harm — listeners idempotent). This matches what
-  //   the pre-refactor code did. It does NOT mean "stop after current
-  //   step" (the old comment was aspirational; Pipeline has no such
-  //   hook). True graceful-stop is filed as future work.
-  // hard=true: SIGTERM the active Claude subprocess; the step throws,
-  //   pipeline.run() rejects, .finally() cleans up the map entry. The
-  //   subprocess is gone in seconds rather than minutes.
+  // The previous soft-stop semantic (hard=false: release lock and walk
+  // away while the subprocess kept running) was a lie — it returned
+  // status:'stopped' to the caller while the pipeline kept consuming
+  // tokens. The lock-release-without-stop side effect was also actively
+  // harmful: another process seeing the lockfile gone could think
+  // nothing was running and try to start a parallel pipeline against
+  // the same worktree. Removed.
   //
   // Returns { stopped, killed, reason? }. stopped=false means there was
   // no pipeline to stop.
-  async function stopPipeline(projectId, hard = false) {
+  async function stopPipeline(projectId) {
     const entry = activePipelines.get(projectId);
     if (!entry) {
       return { stopped: false, killed: false, reason: 'no pipeline running for this project' };
     }
     const { pipeline } = entry;
     let killed = false;
-    if (hard && typeof pipeline.stopActiveSubprocess === 'function') {
+    if (typeof pipeline.stopActiveSubprocess === 'function') {
       killed = pipeline.stopActiveSubprocess();
     }
     await pipeline.releaseLock();
@@ -853,37 +852,37 @@ export async function startServer(config) {
   // 404 not 400: the request is well-formed; the resource just doesn't
   // exist (no running pipeline for that id).
   app.post('/api/projects/:id/stop', async (req, res) => {
-    const hard = req.query?.hard === 'true' || req.body?.hard === true;
     const projectId = req.params.id;
     if (!configForProject(projectId)) {
       return res.status(404).json({ error: `project ${projectId} not loaded` });
     }
     if (activePipelines.has(projectId)) {
-      emitter.emit('stop_requested', { project: projectId, hard });
-      const result = await stopPipeline(projectId, hard);
-      return res.json({ status: 'stopped', project: projectId, hard, subprocessKilled: result.killed });
+      emitter.emit('stop_requested', { project: projectId });
+      const result = await stopPipeline(projectId);
+      return res.json({ status: 'stopped', project: projectId, subprocessKilled: result.killed });
     }
     return res.status(404).json({ error: `no pipeline running for project ${projectId}` });
   });
 
-  // API: stop pipeline. Default semantics are "stop after current step"
-  // (pipeline winds down when the step's Claude subprocess completes).
-  // Pass `?hard=true` or {"hard": true} body to SIGTERM the subprocess
-  // immediately — fixes the recurring "stop is slow" complaint where a
-  // mid-step /api/stop could wait 5-15 min for Claude to finish.
+  // API: stop pipeline. PIPE-009: stop is always decisive — SIGTERMs
+  // the active Claude subprocess (escalates to SIGKILL after 5s).
+  // Subprocess dies in seconds, step throws, run() rejects, map entry
+  // is cleaned. The previous soft-stop semantic (hard=false: release
+  // lock and walk away while the pipeline kept running) was a lie and
+  // produced a dangerous race window where the lockfile was gone but
+  // a worker was still alive. Removed; `hard` query/body params are
+  // ignored (no breakage, just no-op).
   //
-  // PIPE-008: this endpoint stops the ACTIVE PROJECT's pipeline only
-  // (backwards-compat). Use /api/projects/:id/stop to stop a non-active
-  // project's run.
+  // PIPE-008: this endpoint stops the ACTIVE PROJECT's pipeline only.
+  // Use /api/projects/:id/stop to stop a non-active project's run.
   app.post('/api/stop', async (req, res) => {
-    const hard = req.query?.hard === 'true' || req.body?.hard === true;
     const projectId = config._activeProjectId || config.name || 'default';
 
     // Happy path: pipeline reference still live.
     if (activePipelines.has(projectId)) {
-      emitter.emit('stop_requested', { project: projectId, hard });
-      const result = await stopPipeline(projectId, hard);
-      return res.json({ status: 'stopped', project: projectId, hard, subprocessKilled: result.killed });
+      emitter.emit('stop_requested', { project: projectId });
+      const result = await stopPipeline(projectId);
+      return res.json({ status: 'stopped', project: projectId, subprocessKilled: result.killed });
     }
 
     // Orphan path: no map entry for the active project (Pipeline.run()
@@ -893,20 +892,17 @@ export async function startServer(config) {
     // post-PIPE-008 this scans for orphans server-wide, not per-project
     // — the spawn relationship doesn't carry project metadata, so any
     // orphaned `claude` child of this server gets cleaned up.
+    //
+    // PIPE-009: the previous "soft" path (409 with a hint to retry with
+    // hard=true) is gone. If the orphan exists, it's by definition NOT
+    // doing pipeline-orchestrated work (the pipeline finished already);
+    // it's just a stuck worker. Always SIGTERM.
     const orphans = findOrphanClaudeChildren();
     if (orphans.length === 0) {
       return res.status(400).json({ error: 'No pipeline running' });
     }
 
-    emitter.emit('stop_requested', { hard, orphans: orphans.length });
-
-    if (!hard) {
-      return res.status(409).json({
-        status: 'orphans_detected',
-        orphansFound: orphans.length,
-        hint: 'pass ?hard=true to SIGTERM the orphan claude subprocess(es)',
-      });
-    }
+    emitter.emit('stop_requested', { orphans: orphans.length });
 
     // Three distinct terminal states per orphan:
     //   signaled     — SIGTERM delivered; SIGKILL attempted at +5s if still alive
@@ -969,7 +965,6 @@ export async function startServer(config) {
 
     res.json({
       status: 'stopped',
-      hard: true,
       orphansFound: orphans.length,
       orphansSignaled,
       orphansAlreadyDead,
@@ -1145,17 +1140,73 @@ export async function startServer(config) {
     }
   });
 
-  return new Promise((resolvePromise) => {
-    const server = app.listen(config.server.port, config.server.host, () => {
-      resolvePromise({ emitter, server });
-    });
-    server.on('error', (err) => {
-      if (err.code === 'EADDRINUSE') {
-        console.warn(`Port ${config.server.port} already in use — running without UI server`);
-        resolvePromise({ emitter, server: null });
-      } else {
-        throw err;
+  // Bulk pipeline-state status for the sidebar's per-ticket color cue.
+  // Returns { ticketId: { status, blocked_step? } } — slim payload, only
+  // the fields the sidebar needs to color a row. Skips `*.failed-*.json`
+  // history files; only the active `{id}.json` per ticket is returned.
+  app.get('/api/pipeline-states', async (req, res) => {
+    try {
+      const dir = config._resolved.pipelineDir;
+      const out = {};
+      const files = readdirSync(dir).filter((f) => /^[A-Za-z0-9_-]+\.json$/.test(f));
+      for (const f of files) {
+        const ticketId = f.slice(0, -5);
+        try {
+          const raw = readFileSync(resolve(dir, f), 'utf-8');
+          const state = JSON.parse(raw);
+          out[ticketId] = {
+            status: state.status || null,
+            blocked_step: state.blocked_step || null,
+          };
+        } catch { /* skip unreadable */ }
       }
-    });
+      res.json(out);
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // PIPE-010: bind with retry + fail-loud-on-give-up.
+  //
+  // The kernel can take up to a couple seconds to release a listening
+  // socket after the previous server's parent exits — a common race
+  // when start.sh restarts the server after a SIGKILL fallback.
+  // Retry every 100ms for up to 2s before giving up.
+  //
+  // The previous fallback ("running without UI server") was actively
+  // harmful: the process kept running but bound nothing, so MCP and the
+  // dashboard were unreachable. Operators only noticed when other
+  // sessions hit timeouts. Better to exit(1) loud and let the
+  // supervisor (start.sh) handle the restart.
+  return new Promise((resolvePromise, rejectPromise) => {
+    const port = config.server.port;
+    const host = config.server.host;
+    const MAX_ATTEMPTS = 20;
+    const RETRY_INTERVAL_MS = 100;
+    let attempt = 0;
+    const tryListen = () => {
+      attempt++;
+      const server = app.listen(port, host, () => {
+        if (attempt > 1) console.log(`HTTP server bound on attempt ${attempt} (${(attempt - 1) * RETRY_INTERVAL_MS}ms after first try)`);
+        resolvePromise({ emitter, server });
+      });
+      server.on('error', (err) => {
+        if (err.code !== 'EADDRINUSE') {
+          rejectPromise(err);
+          return;
+        }
+        if (attempt < MAX_ATTEMPTS) {
+          setTimeout(tryListen, RETRY_INTERVAL_MS);
+          return;
+        }
+        // Exhausted retries — fail loud rather than running headless.
+        // 2s should be enough for any sane SIGKILL → kernel-reap window;
+        // beyond that, something else is genuinely holding the port and
+        // the operator needs to know.
+        console.error(`FATAL: port ${port} still bound after ${MAX_ATTEMPTS * RETRY_INTERVAL_MS}ms of retries. Aborting. Inspect with \`ss -tlnp | grep ${port}\`.`);
+        process.exit(1);
+      });
+    };
+    tryListen();
   });
 }
