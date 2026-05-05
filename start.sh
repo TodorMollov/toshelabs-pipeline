@@ -3,66 +3,77 @@ cd "$(dirname "$0")"
 PIDFILE=".server.pid"
 PORT="${PIPELINE_PORT:-3847}"
 
-# Wait until the listening port is actually free. Without this, the new
-# server starts before the old one fully releases :3847 and gets the
-# "Port 3847 already in use — running without UI server" fallback path,
-# which silently leaves the old process serving requests with stale
-# state. Polls every 200ms up to 10s; gives up loud rather than
-# proceeding into a broken state.
-wait_port_free() {
-  local i=0
-  # 30s ceiling: when stop is hard-killing a step, the kernel needs a
-  # second or two to reap the listening socket after the parent exits.
-  # 10s was too short — a Pipeline mid-`flutter test` could take 10-15s
-  # to wind down and the next `start` would race the port and fall into
-  # the "running without UI server" zombie path. 30s × 200ms = 150 polls.
-  while [ "$i" -lt 150 ]; do
-    if ! ss -tln "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}\b"; then
+# Stop pattern (operator-requested 2026-05-05):
+#   1. Send SIGTERM to every node-pipeline process we know about.
+#   2. Poll every 1s checking whether the port is actually free.
+#   3. After 10s of polling, if anything's still bound, SIGKILL and
+#      poll one more second to confirm. SIGKILL is unconditional —
+#      after step 3 the port MUST be free or we refuse to start.
+#
+# Why this shape: SIGTERM lets the running server flush ops logs, release
+# code locks, and unwatchFile cleanly. We give it 10s to do that. If it
+# can't (mid-`flutter test`, mid-Claude-step, deadlocked), SIGKILL is
+# decisive. Either way, total wait is bounded at ~11s.
+#
+# Port-as-success-signal: checking the port is more reliable than checking
+# the PID, because PID reuse + multi-process scenarios make "is THIS pid
+# alive" unreliable. If the port's free, the kernel has reaped the listening
+# socket — that means the process binding it is gone.
+
+list_pids() {
+  # Every process matching our server invocation. Includes ones started
+  # outside this script (manual `node src/index.js --server`).
+  pgrep -f "node src/index.js --server" 2>/dev/null
+}
+
+port_is_free() {
+  ! ss -tln "sport = :${PORT}" 2>/dev/null | grep -q ":${PORT}\b"
+}
+
+stop_and_wait() {
+  # 1. Send SIGTERM to known pid + sweep by name.
+  if [ -f "$PIDFILE" ]; then
+    kill "$(cat "$PIDFILE")" 2>/dev/null || true
+    rm -f "$PIDFILE"
+  fi
+  pkill -TERM -f "node src/index.js --server" 2>/dev/null || true
+
+  # 2. Poll every 1s up to 10s for graceful shutdown.
+  local waited=0
+  while [ "$waited" -lt 10 ]; do
+    if port_is_free && [ -z "$(list_pids)" ]; then
+      [ "$waited" -gt 0 ] && echo "Stopped after ${waited}s."
       return 0
     fi
-    sleep 0.2
-    i=$((i + 1))
+    sleep 1
+    waited=$((waited + 1))
   done
-  echo "ERROR: port ${PORT} still bound after 30s wait — refusing to start" >&2
+
+  # 3. SIGKILL anything still alive; one more 1s check.
+  echo "Graceful stop didn't finish in 10s — SIGKILL." >&2
+  pkill -KILL -f "node src/index.js --server" 2>/dev/null || true
+  sleep 1
+  if port_is_free; then
+    echo "Stopped (after SIGKILL)."
+    return 0
+  fi
+  echo "ERROR: port ${PORT} still bound after SIGKILL. Inspect with \`ss -tlnp | grep ${PORT}\`." >&2
   return 1
 }
 
 case "${1:-start}" in
   stop)
-    if [ -f "$PIDFILE" ]; then
-      kill "$(cat "$PIDFILE")" 2>/dev/null && echo "Stopped (pidfile)." || true
-      rm -f "$PIDFILE"
-    fi
-    # Always sweep by name afterward — catches processes started outside
-    # the script (e.g. left over from an earlier session) that the pidfile
-    # never knew about. Without this, port stays held and the next
-    # `start` becomes a zombie that can't bind.
-    pkill -f "node src/index.js --server" 2>/dev/null && echo "Swept stragglers." || true
-    # Wait for the kernel to actually release the port. SIGTERM doesn't
-    # close listening sockets synchronously; the kernel reaps them after
-    # the process exits. Even after pkill returns 0, the next bind() can
-    # fail with EADDRINUSE for ~hundreds of ms. Poll instead of guessing.
-    wait_port_free || true
+    stop_and_wait
     ;;
   restart)
-    "$0" stop
+    "$0" stop || exit 1
     "$0" start "${@:2}"
     ;;
   start|*)
     [ "$1" = "start" ] && shift
-    "$0" stop 2>/dev/null
-    # If port is still bound after stop's wait, refuse to start. The
-    # alternative — letting node start anyway and fall into its
-    # "Port already in use — running without UI server" path — produces
-    # a zombie process that's alive but not serving anything (no
-    # dashboard, no MCP, no /api/*). The operator only notices when a
-    # subsequent /api/projects/refresh times out, by which point
-    # whatever they're trying to do has been silently broken for hours.
-    # Better to fail loud here.
-    if ! wait_port_free; then
-      echo "ERROR: refusing to start — port ${PORT} is held by another process. Run \`./start.sh stop\` and check \`ss -tlnp | grep ${PORT}\`." >&2
-      exit 1
-    fi
+    # stop_and_wait is a no-op if nothing's running; safe to call
+    # before every start so no orphan can interfere with the new bind.
+    stop_and_wait || exit 1
     # rotate previous log once so we keep one generation
     [ -f pipeline.log ] && mv -f pipeline.log pipeline.log.1
     NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" >> pipeline.log 2>&1 &
