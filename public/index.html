@@ -1102,6 +1102,10 @@ async function requeueTicket(id) {
     const data = await r.json();
     if (!r.ok) { appendTerminal(`Re-queue failed: ${data.error || r.statusText}`, 'system'); return; }
     appendTerminal(`Re-queued ${id}${data.archived ? ' (state archived)' : ''}${data.backlogUpdated ? ' (backlog reset)' : ''}`, 'system');
+    // Refresh state immediately so the orange Requeue pill disappears
+    // and the row's status class drops back to actionable. Without this
+    // the row only updates on the next 10s poll.
+    await loadPipelineStates();
   } catch (err) {
     appendTerminal(`Re-queue failed: ${err.message}`, 'system');
   }
