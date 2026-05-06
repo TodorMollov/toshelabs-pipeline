@@ -319,8 +319,24 @@ async function loadTickets() {
     const r = await fetch('/api/reports/tickets');
     const d = await r.json();
     state.tickets = d.tickets || [];
-  } catch { state.tickets = []; }
+    state.project = d.project || null;
+  } catch { state.tickets = []; state.project = null; }
 }
+
+const REQUEUE_STATUSES = new Set(['blocked', 'failed', 'in_progress']);
+async function requeueTicket(ticketId) {
+  if (!state.project) { alert('Cannot re-queue: active project unknown.'); return; }
+  if (!confirm(`Re-queue ${ticketId}?\n\nArchives the current pipeline-state JSON and resets the backlog ticket to 'requested'. The pipeline will start it fresh on the next run. This does NOT trigger a run.`)) return;
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(state.project)}/tickets/${encodeURIComponent(ticketId)}/requeue`, { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert(`Re-queue failed: ${d.error || r.statusText}`); return; }
+    await refreshAll();
+  } catch (err) {
+    alert(`Re-queue failed: ${err.message}`);
+  }
+}
+window.requeueTicket = requeueTicket;
 
 async function loadEvents() {
   try {
@@ -499,13 +515,16 @@ function renderTickets() {
       return `<div class="step-dot ${status}" title="${s}: ${status}"></div>`;
     }).join('');
     const pri = t.priority ? `<span class="pri pri-${t.priority}">${t.priority}</span>` : '';
+    const reqBtn = REQUEUE_STATUSES.has(t.status)
+      ? ` <button onclick="event.stopPropagation();requeueTicket('${esc(t.id)}')" title="Archive pipeline-state and reset backlog status to 'requested'. Does not start a run." style="margin-left:6px;background:transparent;color:var(--text-dim);border:1px solid var(--border);border-radius:3px;padding:1px 6px;font-size:10px;cursor:pointer;">↻ requeue</button>`
+      : '';
     const collapsed = (!anyFilterActive && state.collapsedGroups.has(groupName)) ? ' collapsed' : '';
     return `<tr class="ticket-row${collapsed}" data-id="${esc(t.id)}" data-group="${esc(groupName)}">
       <td class="id">${esc(t.id)}</td>
       <td>${esc(t.title).slice(0,80)}</td>
       <td>${pri}</td>
       <td>${esc(t.type || '')}</td>
-      <td class="status-${t.status}">${esc(t.status)}</td>
+      <td class="status-${t.status}">${esc(t.status)}${reqBtn}</td>
       <td title="${t.waited_sec ? 'work ' + fmtDuration(t.working_sec) + ' + waited ' + fmtDuration(t.waited_sec) + ' (5h reset)' : 'no rate-limit waits'}">${fmtDuration(t.working_sec ?? t.duration_sec)}${t.waited_sec ? ` <span style="color:var(--text-muted);font-size:11px;">+${fmtDuration(t.waited_sec)}w</span>` : ''}</td>
       <td><div class="steps">${steps}</div></td>
       <td>${fmtDate(t.completed_at || t.started_at)}</td>
@@ -599,7 +618,7 @@ const es = new EventSource('/events');
 es.onmessage = (e) => {
   try {
     const entry = JSON.parse(e.data);
-    if (['ticket_done', 'ticket_failed', 'step_done', 'pipeline_complete', 'pipeline_crashed_detected', 'rate_limited'].includes(entry.event)) {
+    if (['ticket_done', 'ticket_failed', 'step_done', 'pipeline_complete', 'pipeline_crashed_detected', 'rate_limited', 'ticket_requeued'].includes(entry.event)) {
       // Coalesce refreshes
       clearTimeout(window._refreshTimer);
       window._refreshTimer = setTimeout(refreshAll, 1200);

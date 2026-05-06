@@ -938,6 +938,56 @@ export async function startServer(config) {
     handleRunTicket(req.params.id, req.params.ticketId, req.body, res);
   });
 
+  // Re-queue a stuck ticket. Archives the existing pipeline-state JSON
+  // (preserves the audit trail) so the next pipeline run sees no state
+  // for this ticket and starts fresh from `requested`. Does NOT trigger
+  // a run — the operator decides when to re-process. Idempotent: if no
+  // state file exists, returns ok with archived:false.
+  app.post('/api/projects/:id/tickets/:ticketId/requeue', async (req, res) => {
+    const projectId = req.params.id;
+    const ticketId = req.params.ticketId;
+    const cfg = configForProject(projectId);
+    if (!cfg) return res.status(404).json({ error: `project ${projectId} not loaded` });
+    if (activePipelines.has(projectId)) {
+      return res.status(409).json({ error: `pipeline is running for project ${projectId}; stop it before re-queueing` });
+    }
+    try {
+      const { existsSync } = await import('fs');
+      const { mkdir, rename, readFile: rf, writeFile: wf } = await import('fs/promises');
+      const { resolve: rsv } = await import('path');
+      const liveDir = cfg._resolved.pipelineDir;
+      const archiveDir = rsv(liveDir, 'archive');
+      const stateFile = rsv(liveDir, `${ticketId}.json`);
+      let archivedTo = null;
+      if (existsSync(stateFile)) {
+        await mkdir(archiveDir, { recursive: true });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        archivedTo = rsv(archiveDir, `${ticketId}.requeued-${stamp}.json`);
+        await rename(stateFile, archivedTo);
+      }
+      // Defensive: ensure backlog ticket status is `requested`, since
+      // a `failed` state would be odd for a re-queued ticket. Schema
+      // validation lives in the MCP/CRUD path; here we just patch the
+      // status field if the ticket exists in the backlog.
+      const backlogPath = cfg._resolved.backlog;
+      let backlogUpdated = false;
+      if (existsSync(backlogPath)) {
+        const data = JSON.parse(await rf(backlogPath, 'utf-8'));
+        const idx = (data.tickets || []).findIndex((t) => t.id === ticketId);
+        if (idx >= 0 && data.tickets[idx].status !== 'requested') {
+          data.tickets[idx].status = 'requested';
+          data.updated_at = new Date().toISOString().slice(0, 10);
+          await wf(backlogPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+          backlogUpdated = true;
+        }
+      }
+      emitter.emit('ticket_requeued', { project: projectId, ticket: ticketId, archived: !!archivedTo, backlogUpdated });
+      res.json({ project: projectId, ticket: ticketId, archived: !!archivedTo, archivedTo, backlogUpdated });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // PIPE-008: project-scoped stop. Stops the pipeline running for that
   // specific project (if any). Other projects' pipelines are untouched.
   // 404 not 400: the request is well-formed; the resource just doesn't
@@ -1185,7 +1235,7 @@ export async function startServer(config) {
         const bk = b.completed_at || b.started_at || '';
         return bk.localeCompare(ak);
       });
-      res.json({ count: results.length, tickets: results });
+      res.json({ count: results.length, tickets: results, project: config._activeProjectId || config.name || 'default' });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
