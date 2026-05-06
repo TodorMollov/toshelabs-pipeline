@@ -250,21 +250,10 @@ export class Pipeline {
               await this.savePipelineJson(ticket.id, failedState);
             }
           } catch { /* best-effort */ }
-          // Atomic rollback: revert this ticket's declared files so the next
-          // ticket's baseline is clean. Skipped on dry-run and when the
-          // ticket has no declared files (e.g. crashed before plan).
-          //
-          // Hard skip when the failure is a checkpoint refusal (DIRTY_TREE
-          // and friends): we never wrote a thing, so there is nothing to
-          // revert. Running rollback here would incorrectly attribute the
-          // operator's pre-existing uncommitted edits to this ticket and
-          // `git checkout HEAD --` them out of the tree (this is exactly
-          // how 13 backlog edits were destroyed on 2026-04-25).
-          const skipRollback = err instanceof CheckpointError;
-          if (!this.dryRun && failedState && !skipRollback) {
-            try { await this.rollbackTicketFiles(ticket, failedState); }
-            catch (rbErr) { console.error(`[rollback] ${ticket.id}: ${rbErr.message}`); }
-          }
+          // Step-level rollback (revertToBaseline) already ran inside
+          // runStepWithHealing for any gate-failure path that throws here,
+          // so the worktree is already clean. In worktree mode the next
+          // ticket's prepareWorktreeForTicket also resets the side branch.
           // Per-ticket branches were removed in the 2026-04-28 refactor;
           // the orchestrator never leaves master in the primary checkout
           // (and the worktree, when enabled, is permanently pinned to its
@@ -488,13 +477,6 @@ export class Pipeline {
       } catch (err) {
         console.error(`[baseline] capture failed for ${ticket.id}: ${err.message}. Continuing without baseline — tests_green may flag preexisting failures as new.`);
         this.emit('baseline_capture_failed', { ticket: ticket.id, error: err.message });
-      }
-      // Record which files were already dirty so rollback/auto-commit can
-      // distinguish this ticket's output from earlier uncommitted work.
-      try {
-        await this.snapshotDirtyAtStart(ticket, pipelineState);
-      } catch (err) {
-        console.error(`[dirty-snapshot] failed for ${ticket.id}: ${err.message}`);
       }
     }
 
@@ -1382,242 +1364,28 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     await writeFile(path, JSON.stringify(state, null, 2));
   }
 
-  // --- File tracking: dirty snapshot, rollback, auto-commit ---
-
-  // Union of files_changed across every step's artifacts. Pipeline state
-  // files (memory/pipeline/*.json) are excluded — they're bookkeeping, not
-  // ticket output. Paths are relative to project_dir, matching git.
-  // Paths the orchestrator manages as bookkeeping — never count toward
-  // ticket file changes, never trip silent-writes guards. After the
-  // 2026-04-28 working-data relocation, pipeline state and worker output
-  // both live under {pipeline-home}/projects/{name}/ — outside the project
-  // entirely, so they don't appear in the project's git status. The legacy
-  // prefixes are kept for back-compat with stale state files that may
-  // still exist in older projects mid-migration.
-  isOrchestratorPath(path) {
-    if (!path) return false;
-    if (path.startsWith('memory/pipeline/')) return true;       // legacy
-    if (path.startsWith('.pipeline-worker-out/')) return true;  // legacy
-    return false;
-  }
-
-  collectDeclaredFiles(pipelineState) {
-    const out = new Set();
-    for (const step of Object.values(pipelineState.steps || {})) {
-      if (!step || typeof step !== 'object') continue;
-      for (const fc of (step.files_changed || [])) {
-        const p = typeof fc === 'object' ? fc.path : fc;
-        if (!p || typeof p !== 'string') continue;
-        if (this.isOrchestratorPath(p)) continue;
-        out.add(p);
-      }
-    }
-    return out;
-  }
-
-  // Authoritative "this ticket touched" set: union of LLM-declared files
-  // AND git-observed changes since ticket start. Catches silent writes
-  // (LLM forgot to list a file, step wrote a sibling config, crash mid-
-  // step). Files already dirty at ticket start are never attributed here —
-  // they belong to earlier uncommitted work or manual edits.
-  collectTicketFiles(pipelineState) {
-    const out = this.collectDeclaredFiles(pipelineState);
-    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
-    const nowDirty = this.getDirtyFiles(this.cwd);
-    for (const path of nowDirty.keys()) {
-      if (dirtyAtStart.has(path)) continue;
-      if (this.isOrchestratorPath(path)) continue;
-      out.add(path);
-    }
-    return out;
-  }
-
-  // Returns paths currently dirty that are NOT declared anywhere (plan.
-  // files_to_change ∪ all steps' files_changed) AND were not dirty at
-  // ticket start. Forces the implement step to own every file it wrote:
-  // either declare it or revert it. Without this, silent writes accumulate
-  // into the kind of 40-file graveyard we cleaned up in 2026-04-19.
-  checkSilentWrites(pipelineState) {
-    const dirtyAtStart = new Set(pipelineState.dirty_at_start || []);
-    const nowDirty = this.getDirtyFiles(this.cwd);
-    const declared = this.collectDeclaredFiles(pipelineState);
-    // Also accept paths the planner declared under plan.files_to_change
-    // even if no step reports them in files_changed yet.
-    const plan = pipelineState.steps?.plan;
-    for (const fc of (plan?.files_to_change || [])) {
-      const p = typeof fc === 'object' ? fc.path : fc;
-      if (p && typeof p === 'string' && !this.isOrchestratorPath(p)) declared.add(p);
-    }
-    const silent = [];
-    for (const path of nowDirty.keys()) {
-      if (dirtyAtStart.has(path)) continue;
-      if (this.isOrchestratorPath(path)) continue;
-      if (declared.has(path)) continue;
-      silent.push(path);
-    }
-    return silent;
-  }
-
-  // `git status --porcelain` snapshot keyed by path. Values: 'M' (modified),
-  // 'A' (added), 'D' (deleted), '??' (untracked), etc. Best-effort: returns
-  // empty map on git error so downstream code degrades gracefully.
-  getDirtyFiles(projectDir) {
-    const map = new Map();
-    try {
-      const porcelain = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8', timeout: 10000 });
-      for (const line of porcelain.split('\n')) {
-        if (!line) continue;
-        const code = line.slice(0, 2).trim();
-        const path = line.slice(3).trim();
-        if (path) map.set(path, code || 'M');
-      }
-    } catch { /* best effort */ }
-    return map;
-  }
-
-  // Record which files were already dirty/untracked at ticket start so
-  // rollback and auto-commit can ignore them — they belong to earlier
-  // uncommitted tickets or manual edits, not to this ticket.
-  async snapshotDirtyAtStart(ticket, pipelineState) {
-    if (Array.isArray(pipelineState.dirty_at_start)) return; // already captured
-    const dirty = this.getDirtyFiles(this.cwd);
-    pipelineState.dirty_at_start = Array.from(dirty.keys());
-    pipelineState.dirty_at_start_captured_at = new Date().toISOString();
-    await this.savePipelineJson(ticket.id, pipelineState);
-    this.emit('dirty_at_start_captured', { ticket: ticket.id, count: pipelineState.dirty_at_start.length });
-  }
-
-  // Revert declared files the ticket authored, leaving everything else
-  // untouched. Only called on terminal failure — blocked tickets keep their
-  // files so the next retry can resume without re-running earlier steps.
-  async rollbackTicketFiles(ticket, pipelineState) {
-    if (pipelineState.rollback?.at) return; // already rolled back — idempotent
-    // Refuse to roll back when `dirty_at_start` was never captured. Without
-    // that snapshot `collectTicketFiles` cannot tell ticket writes apart
-    // from the operator's pre-existing dirty files, and would attribute
-    // every dirty path in the tree to this ticket. Missing baseline means
-    // we don't know what's safe to touch — so touch nothing. This is the
-    // structural backstop for the BUG-252 / 2026-04-25 incident.
-    if (!Array.isArray(pipelineState.dirty_at_start)) {
-      pipelineState.rollback = {
-        at: new Date().toISOString(),
-        skipped_reason: 'dirty_at_start not captured — refusing to revert',
-        reverted: [], deleted: [], skipped: [], errors: [],
-      };
-      await this.savePipelineJson(ticket.id, pipelineState);
-      console.log(`[rollback] ${ticket.id}: SKIPPED — baseline never captured`);
-      this.emit('ticket_rolled_back', {
-        ticket: ticket.id,
-        revertedCount: 0, deletedCount: 0, skippedCount: 0, errorCount: 0,
-        skippedReason: 'dirty_at_start not captured',
-      });
-      return;
-    }
-    const projectDir = this.cwd;
-    const touched = this.collectTicketFiles(pipelineState);
-    const dirtyAtStart = new Set(pipelineState.dirty_at_start);
-    const nowDirty = this.getDirtyFiles(projectDir);
-
-    const reverted = [];
-    const deleted = [];
-    const skipped = [];
-    const errors = [];
-
-    for (const path of touched) {
-      if (dirtyAtStart.has(path)) { skipped.push(path); continue; } // not this ticket's
-      const code = nowDirty.get(path);
-      if (!code) continue; // file is not currently changed
-      try {
-        if (code === '??' || code === 'A') {
-          execSync(`rm -f ${JSON.stringify(path)}`, { cwd: projectDir, encoding: 'utf-8', timeout: 5000 });
-          deleted.push(path);
-        } else {
-          execSync(`git checkout HEAD -- ${JSON.stringify(path)}`, { cwd: projectDir, encoding: 'utf-8', timeout: 10000 });
-          reverted.push(path);
-        }
-      } catch (err) {
-        errors.push({ path, error: err.message });
-      }
-    }
-
-    pipelineState.rollback = {
-      at: new Date().toISOString(),
-      reverted, deleted, skipped, errors,
-    };
-    await this.savePipelineJson(ticket.id, pipelineState);
-
-    console.log(`[rollback] ${ticket.id}: reverted ${reverted.length}, deleted ${deleted.length}, skipped ${skipped.length} (not this ticket's), errors ${errors.length}`);
-    this.emit('ticket_rolled_back', {
-      ticket: ticket.id,
-      revertedCount: reverted.length,
-      deletedCount: deleted.length,
-      skippedCount: skipped.length,
-      errorCount: errors.length,
-    });
-  }
-
-  // Commit the ticket's declared files as a single commit tagged with the
-  // ticket ID. Only stages files the ticket declared AND currently dirty —
-  // other uncommitted work in the tree is left alone. No-op if nothing
-  // declared by this ticket is currently dirty (idempotent across retries).
-  async commitTicketFiles(ticket, pipelineState) {
-    const projectDir = this.cwd;
-    const touched = this.collectTicketFiles(pipelineState);
-    const nowDirty = this.getDirtyFiles(projectDir);
-
-    const toCommit = [];
-    for (const path of touched) {
-      if (nowDirty.has(path)) toCommit.push(path);
-    }
-    if (toCommit.length === 0) {
-      this.emit('auto_commit_skipped', { ticket: ticket.id, reason: 'no declared files currently dirty' });
-      return;
-    }
-
-    const title = (ticket.title || '').slice(0, 72);
-    const subject = `[${ticket.id}] ${title}`.trim();
-    const bodyLines = [''];
-    const plan = pipelineState.steps?.plan;
-    if (plan?.summary) bodyLines.push(plan.summary);
-    else if (ticket.description) bodyLines.push(ticket.description.slice(0, 500));
-    bodyLines.push('', '🤖 toshelabs-pipeline');
-    const body = bodyLines.join('\n');
-    const message = `${subject}\n${body}`;
-
-    try {
-      // Stage only the declared files — never `git add -A`.
-      const quoted = toCommit.map((p) => JSON.stringify(p)).join(' ');
-      execSync(`git add -- ${quoted}`, { cwd: projectDir, encoding: 'utf-8', timeout: 15000 });
-
-      // Detect whether there's anything actually staged by this ticket
-      // (files may have been identical to HEAD → git add is a no-op).
-      const staged = execSync('git diff --cached --name-only', { cwd: projectDir, encoding: 'utf-8', timeout: 10000 }).trim();
-      if (!staged) {
-        this.emit('auto_commit_skipped', { ticket: ticket.id, reason: 'no diff after staging' });
-        return;
-      }
-
-      // Escape single quotes in message for shell safety.
-      const safeMsg = message.replace(/'/g, "'\\''");
-      execSync(`git commit -m '${safeMsg}' -- ${quoted}`, { cwd: projectDir, encoding: 'utf-8', timeout: 30000 });
-
-      const sha = execSync('git rev-parse HEAD', { cwd: projectDir, encoding: 'utf-8', timeout: 5000 }).trim();
-      pipelineState.auto_commit = { at: new Date().toISOString(), sha, files: toCommit };
-      await this.savePipelineJson(ticket.id, pipelineState);
-
-      console.log(`[auto-commit] ${ticket.id}: committed ${toCommit.length} files as ${sha.slice(0, 7)}`);
-      this.emit('auto_commit_done', { ticket: ticket.id, sha, fileCount: toCommit.length });
-    } catch (err) {
-      const tail = (err.stderr || err.stdout || err.message || '').toString().slice(-500);
-      console.error(`[auto-commit] ${ticket.id} failed: ${tail}`);
-      // Persist so reports can list tickets done-but-not-committed and the
-      // user knows they need manual intervention.
-      pipelineState.auto_commit = { status: 'failed', at: new Date().toISOString(), error: tail };
-      try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* best-effort */ }
-      this.emit('auto_commit_failed', { ticket: ticket.id, error: tail });
-    }
-  }
-
+  // --- Dead-code island removed 2026-05-01 ---
+  //
+  // Previously this section held a parallel rollback/commit/declaration-
+  // accounting layer (rollbackTicketFiles, commitTicketFiles,
+  // collectTicketFiles, collectDeclaredFiles, checkSilentWrites,
+  // snapshotDirtyAtStart, getDirtyFiles, isOrchestratorPath). It diffed
+  // `git status --porcelain` against LLM-declared file lists and tried to
+  // tell ticket writes apart from operator dirt in a shared working tree.
+  //
+  // The 2026-04-28 worktree refactor (worktree.js + checkpoint.js) made
+  // all of this redundant: each ticket runs in an isolated worktree,
+  // `setupTicketBaseline` tags the start point, `revertToBaseline` does
+  // `git reset --hard <tag> && git clean -fd` on failure, and
+  // `commitTicketAsOne` does `git add -A && git commit` on success. There
+  // is no operator dirt in the worktree to tell ticket writes apart from,
+  // so no declaration ledger is needed.
+  //
+  // The silent-writes gate that lived here was also generating false
+  // positives whenever git collapsed a new-only directory into `dir/`
+  // (BUG-258), since the declaration set held file paths but git reported
+  // the parent dir. Removing the gate fixes the false positive without
+  // weakening atomicity — the worktree lifecycle enforces it instead.
   // --- Dependency-declaration gate ---
 
   checkDepsDeclared(stepArtifacts, planArtifacts) {
@@ -2081,22 +1849,6 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           }
         } catch (err) {
           console.warn(`[deps-check] skipped for ${ticket.id}: ${err.message}`);
-        }
-
-        // Plan-vs-actual gate: every file implement touched must be declared
-        // in either plan.files_to_change OR implement.files_changed. Catches
-        // silent writes (LLM wrote a helper and forgot to list it) before
-        // they leak into the tree as orphan files that poison future tickets.
-        try {
-          const silent = this.checkSilentWrites(pipelineState);
-          if (silent.length > 0) {
-            validation.pass = false;
-            validation.failures.push(
-              `undeclared file writes (${silent.length}): ${silent.slice(0, 10).join(', ')}${silent.length > 10 ? ` ...+${silent.length - 10} more` : ''}. Add these to implement.files_changed or revert them.`,
-            );
-          }
-        } catch (err) {
-          console.warn(`[silent-writes] skipped for ${ticket.id}: ${err.message}`);
         }
       }
 
