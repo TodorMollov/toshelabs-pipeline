@@ -176,7 +176,7 @@
         <th data-sort="priority">Pri</th>
         <th data-sort="type">Type</th>
         <th data-sort="status">Status</th>
-        <th data-sort="duration_sec">Duration</th>
+        <th data-sort="working_sec">Duration</th>
         <th>Steps</th>
         <th data-sort="completed_at">Finished</th>
       </tr></thead>
@@ -344,7 +344,9 @@ function renderTiles() {
   const done = tickets.filter(t => t.status === 'done').length;
   const inProg = tickets.filter(t => t.status === 'in_progress').length;
   const blocked = tickets.filter(t => t.status === 'blocked' || t.status === 'failed').length;
-  const durs = tickets.filter(t => t.duration_sec != null).map(t => t.duration_sec);
+  // Use working_sec (excludes 5h-reset idle waits) where available, fall
+  // back to duration_sec for legacy tickets that never recorded waits.
+  const durs = tickets.map(t => t.working_sec ?? t.duration_sec).filter(d => d != null);
   const totalDur = durs.reduce((a, b) => a + b, 0);
   const avgDur = durs.length ? Math.round(totalDur / durs.length) : null;
   const evs = visibleEvents();
@@ -504,7 +506,7 @@ function renderTickets() {
       <td>${pri}</td>
       <td>${esc(t.type || '')}</td>
       <td class="status-${t.status}">${esc(t.status)}</td>
-      <td>${fmtDuration(t.duration_sec)}</td>
+      <td title="${t.waited_sec ? 'work ' + fmtDuration(t.working_sec) + ' + waited ' + fmtDuration(t.waited_sec) + ' (5h reset)' : 'no rate-limit waits'}">${fmtDuration(t.working_sec ?? t.duration_sec)}${t.waited_sec ? ` <span style="color:var(--text-muted);font-size:11px;">+${fmtDuration(t.waited_sec)}w</span>` : ''}</td>
       <td><div class="steps">${steps}</div></td>
       <td>${fmtDate(t.completed_at || t.started_at)}</td>
     </tr>
