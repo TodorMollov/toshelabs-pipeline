@@ -453,6 +453,10 @@ function renderTickets() {
   const ft = document.getElementById('filterText').value.toLowerCase();
   const fs = document.getElementById('filterStatus').value;
   const fp = document.getElementById('filterPri').value;
+  // When the user is asking a specific question via filters, render every
+  // group expanded so the answer isn't buried behind a collapsed header.
+  // The default-collapsed `done` group only applies in the unfiltered view.
+  const anyFilterActive = !!(ft || fs || fp || state.timeFrom != null || state.timeTo != null);
   let rows = visibleTickets().filter(t => {
     if (ft && !(t.id.toLowerCase().includes(ft) || (t.title || '').toLowerCase().includes(ft))) return false;
     if (fs && t.status !== fs) return false;
@@ -493,7 +497,7 @@ function renderTickets() {
       return `<div class="step-dot ${status}" title="${s}: ${status}"></div>`;
     }).join('');
     const pri = t.priority ? `<span class="pri pri-${t.priority}">${t.priority}</span>` : '';
-    const collapsed = state.collapsedGroups.has(groupName) ? ' collapsed' : '';
+    const collapsed = (!anyFilterActive && state.collapsedGroups.has(groupName)) ? ' collapsed' : '';
     return `<tr class="ticket-row${collapsed}" data-id="${esc(t.id)}" data-group="${esc(groupName)}">
       <td class="id">${esc(t.id)}</td>
       <td>${esc(t.title).slice(0,80)}</td>
@@ -513,7 +517,7 @@ function renderTickets() {
 
   let html = '';
   for (const g of groupNames) {
-    const isCollapsed = state.collapsedGroups.has(g);
+    const isCollapsed = !anyFilterActive && state.collapsedGroups.has(g);
     html += `<tr class="group-header" data-group="${esc(g)}">
       <td colspan="8"><span class="caret">${isCollapsed ? '▸' : '▾'}</span> <span class="status-${g}">${esc(g)}</span><span class="group-count">${groups[g].length}</span></td>
     </tr>`;
