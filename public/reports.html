@@ -161,6 +161,13 @@
         <option value="">all priorities</option>
         <option>P0</option><option>P1</option><option>P2</option><option>P3</option>
       </select>
+      <span style="display:flex;align-items:center;gap:6px;color:var(--text-muted);font-size:11px;">
+        <span style="text-transform:uppercase;letter-spacing:0.4px;">from</span>
+        <input type="datetime-local" id="filterFrom" step="60" title="filter by completed/started time (local)" />
+        <span style="text-transform:uppercase;letter-spacing:0.4px;">to</span>
+        <input type="datetime-local" id="filterTo" step="60" />
+        <button id="filterTimeClear" title="clear time filter" style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer;">clear</button>
+      </span>
     </div>
     <table id="ticketsTable">
       <thead><tr>
@@ -269,9 +276,31 @@ function renderStepMetricsTable(t) {
 function isNewTicket(t) {
   return !!t.baseline_captured_at;
 }
+// Time-window filter (state.timeFrom / state.timeTo are ms-since-epoch
+// or null). Sections that respect it: tiles (crash/rate-limit counts),
+// timeline, step distribution, tickets table. Tickets are filtered by
+// completed_at, falling back to started_at for in-progress ones.
+// Events are filtered by their own ts.
+function inTimeWindow(iso) {
+  if (state.timeFrom == null && state.timeTo == null) return true;
+  if (!iso) return false;
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return false;
+  if (state.timeFrom != null && t < state.timeFrom) return false;
+  if (state.timeTo != null && t > state.timeTo) return false;
+  return true;
+}
 function visibleTickets() {
-  if (state.hideLegacy === false) return state.tickets;
-  return state.tickets.filter(isNewTicket);
+  let list = state.tickets;
+  if (state.hideLegacy !== false) list = list.filter(isNewTicket);
+  if (state.timeFrom != null || state.timeTo != null) {
+    list = list.filter(t => inTimeWindow(t.completed_at || t.started_at));
+  }
+  return list;
+}
+function visibleEvents() {
+  if (state.timeFrom == null && state.timeTo == null) return state.events;
+  return state.events.filter(e => inTimeWindow(e.ts));
 }
 function visibleTicketIds() {
   return new Set(visibleTickets().map((t) => t.id));
@@ -318,16 +347,18 @@ function renderTiles() {
   const durs = tickets.filter(t => t.duration_sec != null).map(t => t.duration_sec);
   const totalDur = durs.reduce((a, b) => a + b, 0);
   const avgDur = durs.length ? Math.round(totalDur / durs.length) : null;
-  const crashes = state.events.filter(e => e.event === 'pipeline_crashed_detected').length;
-  const rateLimits = state.events.filter(e => e.event === 'rate_limited').length;
+  const evs = visibleEvents();
+  const crashes = evs.filter(e => e.event === 'pipeline_crashed_detected').length;
+  const rateLimits = evs.filter(e => e.event === 'rate_limited').length;
+  const windowed = (state.timeFrom != null || state.timeTo != null);
   const fh = currentUsage?.five_hour?.pct;
 
   const tiles = [
     { label: 'Tickets processed', value: total, sub: `${done} done · ${inProg} in progress · ${blocked} blocked/failed` },
     { label: 'Success rate', value: total ? Math.round(100 * done / total) + '%' : '—', sub: `${done}/${total}` },
     { label: 'Total runtime', value: fmtDuration(totalDur), sub: avgDur != null ? `avg ${fmtDuration(avgDur)}/ticket` : '' },
-    { label: 'Crashes (7d)', value: crashes, sub: crashes ? 'from ops log' : 'none recorded' },
-    { label: 'Rate-limit hits (7d)', value: rateLimits, sub: rateLimits ? 'from ops log' : 'none recorded' },
+    { label: windowed ? 'Crashes (window)' : 'Crashes (7d)', value: crashes, sub: crashes ? 'from ops log' : 'none recorded' },
+    { label: windowed ? 'Rate-limit hits (window)' : 'Rate-limit hits (7d)', value: rateLimits, sub: rateLimits ? 'from ops log' : 'none recorded' },
     { label: '5h window now', value: fh != null ? Math.round(fh) + '%' : '—', sub: currentUsage?.five_hour?.resets_at ? 'resets ' + new Date(currentUsage.five_hour.resets_at * 1000).toLocaleTimeString('en-GB', {timeZone:'Europe/London', hour:'numeric', minute:'2-digit'}) : '' },
   ];
   document.getElementById('tiles').innerHTML = tiles.map(t =>
@@ -350,7 +381,7 @@ function renderTimeline() {
   // ids. Events without a ticket id (server_started, pipeline_*, etc.)
   // always pass through — they're global.
   const okIds = state.hideLegacy === false ? null : visibleTicketIds();
-  const rows = state.events.filter(e => {
+  const rows = visibleEvents().filter(e => {
     if (!interesting.has(e.event)) return false;
     if (!okIds) return true;
     const tid = e.data?.ticket;
@@ -524,6 +555,27 @@ document.querySelectorAll('th[data-sort]').forEach(th => {
 // Filter listeners
 ['filterText', 'filterStatus', 'filterPri'].forEach(id =>
   document.getElementById(id).addEventListener('input', renderTickets));
+
+// Time-window inputs. Empty input = unbounded on that side. The browser
+// gives us "YYYY-MM-DDTHH:MM" in local time; new Date() parses it as
+// local. Re-render every section that respects the window.
+function reapplyTimeFilter() {
+  const fromVal = document.getElementById('filterFrom').value;
+  const toVal = document.getElementById('filterTo').value;
+  state.timeFrom = fromVal ? new Date(fromVal).getTime() : null;
+  state.timeTo = toVal ? new Date(toVal).getTime() : null;
+  renderTiles();
+  renderTimeline();
+  renderStepDist();
+  renderTickets();
+}
+document.getElementById('filterFrom').addEventListener('input', reapplyTimeFilter);
+document.getElementById('filterTo').addEventListener('input', reapplyTimeFilter);
+document.getElementById('filterTimeClear').addEventListener('click', () => {
+  document.getElementById('filterFrom').value = '';
+  document.getElementById('filterTo').value = '';
+  reapplyTimeFilter();
+});
 
 // Hide-legacy toggle re-renders every view at once (tiles, timeline, step
 // distribution, tickets). State stored on `state` so filter helpers see it.
