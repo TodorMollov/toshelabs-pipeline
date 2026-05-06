@@ -564,6 +564,36 @@
       "out_of_scope": [
         "Mid-step graceful-stop checkpoints (let the step finish then stop). Filed historically as PIPE-009b future work; same reason as before — minutes-of-wait isnt useful semantic."
       ]
+    },
+    {
+      "id": "PIPE-015",
+      "schema_version": 1,
+      "title": "spawn claude — retry on ENOENT + capture rich diagnostics",
+      "status": "done",
+      "priority": "P2",
+      "type": "ops",
+      "complexity": "small",
+      "area": "src/runner.js (trySpawnClaudeWithRetry helper, spawnClaude wrapper)",
+      "reported": "2026-05-06",
+      "source": "Overnight autonomous run on 2026-05-05 hit two intermittent 'spawn claude ENOENT' failures across ~100 spawns (~2%). Existing error handler dropped err.code/path/syscall and surfaced only 'Failed to spawn claude: spawn claude ENOENT' — no evidence to diagnose from. Likely cause is generic WSL filesystem flakiness or a fork/exec race; we don't have hard evidence and probably never will without rich diagnostics on every future occurrence.",
+      "description": "Wrap the OS-level spawn in a small retry helper: 5 attempts × 1s spacing on ENOENT, fail-fast on any other error code (EACCES/ENOMEM aren't transient). On every ENOENT log a structured diag — err.code/errno/syscall/path/spawnfile, the claudeBin we asked for, the PATH passed in env (truncated), and fs.realpath() of the binary at the moment of failure (null = file genuinely missing; truthy = transient race, file is actually on disk). Race the 'spawn' event vs 'error' to detect successful spawn deterministically.",
+      "user_impact": "Tickets no longer fail individually for a transient spawn race that resolves on the very next attempt. When a real persistent ENOENT does occur (PATH misconfiguration, claude uninstalled, etc.) the diag block tells the operator exactly what was missing and where it was looked for.",
+      "acceptance_criteria": [
+        "GIVEN claude is on PATH, WHEN spawnClaude runs, THEN it spawns successfully on attempt 1 and the diagnostic logs do not fire.",
+        "GIVEN a transient ENOENT, WHEN a subsequent retry succeeds, THEN '[runner] spawn claude OK on attempt N/5' is logged and the ticket continues normally.",
+        "GIVEN a persistent ENOENT, WHEN all 5 attempts fail, THEN the rejected error message includes attempt count + interval AND the rich diag (with realpath_of_claude_bin, path_env_head) is in the warn logs for every attempt.",
+        "GIVEN a non-ENOENT spawn error (EACCES etc.), WHEN it fires, THEN it surfaces immediately on attempt 1 (no retry)."
+      ],
+      "fix_plan": [
+        "1. src/runner.js: add trySpawnClaudeWithRetry(claudeBin, args, spawnOpts, onRetryDiag). Loop 5×, race proc.once('spawn') vs proc.once('error'), retry on ENOENT only.",
+        "2. On each ENOENT capture diag: err.code/errno/syscall/path/spawnfile + claudeBin + PATH env head + realpath() of claudeBin. console.warn with JSON.",
+        "3. Convert spawnClaude to async, await trySpawnClaudeWithRetry before the existing Promise wrapper. The post-spawn proc.on('error') handler stays as a backstop for rare post-spawn failures.",
+        "4. Smoke-test: normal pipeline run still works; verify no behavior change on the happy path."
+      ],
+      "out_of_scope": [
+        "Diagnosing the actual root cause of the WSL ENOENT — without evidence we'd be speculating. The diag captured here is the evidence collection step; a future ticket can investigate once we have one or two real diag blocks captured.",
+        "Exponential backoff or jitter — 5 × 1s is fine for a ~2% transient; if we ever see clustered failures across many spawns we can revisit."
+      ]
     }
   ]
 }

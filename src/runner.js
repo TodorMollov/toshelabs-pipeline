@@ -1,10 +1,80 @@
 import { spawn } from 'child_process';
-import { readFile } from 'fs/promises';
+import { readFile, realpath } from 'fs/promises';
+
+// PIPE-015: spawn `claude` with retry on ENOENT.
+//
+// Background: during the 2026-05-05 overnight autonomous run we hit two
+// "spawn claude ENOENT" failures for individual tickets in an otherwise
+// healthy pipeline (~2% of ~100 spawns). Likely cause is generic WSL
+// filesystem flakiness or a fork/exec race; we don't have hard evidence.
+// Either way, retrying is cheap and works.
+//
+// Strategy: retry the OS-level spawn up to 5 times with 1s spacing. On
+// each retry, log a rich diagnostic snapshot (err.code/errno/syscall/
+// path, the claudeBin we asked for, the PATH passed in env, and
+// fs.realpath() of the binary) so next time we have evidence to diagnose
+// from. Non-ENOENT errors fail immediately (they're not transient).
+//
+// Listens for the 'spawn' event (Node 15+) which fires once on
+// successful spawn — guaranteed to come before any other proc event,
+// so racing it against 'error' is correct.
+async function trySpawnClaudeWithRetry(claudeBin, args, spawnOpts, onRetryDiag) {
+  const MAX_ATTEMPTS = 5;
+  const RETRY_INTERVAL_MS = 1000;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const proc = spawn(claudeBin, args, spawnOpts);
+    const result = await new Promise((res) => {
+      proc.once('spawn', () => res({ ok: true }));
+      proc.once('error', (err) => res({ ok: false, err }));
+    });
+    if (result.ok) {
+      if (attempt > 1) console.log(`[runner] spawn claude OK on attempt ${attempt}/${MAX_ATTEMPTS}`);
+      return proc;
+    }
+    const err = result.err;
+    if (err.code !== 'ENOENT') {
+      // Non-retryable (EACCES, ENOMEM, etc.) — surface immediately.
+      throw err;
+    }
+    // ENOENT — capture every bit of evidence we can about WHY before
+    // we wait + retry.
+    let resolvedTarget = null;
+    try { resolvedTarget = await realpath(claudeBin); } catch { /* not on disk */ }
+    const diag = {
+      attempt,
+      max_attempts: MAX_ATTEMPTS,
+      code: err.code,
+      errno: err.errno,
+      syscall: err.syscall,
+      path: err.path,
+      spawnfile: err.spawnfile,
+      claude_bin_arg: claudeBin,
+      // PATH from the spawn env (truncated for log readability)
+      path_env_head: (spawnOpts.env?.PATH || '<unset>').slice(0, 300),
+      // What does claudeBin resolve to RIGHT NOW (after the failure)?
+      // null = file not on disk; truthy = file exists, so the failure
+      // was a transient race rather than a missing binary.
+      realpath_of_claude_bin: resolvedTarget,
+    };
+    console.warn(`[runner] spawn claude ENOENT (attempt ${attempt}/${MAX_ATTEMPTS}): ${JSON.stringify(diag)}`);
+    if (typeof onRetryDiag === 'function') onRetryDiag(diag);
+    if (attempt < MAX_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, RETRY_INTERVAL_MS));
+      continue;
+    }
+    // Exhausted retries — wrap the original error with the rich diag
+    // attached so the caller's logging surfaces it.
+    const finalErr = new Error(`spawn claude ENOENT after ${MAX_ATTEMPTS} attempts (${RETRY_INTERVAL_MS}ms each): ${err.message}`);
+    finalErr.code = 'ENOENT';
+    finalErr.diag = diag;
+    throw finalErr;
+  }
+}
 
 /**
  * Spawn a claude CLI process and stream output
  */
-export function spawnClaude({
+export async function spawnClaude({
   prompt,
   model = 'opus',
   tools = [],
