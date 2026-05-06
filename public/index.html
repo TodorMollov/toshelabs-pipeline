@@ -134,11 +134,13 @@
     font-family: inherit;
   }
   .ticket-item:hover .run-btn { display: inline-block; }
+  /* Always-visible (no hover gate) — stuck tickets are rare and the
+     button needs to be discoverable without hovering. */
   .ticket-item .requeue-btn {
-    display: none;
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--text-dim);
+    display: inline-block;
+    background: var(--orange-dim, rgba(240,168,104,0.12));
+    border: 1px solid var(--orange, #f0a868);
+    color: var(--orange, #f0a868);
     font-size: 10px;
     font-weight: 600;
     padding: 2px 8px;
@@ -146,8 +148,7 @@
     cursor: pointer;
     font-family: inherit;
   }
-  .ticket-item:hover .requeue-btn { display: inline-block; }
-  .ticket-item .requeue-btn:hover { color: var(--text); border-color: var(--text-dim); }
+  .ticket-item .requeue-btn:hover { filter: brightness(1.2); }
 
   .reorder-btns {
     display: none;
@@ -1001,10 +1002,33 @@ async function loadPipelineStates() {
 // expanded <details> groups). Adds/removes one class per row; cheap.
 function applyPipelineStatesToDOM() {
   const STATUS_CLASSES = ['status-failed','status-crashed','status-blocked','status-in_progress','status-done'];
+  const STUCK = new Set(['blocked', 'failed', 'in_progress']);
   document.querySelectorAll('.ticket-item').forEach(el => {
     el.classList.remove(...STATUS_CLASSES);
-    const s = pipelineStates[el.dataset.id]?.status;
+    const id = el.dataset.id;
+    const s = pipelineStates[id]?.status;
     if (s) el.classList.add(`status-${s}`);
+    // Inject/remove the Requeue button so it picks up state changes
+    // that arrive after the ticket list rendered (the common case —
+    // backlog loads first, pipelineStates poll fills in later).
+    const top = el.querySelector('.ticket-top');
+    if (!top) return;
+    const existing = top.querySelector('.requeue-btn');
+    if (STUCK.has(s)) {
+      if (!existing) {
+        const btn = document.createElement('button');
+        btn.className = 'requeue-btn';
+        btn.title = "Archive pipeline-state and reset backlog status to 'requested'. Does not start a run.";
+        btn.innerHTML = '&#8635; Requeue';
+        btn.addEventListener('click', (ev) => { ev.stopPropagation(); requeueTicket(id); });
+        // Insert after the Run button if present, else at the end of .ticket-top.
+        const runBtn = top.querySelector('.run-btn');
+        if (runBtn) runBtn.insertAdjacentElement('afterend', btn);
+        else top.appendChild(btn);
+      }
+    } else if (existing) {
+      existing.remove();
+    }
   });
 }
 
