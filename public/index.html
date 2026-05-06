@@ -134,6 +134,20 @@
     font-family: inherit;
   }
   .ticket-item:hover .run-btn { display: inline-block; }
+  .ticket-item .requeue-btn {
+    display: none;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-size: 10px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .ticket-item:hover .requeue-btn { display: inline-block; }
+  .ticket-item .requeue-btn:hover { color: var(--text); border-color: var(--text-dim); }
 
   .reorder-btns {
     display: none;
@@ -1055,6 +1069,20 @@ async function runTicket(id) {
   appendTerminal(`Started: ${id} ${data.dryRun ? '(dry run)' : ''}`, 'system');
 }
 
+async function requeueTicket(id) {
+  const project = state.activeProjectId;
+  if (!project) return alert('Cannot re-queue: active project unknown.');
+  if (!confirm(`Re-queue ${id}?\n\nArchives the current pipeline-state JSON and resets the backlog ticket to 'requested'. The pipeline will start it fresh on the next run. This does NOT trigger a run.`)) return;
+  try {
+    const r = await fetch(`/api/projects/${encodeURIComponent(project)}/tickets/${encodeURIComponent(id)}/requeue`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) { appendTerminal(`Re-queue failed: ${data.error || r.statusText}`, 'system'); return; }
+    appendTerminal(`Re-queued ${id}${data.archived ? ' (state archived)' : ''}${data.backlogUpdated ? ' (backlog reset)' : ''}`, 'system');
+  } catch (err) {
+    appendTerminal(`Re-queue failed: ${err.message}`, 'system');
+  }
+}
+
 async function runAll() {
   if (state.running) return alert('Pipeline already running');
   state.running = true; state.startTime = Date.now(); state.completed = 0; state.thinkRounds = 0;
@@ -1105,6 +1133,8 @@ function renderTicketItem(t, actionIds) {
   const isActionable = actionIds.has(t.id);
   const dots = STEPS.map(() => '<div class="step-dot"></div>').join('');
   const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
+  const isStuck = stateStatus === 'blocked' || stateStatus === 'failed' || stateStatus === 'in_progress';
+  const requeueBtn = isStuck ? `<button class="requeue-btn" onclick="event.stopPropagation();requeueTicket('${t.id}')" title="Archive pipeline-state and reset backlog status to 'requested'. Does not start a run.">&#8635; Requeue</button>` : '';
   const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
   const testTag = isTest ? '<span class="ticket-tag test">test</span>' : '';
   const stateStatus = pipelineStates[t.id]?.status;
@@ -1115,6 +1145,7 @@ function renderTicketItem(t, actionIds) {
       <span class="ticket-priority ${pCls}">${t.priority||''}</span>
       ${testTag}
       ${runBtn}
+      ${requeueBtn}
       ${reorderBtns}
     </div>
     <div class="ticket-title">${t.title||''}</div>
@@ -1806,7 +1837,7 @@ async function reorderTicket(ticketId, direction) {
 // ─── Sidebar click handler ───
 document.getElementById('ticketList').addEventListener('click', (e) => {
   const item = e.target.closest('.ticket-item');
-  if (!item || e.target.closest('.run-btn') || e.target.closest('.reorder-btn')) return;
+  if (!item || e.target.closest('.run-btn') || e.target.closest('.requeue-btn') || e.target.closest('.reorder-btn')) return;
   showTicketDetail(item.dataset.id);
 });
 
