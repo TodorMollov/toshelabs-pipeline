@@ -1132,13 +1132,13 @@ function renderTicketItem(t, actionIds) {
   const pCls = (t.priority||'P3').toLowerCase();
   const isActionable = actionIds.has(t.id);
   const dots = STEPS.map(() => '<div class="step-dot"></div>').join('');
-  const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
+  const stateStatus = pipelineStates[t.id]?.status;
+  const statusCls = stateStatus ? ` status-${stateStatus}` : '';
   const isStuck = stateStatus === 'blocked' || stateStatus === 'failed' || stateStatus === 'in_progress';
+  const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
   const requeueBtn = isStuck ? `<button class="requeue-btn" onclick="event.stopPropagation();requeueTicket('${t.id}')" title="Archive pipeline-state and reset backlog status to 'requested'. Does not start a run.">&#8635; Requeue</button>` : '';
   const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
   const testTag = isTest ? '<span class="ticket-tag test">test</span>' : '';
-  const stateStatus = pipelineStates[t.id]?.status;
-  const statusCls = stateStatus ? ` status-${stateStatus}` : '';
   return `<div class="ticket-item${statusCls}" data-id="${t.id}">
     <div class="ticket-top">
       <span class="ticket-id ${idCls}">${t.id}</span>
