@@ -594,6 +594,69 @@
         "Diagnosing the actual root cause of the WSL ENOENT — without evidence we'd be speculating. The diag captured here is the evidence collection step; a future ticket can investigate once we have one or two real diag blocks captured.",
         "Exponential backoff or jitter — 5 × 1s is fine for a ~2% transient; if we ever see clustered failures across many spawns we can revisit."
       ]
+    },
+    {
+      "id": "PIPE-016",
+      "schema_version": 1,
+      "title": "planner: trace consumer surface when a change touches a type — close the cross-file blind spot",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "prompts/plan.md (busydad + pension-ai), prompts in any future onboarded project",
+      "reported": "2026-05-06",
+      "source": "BUG-279 post-mortem (2026-05-06): planner produced a complete, well-architected plan for adding an `autoReminderSuppressed` field to EntryModel + the Drift Entries table. Implement followed faithfully. tests_green failed because nine pre-existing test fixtures construct Drift `Entry(...)` rows directly — Drift's `withDefault(Constant(false))` is a SQL-level default, not a Dart-constructor default, so the generated row class made the new field a required parameter and every fixture failed to compile. The planner's `files_to_change` list never included the consumer test fixtures because the prompt asks the planner to enumerate intended changes, not to enumerate downstream blast radius. Heals couldn't recover (see PIPE-017). Operator hand-finished the ticket.",
+      "description": "Extend prompts/plan.md with an explicit type-impact check before the planner finalises files_to_change. When the change adds a field, removes a field, or changes a constructor signature on a type, the planner must Grep the codebase for direct constructions of that type (test fixtures included) and add them to files_to_change with what_to_do='[fixture-update] add new field with default value'. The check is dirt-cheap (one extra Grep round) and addresses a recurring failure mode where the planner is locally correct but globally incomplete.",
+      "user_impact": "Today the pipeline silently fails on tickets that touch foundational types (EntryModel, ReminderModel, repository signatures) — heal can't see the consumer files, exhausts attempts, ticket marked failed, operator has to hand-finish. Adds 0–30s of planner time, prevents one or more hour-long ticket dead-ends per batch.",
+      "acceptance_criteria": [
+        "GIVEN a ticket whose plan adds a field to a type T, WHEN the planner produces files_to_change, THEN the list includes every file that constructs T directly (verified via Grep `T(`).",
+        "GIVEN a ticket that does NOT touch a type signature, WHEN the planner runs, THEN no spurious fixture-update entries appear (the check no-ops cleanly).",
+        "GIVEN a Drift table change adding a column, WHEN the planner runs, THEN the plan calls out that build_runner must regenerate code AND lists every direct Entry/RowClass constructor in the test tree."
+      ],
+      "fix_plan": [
+        "1. Read busydad/prompts/plan.md and pension-ai/prompts/plan.md (likely identical or near-identical).",
+        "2. Add a new section before files_to_change is emitted: 'Type-impact check — when your change adds/removes/changes a field on a class, OR adds a column to a Drift table, run Grep `<TypeName>(` across lib/ and test/. Every file that matches must appear in files_to_change with what_to_do = `[fixture-update] add <field>: <default-value>`. This is a hard requirement.'",
+        "3. Add a one-line example in the prompt: 'e.g. adding `autoReminderSuppressed` to EntryModel → grep `EntryModel(` AND `Entry(` (the Drift row class) → 9 fixture files need a one-line addition.'",
+        "4. Smoke-test by re-running a ticket of similar shape and verifying the planner now lists fixture files. If it does not, iterate on the prompt wording.",
+        "5. Backport the prompt change to pension-ai once verified on busydad."
+      ],
+      "out_of_scope": [
+        "Static analysis tooling to enforce this — prompt-level guidance is enough for now; if it doesn't take, we revisit.",
+        "Auto-applying the fixture updates (planner declares, implement does the work — no change to roles)."
+      ]
+    },
+    {
+      "id": "PIPE-017",
+      "schema_version": 1,
+      "title": "heal: inject failing-test source into the prompt so heals can reason about cross-file breaks",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/pipeline.js (runStepWithHealing), prompts/implement.md (acknowledge new variable)",
+      "reported": "2026-05-06",
+      "source": "BUG-279 post-mortem (2026-05-06): tests_green reported `loading X` failures for two pre-existing test files the LLM had never read. The heal prompt knew the test NAMES but not the test SOURCE. The LLM's heal attempts saw 'tests_green failed: 2 new failures' and tried to fix the production code — they had no way to see the actual compile error or the unread fixture file. Heals exhausted, ticket failed. Same pattern would defeat any heal where the failure is in a file outside the LLM's working set.",
+      "description": "When tests_green hands a failure list to the heal step, also inject the source of each failing test file (truncated to first ~200 lines or 8KB, whichever is smaller — enough to capture imports + assertions). The heal then has the actual evidence: 'this fixture's Entry(...) call is missing your new required field' rather than 'a test failed somewhere'. Composes with PIPE-016 (planner-side prevention) — even when planner misses a consumer, heal can recover. Cost: a few thousand input tokens per heal attempt, almost all of it cache-hit on the retry.",
+      "user_impact": "Today, pipeline failures on cross-file breaks are unrecoverable without operator intervention. With PIPE-017 the heal can self-correct on first or second attempt for the broad class of 'I broke a consumer I didn't know existed'. Estimated to save 2–4 ticket-blocked-failed events per overnight batch on busydad-shaped projects.",
+      "acceptance_criteria": [
+        "GIVEN tests_green fails with new_failed_tests pointing at file F, WHEN the heal prompt is constructed, THEN F's source (first 200 lines) is appended to the prompt under a clearly-labeled heading.",
+        "GIVEN multiple failing test files, WHEN the heal runs, THEN each unique file's source is included once (deduped on path).",
+        "GIVEN a `loading X` failure (compile-time, no test name), WHEN the heal runs, THEN the source of X is included AND the heal prompt explicitly notes 'this file failed to compile — fix the import/type mismatch'.",
+        "GIVEN the source dump exceeds budget (e.g. 50+ failing files), WHEN the heal runs, THEN it caps at the top N (by failure count) and notes the truncation."
+      ],
+      "fix_plan": [
+        "1. src/pipeline.js: locate the tests_green heal-prompt construction. Identify where new_failed_tests is materialised into the heal context.",
+        "2. Add a helper readFailingTestSources(failures, projectDir, maxFiles=10, maxBytes=8192) that returns a Map<path, sourceSnippet>. Read each file once, slice to the cap, prepend `// File: <relative path>\\n` so the LLM knows which is which.",
+        "3. Append a section to the heal prompt: 'Failing test file sources (for compile-error / cross-cutting failures):\\n```dart\\n<dump>\\n```\\nCheck whether your changes broke imports or constructor calls in these files. If yes, update them as part of this heal.'",
+        "4. Update prompts/implement.md to acknowledge: 'You may receive failing test file sources in the heal prompt — treat them as additional files_to_change you must update or revert.'",
+        "5. Test on a synthetic ticket: add a required field to a widely-used type, watch first-attempt fail, watch heal succeed by updating fixtures.",
+        "6. Validate the cache-hit assumption: the heal prefix grows by ~5–10k input tokens, which should be cached on retry. Inspect cacheHitRatio metric on a real heal cycle to confirm."
+      ],
+      "out_of_scope": [
+        "Sourcemap-aware analysis (showing only the relevant function) — first version dumps the file head, simpler and more robust.",
+        "Symmetric injection for analyzer errors (PIPE-017b future work) — analyzer failures already include the file path AND the error site in the message; the marginal value of file source is lower there.",
+        "Automatic test rewriting — heal still has to reason about whether the test or the implementation is wrong; we just give it the source so reasoning is possible."
+      ]
     }
   ]
 }
