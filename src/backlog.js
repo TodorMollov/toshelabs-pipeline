@@ -129,9 +129,12 @@ export async function archiveTicket(ticketId, config, opts = {}) {
   // Append to archive. Dedupe by id so repeated archive calls don't
   // create duplicate archive entries — matches the behaviour of the
   // manual rescue script.
-  const archiveRaw = await readFile(config._resolved.archive, 'utf-8');
-  const archive = JSON.parse(archiveRaw);
-  archive.tickets = (archive.tickets || []).filter((t) => t.id !== ticketId);
+  let archive = { tickets: [] };
+  try {
+    archive = JSON.parse(await readFile(config._resolved.archive, 'utf-8'));
+    if (!Array.isArray(archive.tickets)) archive.tickets = [];
+  } catch { /* missing/invalid — start fresh, matches closed-bugs handling below */ }
+  archive.tickets = archive.tickets.filter((t) => t.id !== ticketId);
   archive.tickets.push(ticket);
   await writeFile(config._resolved.archive, JSON.stringify(archive, null, 2));
 

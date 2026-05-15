@@ -866,6 +866,7 @@
 <div class="header">
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
   <div class="status-pill idle" id="statusPill">Idle</div>
+  <span id="nowRunning" style="margin-left:10px;color:var(--text-dim);font-size:12px;font-family:var(--mono,monospace)"></span>
   <a href="/reports.html" style="margin-left:14px;color:var(--text-dim);font-size:12px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px">Reports &rarr;</a>
   <!-- PIPE-003: project picker. Populated from /api/projects. Switching is
        refused server-side while a run is in flight (server returns 409). -->
@@ -994,6 +995,32 @@ async function loadPipelineStates() {
     if (!r.ok) return;
     pipelineStates = await r.json();
     applyPipelineStatesToDOM();
+    // Seed the center header + breadcrumb on page load (mid-run case —
+    // SSE missed the original ticket_start). Picks the first ticket with
+    // status 'in_progress'; populates id+title; fetches its step detail
+    // to recover the currently-running step (the first step whose status
+    // isn't `done` or `not_applicable`).
+    if (!state.runningTicket) {
+      for (const [id, s] of Object.entries(pipelineStates)) {
+        if (s.status === 'in_progress') {
+          const t = (allTickets || []).find(x => x.id === id);
+          setActiveTicket(id, t?.title || '');
+          state.runningTicket = id;
+          updateNowRunning();
+          fetch(`/api/pipeline/${encodeURIComponent(id)}`).then(r=>r.json()).then(p => {
+            const steps = p?.steps || {};
+            for (const [name, ss] of Object.entries(steps)) {
+              if (ss.status !== 'done' && ss.status !== 'not_applicable') {
+                state.runningStep = name;
+                updateNowRunning();
+                break;
+              }
+            }
+          }).catch(()=>{});
+          break;
+        }
+      }
+    }
   } catch { /* best-effort */ }
 }
 
@@ -1002,7 +1029,7 @@ async function loadPipelineStates() {
 // expanded <details> groups). Adds/removes one class per row; cheap.
 function applyPipelineStatesToDOM() {
   const STATUS_CLASSES = ['status-failed','status-crashed','status-blocked','status-in_progress','status-done'];
-  const STUCK = new Set(['blocked', 'failed', 'in_progress']);
+  const STUCK = new Set(['blocked', 'failed']);
   document.querySelectorAll('.ticket-item').forEach(el => {
     el.classList.remove(...STATUS_CLASSES);
     const id = el.dataset.id;
@@ -1132,6 +1159,13 @@ async function forceUnlock() {
   appendTerminal(data.status === 'unlocked' ? 'Code lock force-released' : 'No lock held', 'system');
 }
 
+function updateNowRunning() {
+  const el = document.getElementById('nowRunning');
+  if (!el) return;
+  const t = state.runningTicket, s = state.runningStep;
+  el.textContent = (t && state.running) ? (s ? `${t} · ${s}` : t) : '';
+}
+
 function setRunning(v) {
   state.running = v;
   const pill = document.getElementById('statusPill');
@@ -1148,8 +1182,10 @@ function setRunning(v) {
     btnAll.disabled = false; btnAll.style.opacity = '1';
     btnStop.disabled = true; btnStop.style.color = 'var(--text-muted)'; btnStop.style.borderColor = 'var(--border)';
     state.running = false;
+    state.runningTicket = null; state.runningStep = null;
     stat.textContent = 'Idle'; stat.style.color = '';
   }
+  updateNowRunning();
 }
 
 // ─── Render ───
@@ -1162,7 +1198,7 @@ function renderTicketItem(t, actionIds) {
   const dots = STEPS.map(() => '<div class="step-dot"></div>').join('');
   const stateStatus = pipelineStates[t.id]?.status;
   const statusCls = stateStatus ? ` status-${stateStatus}` : '';
-  const isStuck = stateStatus === 'blocked' || stateStatus === 'failed' || stateStatus === 'in_progress';
+  const isStuck = stateStatus === 'blocked' || stateStatus === 'failed';
   const runBtn = isActionable ? `<button class="run-btn" onclick="event.stopPropagation();runTicket('${t.id}')">&#9654; Run</button>` : '';
   const requeueBtn = isStuck ? `<button class="requeue-btn" onclick="event.stopPropagation();requeueTicket('${t.id}')" title="Archive pipeline-state and reset backlog status to 'requested'. Does not start a run.">&#8635; Requeue</button>` : '';
   const reorderBtns = isActionable ? `<span class="reorder-btns"><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','up')" title="Move up">&#9650;</button><button class="reorder-btn" onclick="event.stopPropagation();reorderTicket('${t.id}','down')" title="Move down">&#9660;</button></span>` : '';
@@ -1430,11 +1466,14 @@ function handleEvent(ev, d, serverTs) {
   }
   switch (ev) {
     case 'run_requested': setRunning(true); break;
-    case 'ticket_start': setActiveTicket(d.ticket, d.title); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
-    case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; loadPipelineStates(); break;
+    case 'ticket_start': setActiveTicket(d.ticket, d.title); state.runningTicket = d.ticket; updateNowRunning(); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
+    case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; state.runningTicket = null; state.runningStep = null; updateNowRunning(); loadPipelineStates(); break;
+    case 'ticket_stop_observed': appendTerminal(`[stop] ${d.ticket}${d.step ? '/' + d.step : ''}: halted by operator (status → blocked)`, 'system'); state.runningTicket = null; state.runningStep = null; updateNowRunning(); loadPipelineStates(); break;
+    case 'pipeline_stop_observed': appendTerminal(`[stop] supervisor exited cleanly — ${d.remaining} ticket(s) left in queue`, 'system'); loadPipelineStates(); break;
     case 'step_start':
       setStepStatus(d.step, 'active');
       state.stepStartTime = Date.now();
+      state.runningStep = d.step; updateNowRunning();
       appendTerminal(`── step: ${d.step} ──`, 'divider');
       // Snapshot 5h% at step start for delta calculation
       fetch('/api/usage').then(r=>r.json()).then(u=>{ state._stepStartPct = u.five_hour?.pct ?? null; }).catch(()=>{});
@@ -2360,6 +2399,11 @@ document.addEventListener('keydown', (e) => {
 connectSSE();
 updateUsageWidget();
 loadProjects();
+// Seed running state from /api/status so a mid-run reload reflects
+// reality immediately, instead of showing "Idle" until the next SSE event.
+fetch('/api/status').then(r=>r.json()).then(s => {
+  if (s.activeProjectRunning) setRunning(true);
+}).catch(()=>{});
 fetch('/api/backlog').then(r=>r.json()).then(data => {
   allTickets = data.all || [];
   currentActionable = data.actionable || [];

@@ -76,8 +76,14 @@ case "${1:-start}" in
     stop_and_wait || exit 1
     # rotate previous log once so we keep one generation
     [ -f pipeline.log ] && mv -f pipeline.log pipeline.log.1
-    NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" >> pipeline.log 2>&1 &
-    echo $! > "$PIDFILE"
-    echo "Started (PID $(cat "$PIDFILE"))"
+    # Run in the foreground and stream logs to this terminal while still
+    # teeing to pipeline.log (rotation, .server.pid, and stop_and_wait's
+    # pgrep all keep working). Process substitution keeps $! = node's pid,
+    # not tee's. Ctrl+C stops the server cleanly.
+    NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" > >(tee -a pipeline.log) 2>&1 &
+    NODE_PID=$!
+    echo "$NODE_PID" > "$PIDFILE"
+    echo "Started (PID $NODE_PID) — logs streaming below, also in pipeline.log. Ctrl+C to stop."
+    wait "$NODE_PID"
     ;;
 esac

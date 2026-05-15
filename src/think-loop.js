@@ -1,5 +1,26 @@
 import { spawnClaude } from './runner.js';
 
+// Normalize a challenge's findings into a stable set of issue signatures so
+// we can detect the loop re-raising the SAME structural problem every round
+// (non-convergence) instead of burning the full round budget on it.
+function parseFindingSignatures(text) {
+  if (!text) return [];
+  const m = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
+  if (!m) return [];
+  try {
+    const arr = JSON.parse(m[0]);
+    if (!Array.isArray(arr)) return [];
+    return [...new Set(
+      arr
+        .map((f) => (f && typeof f.issue === 'string' ? f.issue : ''))
+        .filter(Boolean)
+        .map((s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80))
+    )];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Self-challenge protocol — mechanically enforced by the orchestrator.
  *
@@ -9,6 +30,18 @@ import { spawnClaude } from './runner.js';
  *    - Yes → replace best, round++
  *    - No → discard++
  * 4. 3 discards OR 10 rounds → converged
+ *
+ * Token-burn guards (added 2026-05-15):
+ *  A. Infeasibility verdict — the challenger may answer `BLOCKED: <reason>`
+ *     for hard blockers it cannot fix by iterating (missing credential,
+ *     unprovisioned external service, self-contradictory ticket scope).
+ *     The loop stops immediately and the caller marks the ticket blocked
+ *     → human, instead of looping then shipping a doomed plan.
+ *  B. Non-convergence detection — if the challenger re-raises the same
+ *     issue across rounds, or keeps "winning" the compare with fresh
+ *     findings every round without ever discarding, the disagreement is
+ *     structural (iteration won't fix it). Stop and escalate rather than
+ *     run the full round budget.
  */
 export async function thinkLoop({
   initialResult,
@@ -24,7 +57,10 @@ export async function thinkLoop({
   let bestResult = initialResult;
   let discards = 0;
   let rounds = 0;
+  let blocked = false;
+  let blockedReason = '';
   const history = [];
+  const issueFirstSeenRound = new Map(); // signature -> round first seen
 
   while (rounds < maxRounds && discards < maxDiscards) {
     rounds++;
@@ -48,7 +84,10 @@ If you find problems, output ONLY a JSON array of findings:
 
 If no problems found, output exactly: NO_IMPROVEMENT
 
-No prose. No explanations. No complete rewrites. Just the findings array or NO_IMPROVEMENT.`;
+If the output cannot be fixed by editing code or the plan because it depends on something that does not exist or contradicts itself — a missing/wrong credential or key, an unprovisioned external service, or a ticket scope that requires something not available — do NOT emit findings. Output exactly one line:
+BLOCKED: <one sentence — what is missing and why iterating cannot fix it>
+
+No prose. No explanations. No complete rewrites. Just the findings array, or NO_IMPROVEMENT, or one BLOCKED: line.`;
 
     let challengeResult;
     try {
@@ -89,6 +128,39 @@ No prose. No explanations. No complete rewrites. Just the findings array or NO_I
         error: err.message,
       });
       break;
+    }
+
+    // A. Infeasibility verdict — hard blocker iteration cannot fix.
+    const blockedMatch = challengeResult.match(/^\s*BLOCKED:\s*(.+)$/im);
+    if (blockedMatch) {
+      blocked = true;
+      blockedReason = blockedMatch[1].trim().slice(0, 300);
+      history.push({ round: rounds, outcome: 'blocked', reason: blockedReason });
+      emitter?.emit('think_round_end', {
+        ticket: ticket.id, step: stepName, round: rounds,
+        outcome: 'blocked', reason: blockedReason, discards,
+      });
+      break;
+    }
+
+    // B. Non-convergence — same issue re-raised in a later round means the
+    // disagreement is structural; iterating burns tokens without resolving.
+    const sigs = parseFindingSignatures(challengeResult);
+    const repeated = sigs.find(
+      (s) => issueFirstSeenRound.has(s) && issueFirstSeenRound.get(s) !== rounds
+    );
+    if (repeated) {
+      blocked = true;
+      blockedReason = `non-convergence: challenger re-raised the same issue across rounds — "${repeated}"`;
+      history.push({ round: rounds, outcome: 'nonconvergence', reason: blockedReason });
+      emitter?.emit('think_round_end', {
+        ticket: ticket.id, step: stepName, round: rounds,
+        outcome: 'nonconvergence', reason: blockedReason, discards,
+      });
+      break;
+    }
+    for (const s of sigs) {
+      if (!issueFirstSeenRound.has(s)) issueFirstSeenRound.set(s, rounds);
     }
 
     // Check if the challenger found no improvement
@@ -197,14 +269,25 @@ Do not hedge. Pick one.`;
     }
   }
 
-  emitter?.emit('think_converged', {
-    ticket: ticket.id,
-    step: stepName,
-    rounds,
-    discards,
-    improvements: history.filter((h) => h.outcome === 'improved').length,
-    history,
-  });
+  if (blocked) {
+    emitter?.emit('think_blocked', {
+      ticket: ticket.id,
+      step: stepName,
+      rounds,
+      discards,
+      reason: blockedReason,
+      history,
+    });
+  } else {
+    emitter?.emit('think_converged', {
+      ticket: ticket.id,
+      step: stepName,
+      rounds,
+      discards,
+      improvements: history.filter((h) => h.outcome === 'improved').length,
+      history,
+    });
+  }
 
-  return { result: bestResult, rounds, discards, history };
+  return { result: bestResult, rounds, discards, history, blocked, blockedReason };
 }

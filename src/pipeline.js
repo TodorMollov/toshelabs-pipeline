@@ -92,6 +92,13 @@ export class Pipeline {
     // `/api/stop?hard=true` uses this to SIGTERM the step immediately
     // instead of waiting for Claude to finish naturally.
     this.activeSubprocess = null;
+    // Sticky stop signal (PIPE-014). Set by requestStop() when the
+    // operator clicks Stop. Checked at three supervisor checkpoints:
+    // top of ticket loop, top of step loop, top of heal-attempt loop.
+    // Without this, killing the active subprocess only halted the
+    // current attempt — the heal loop retried, or the supervisor
+    // marched to the next step / ticket.
+    this.stopRequested = false;
     // Worktree-per-pipeline-run: when enabled, the orchestrator runs
     // each ticket in {pipelineHome}/projects/{name}/worktree rather
     // than in config.project_dir, so the operator can keep editing
@@ -120,6 +127,18 @@ export class Pipeline {
   effectiveConfig() {
     if (!this.activeWorktree) return this.config;
     return { ...this.config, project_dir: this.activeWorktree };
+  }
+
+  /**
+   * Operator-initiated stop. Sets the sticky flag AND kills the
+   * currently-running subprocess. The flag is what actually halts
+   * the pipeline — kill alone wasn't enough because the heal loop
+   * retried and the supervisor advanced to the next step/ticket
+   * (PIPE-014). Safe to call multiple times.
+   */
+  requestStop() {
+    this.stopRequested = true;
+    return this.stopActiveSubprocess();
   }
 
   /**
@@ -189,6 +208,10 @@ export class Pipeline {
 
       // Process tickets one at a time
       for (let i = 0; i < queue.length; i++) {
+        if (this.stopRequested) {
+          this.emit('pipeline_stop_observed', { remaining: queue.length - i });
+          break;
+        }
         const queuedTicket = queue[i];
         // Re-read the ticket from backlog.json at ticket start rather than
         // using the snapshot captured at run() entry. Fixes the 2026-04-21
@@ -244,9 +267,23 @@ export class Pipeline {
           try {
             failedState = await this.loadPipelineJson(ticket.id);
             if (failedState && failedState.status === 'in_progress') {
-              failedState.status = 'failed';
-              failedState.failed_at = new Date().toISOString();
-              failedState.failure_reason = err.message;
+              if (this.stopRequested) {
+                failedState.status = 'blocked';
+                failedState.blocked_at = new Date().toISOString();
+                failedState.blocked_reason = 'user_stopped_via_api_stop';
+              } else if (err.thinkBlocked) {
+                // Think-loop infeasibility / non-convergence: a human must
+                // resolve the prereq or rescope the ticket — not a crash,
+                // and re-running would just re-burn tokens. Mark blocked.
+                failedState.status = 'blocked';
+                failedState.blocked_at = new Date().toISOString();
+                failedState.blocked_step = err.blockedStep || 'plan';
+                failedState.blocked_reason = err.blockedReason || err.message;
+              } else {
+                failedState.status = 'failed';
+                failedState.failed_at = new Date().toISOString();
+                failedState.failure_reason = err.message;
+              }
               await this.savePipelineJson(ticket.id, failedState);
             }
           } catch { /* best-effort */ }
@@ -258,6 +295,10 @@ export class Pipeline {
           // the orchestrator never leaves master in the primary checkout
           // (and the worktree, when enabled, is permanently pinned to its
           // side branch). No checkout-master cleanup needed here.
+          if (this.stopRequested) {
+            this.emit('ticket_stop_observed', { ticket: ticket.id, error: err.message });
+            break;
+          }
           this.emit('ticket_failed', { ticket: ticket.id, error: err.message });
           continue;
         }
@@ -490,6 +531,19 @@ export class Pipeline {
 
     for (let i = 0; i < steps.length; i++) {
       const stepConfig = steps[i];
+      // PIPE-014: respect operator Stop between steps. Without this,
+      // killing the active subprocess only halted the step in flight —
+      // the supervisor then advanced to the next step (T-038: plan
+      // killed by Stop, then tests_red and implement still ran).
+      if (this.stopRequested) {
+        pipelineState.status = 'blocked';
+        pipelineState.blocked_at = new Date().toISOString();
+        pipelineState.blocked_step = stepConfig.name;
+        pipelineState.blocked_reason = 'user_stopped_via_api_stop';
+        await this.savePipelineJson(ticket.id, pipelineState);
+        this.emit('ticket_stop_observed', { ticket: ticket.id, step: stepConfig.name });
+        return;
+      }
       // Session sharing: reuse previous session when configured.
       // Groups: tests_red→implement, tests_green→review, root_cause→docs_update
       const prevSessionId = this.sessionId;
@@ -836,14 +890,32 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         } else {
           this.emit('think_loop_start', { ticket: ticket.id, step: stepConfig.name, risk });
 
-          await thinkLoop({
+          const tlResult = await thinkLoop({
             initialResult: stepResult.lastResult || '',
             stepName: stepConfig.name,
             challengeQuestion: stepConfig.think_challenge,
-            config: this.config,
+            // effectiveConfig() rewrites project_dir to the active worktree.
+            // think-loop's challenger/compare spawn in config.project_dir;
+            // with raw this.config that's the UNMERGED source repo, so the
+            // challenger sees no implementation and (with the A+B blocked
+            // detector) false-blocks every worktree-mode ticket.
+            config: this.effectiveConfig(),
             ticket,
             emitter: this.emitter,
           });
+
+          // A+B: think-loop hit a hard blocker / non-convergence. Do NOT
+          // proceed to burn implement/review/heal on a doomed plan — halt
+          // the ticket and escalate to the human (run() marks it blocked).
+          if (tlResult?.blocked) {
+            const e = new Error(
+              `think-loop halted ${ticket.id}/${stepConfig.name}: ${tlResult.blockedReason}`
+            );
+            e.thinkBlocked = true;
+            e.blockedReason = tlResult.blockedReason;
+            e.blockedStep = stepConfig.name;
+            throw e;
+          }
 
           // Re-read pipeline JSON after think loop (may have been updated)
           pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
@@ -1633,6 +1705,20 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     const gateFailuresByAttempt = [];
     let lastMaxTurnsHit = false;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      // PIPE-014: bail before re-spawning a heal attempt if the operator
+      // hit Stop. SIGTERM killed the active child; without this check the
+      // heal loop would treat the dead child as "attempt failed" and
+      // spawn a fresh subprocess for attempt+1.
+      if (this.stopRequested) {
+        pipelineState.steps[stepConfig.name] = {
+          ...pipelineState.steps[stepConfig.name],
+          status: 'blocked',
+          blocked_at: new Date().toISOString(),
+          reason: 'user_stopped_via_api_stop',
+        };
+        await this.savePipelineJson(ticket.id, pipelineState);
+        throw new Error('user_stopped_via_api_stop');
+      }
       const isRetry = attempt > 1;
 
       // Snapshot git state before code-writing steps
@@ -2307,13 +2393,19 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       }
     }
 
+    // `flutter test <dir>` exits 1 with this exact text when the path has
+    // zero tests. That is not a crash and not a regression — a directory
+    // with no tests introduced no new failures. Distinguish it by the
+    // explicit sentinel so the genuine-crash guard below stays strict.
+    const unitNoTests = !unitSkipped && unitExitCode !== 0 && matches.length === 0
+      && /No tests ran\.|No tests were found\.?/i.test(testOutput);
     // Silent failure: non-zero exit with no parseable stats ⇒ the runner
     // crashed before producing a summary. Don't let that slip through as
     // a green pass.
-    const unitCrashed = !unitSkipped && unitExitCode !== 0 && matches.length === 0;
+    const unitCrashed = !unitSkipped && unitExitCode !== 0 && matches.length === 0 && !unitNoTests;
     // Suspicious: ran unit but saw zero tests total (command ran but no
     // results). Common cause: wrong cwd, wrong test path, empty glob.
-    const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed;
+    const unitRanNothing = !unitSkipped && matches.length === 0 && !unitCrashed && !unitNoTests;
 
     // --- Extras (e.g. backend, integration) ---
     const implFiles = pipelineState.steps?.implement?.files_changed || [];
@@ -2332,7 +2424,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     }
 
     return {
-      passed, failed, failedTests, unitCrashed, unitExitCode, unitRanNothing, unitSkipped,
+      passed, failed, failedTests, unitCrashed, unitExitCode, unitRanNothing, unitNoTests, unitSkipped,
       analyzerErrors, analyzeOutput,
       extraFailures, extraOutput,
       testOutput,
@@ -2407,6 +2499,9 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     if (res.unitRanNothing) {
       console.warn(`[tests_green] WARNING: unit command produced no stats — check cmd/cwd. exit=${res.unitExitCode}. Tail: ${res.testOutput.slice(-500)}`);
     }
+    if (res.unitNoTests) {
+      console.log(`[tests_green] unit path has zero tests (flutter exit ${res.unitExitCode}, "No tests were found") — benign, 0 new failures.`);
+    }
 
     const testsActuallyRan = !res.unitRanNothing && !res.skippedDueToCompileErrors;
     const failed_ = !testsActuallyRan || (newFailures > 0) || res.unitCrashed || newExtraFailures.length > 0 || newAnalyzerErrors > 0;
@@ -2418,6 +2513,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       unit_crashed: res.unitCrashed,
       unit_exit_code: res.unitExitCode,
       unit_ran_nothing: res.unitRanNothing,
+      unit_no_tests: res.unitNoTests || false,
       unit_skipped_compile_errors: res.skippedDueToCompileErrors || false,
       analyzer_errors: res.analyzerErrors,
       new_analyzer_errors: newAnalyzerErrors,

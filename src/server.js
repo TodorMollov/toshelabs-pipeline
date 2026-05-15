@@ -188,7 +188,14 @@ export async function startServer(config) {
     }
     const { pipeline } = entry;
     let killed = false;
-    if (typeof pipeline.stopActiveSubprocess === 'function') {
+    // PIPE-014: requestStop() sets the sticky flag AND kills the
+    // subprocess. The flag is what halts the supervisor — the kill
+    // alone wasn't enough because heal loops retried and the ticket
+    // loop advanced. Fall back to bare kill for old pipeline instances
+    // that pre-date requestStop (e.g. mid-deploy).
+    if (typeof pipeline.requestStop === 'function') {
+      killed = pipeline.requestStop();
+    } else if (typeof pipeline.stopActiveSubprocess === 'function') {
       killed = pipeline.stopActiveSubprocess();
     }
     await pipeline.releaseLock();
