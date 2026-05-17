@@ -1,5 +1,5 @@
 import { readFile, readdir } from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { parse as parseYaml } from 'yaml';
 import { resolve, dirname, basename } from 'path';
 import { fileURLToPath } from 'url';
@@ -136,4 +136,33 @@ export async function loadAllConfigs({ legacyConfigPath = 'pipeline.config.yaml'
   }
 
   return projects;
+}
+
+// Persisted active-project preference. A hard restart (start.sh, not a
+// PIPE-019 exit-75 relaunch) re-runs index.js with no --project, which
+// previously defaulted to the first non-template id alphabetically —
+// silently switching the active project out from under a multi-day run
+// (observed 2026-05-17: predictor run resumed as busydad). Persist the
+// last activated id here and prefer it on startup. Best-effort: a missing
+// or unreadable file just falls back to the alphabetical default.
+export function activeProjectFilePath() {
+  return resolve(homedir(), '.toshelabs', 'active-project');
+}
+
+export function readPersistedActiveProject() {
+  try {
+    const id = readFileSync(activeProjectFilePath(), 'utf-8').trim();
+    return id || null;
+  } catch {
+    return null;
+  }
+}
+
+export function persistActiveProject(id) {
+  try {
+    writeFileSync(activeProjectFilePath(), String(id), 'utf-8');
+    return true;
+  } catch {
+    return false; // best-effort — never block activation on a write failure
+  }
 }

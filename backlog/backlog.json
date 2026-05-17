@@ -1,678 +1,730 @@
 {
- "schema": "backlog-v1",
- "updated_at": "2026-05-15",
- "_last_session_note": "2026-05-05 \u2014 Autonomous overnight run encountered: (a) plan_critic 180s timeout on real busydad tickets (PIPE-013 to calibrate via backtest); (b) /api/stop only kills the step, not the queue (PIPE-014). plan_critic disabled on busydad for the rest of the run.",
- "tickets": [
-  {
-   "id": "PIPE-001",
-   "title": "Add `plan_critic` phase between plan and tests_red \u2014 falsify plan claims before code is written",
-   "status": "done",
-   "priority": "P1",
-   "type": "feature",
-   "complexity": "medium",
-   "area": "pipeline.config.yaml, prompts/plan_critic.md (new), src/* (phase wiring), pipeline-state schema (new step entry), prompts/tests_red.md (consume critic findings)",
-   "reported": "2026-05-03",
-   "source": "Concrete escape: busydad ticket L10N-1 (commit f90db04, v1.0.99). Pipeline ran plan \u2192 tests_red \u2192 implement \u2192 review \u2192 done, all phases green, but the plan's `edge_cases` array contained the unverified claim 'AppLocalizations.delegate.isSupported checks languageCode only \u2014 en_GB matches \"en\", so app strings still load correctly'. That claim is false (the generated AppLocalizations delegate matches the full Locale, not just languageCode). Tests_red wrote tests consistent with the wrong claim; implement built code consistent with it; review compared code to plan and passed both wrong-against-wrong. Result: every Bulgarian-locale phone (and ~47 other Material-supported / AppLocalizations-unsupported locales) crashed on first frame in production. The existing `think_challenge` self-prompt on the plan step is not enough \u2014 it ran on L10N-1 and still missed it. Self-critique inside the same session is structurally weaker than a separate session with a separate prompt and grounding access. Full forensic in busydad memory/backlog.json BUG-267.source.",
-   "description": "Insert a new pipeline phase named `plan_critic` between `plan` and `tests_red`. Phase reads the plan output (especially `edge_cases`, `risk`, and any sentence asserting framework / library / runtime behaviour) and emits structured findings, each of which must include a concrete falsifying input and a proposed test that would fail if the claim is wrong. Findings are auto-promoted into mandatory tests_red cases. Phase runs in a fresh Claude session with adversarial framing and grounding access (web fetch + framework source read), so it has actual ground truth, not just the same prior that produced the buggy plan.",
-   "user_impact": "Catches the failure mode that produces L10N-class escapes \u2014 coherent wrongness across plan/tests/implementation built on a single false belief. Each escape today costs multiple downstream tickets to remediate (BUG-261A, BUG-261B, BUG-267 for L10N-1 alone) plus user trust. Catch-rate target: would have caught L10N-1, BUG-261 root cause, and at least one of BUG-262 / BUG-266 in backtest.",
-   "acceptance_criteria": [
-    "GIVEN a ticket whose `complexity` is not `trivial`, WHEN the pipeline transitions out of the `plan` step, THEN the new `plan_critic` step runs before `tests_red` is started.",
-    "GIVEN a ticket of ANY complexity (including trivial/small) whose plan touches any load-bearing file, WHEN the plan completes, THEN `plan_critic` runs regardless. Side rule: if a small/trivial-complexity ticket plan ends up touching a load-bearing file, the planner SHOULD also reconsider whether the complexity tag was honest \u2014 bumping a load-bearing change from trivial to medium prevents the regression-test gap that small/trivial tickets explicitly defer.",
-    "GIVEN a ticket whose `complexity` is `trivial` AND that does not touch a load-bearing file, WHEN the plan completes, THEN `plan_critic` is skipped and the pipeline proceeds directly to `tests_red`.",
-    "GIVEN `plan_critic` runs, WHEN it produces output, THEN the output validates against a strict JSON schema: array of objects with required keys `claim_under_test` (string, must quote text from the plan), `concrete_falsifier` (string, must be a specific input value, not a category), `proposed_test` (string, runnable test description). Free-form prose, vague objections, or findings without all three fields are rejected by the validator and do not count as findings.",
-    "GIVEN `plan_critic` returns one or more valid findings, WHEN the pipeline transitions to `tests_red`, THEN the tests_red prompt is given the findings as MANDATORY test cases (must be present in `test_files`/`test_names` of the tests_red output, otherwise tests_red fails its `covers_plan_criteria` rule).",
-    "GIVEN `plan_critic` finds at least one issue AND the planner revises the plan, WHEN the revised plan is produced, THEN `plan_critic` runs ONCE more on the revision (loop bound = 1). If the second pass still objects, the plan ships and downstream phases proceed \u2014 preventing infinite loops.",
-    "GIVEN `plan_critic` runs, WHEN it exceeds 90 seconds wall-clock OR 25,000 tokens of output, THEN it is terminated; whatever valid findings it has produced are used; absence of findings under cap is treated as 'no objections'.",
-    "GIVEN the `plan_critic` step itself errors (model error, timeout, infra failure), WHEN the pipeline is configured with `plan_critic.heal_attempts = 0`, THEN the step does not retry; the operator is paged and the ticket halts at this step rather than silently skipping.",
-    "GIVEN the new phase is added, WHEN the existing pipeline-state schema is updated, THEN every ticket file in `projects/{name}/pipeline-state/` includes a `plan_critic` block (status, completed_at, findings[], dismissed_findings[], skipped_reason if applicable). Old files without the block are treated as `skipped: legacy` and do not break replay.",
-    "GIVEN the planner explicitly disagrees with a critic finding (knows it's out of scope), WHEN the planner produces the revised plan, THEN it MAY include a `dismissed_findings: [{finding_id, rationale}]` array. Dismissed findings are preserved in pipeline-state for audit. Silent dismissal (omitting a finding without acknowledging it in dismissed_findings) is forbidden \u2014 tests_red MUST cover every non-dismissed finding.",
-    "Backtest: GIVEN we re-run `plan_critic` against the archived plans for L10N-1, BUG-261 (root cause), BUG-262, and two arbitrary 'shipped fine' tickets, WHEN we measure findings, THEN L10N-1's plan must produce a finding whose `claim_under_test` quotes the AppLocalizations languageCode sentence AND whose `concrete_falsifier` is a non-en languageCode (e.g. `bg_BG`, `de_DE`). Catch rate on the three real bug plans must be \u2265 2/3. False-positive rate on the two control plans must be < 3 findings each (calibration check)."
-   ],
-   "decisions": [
-    "Model = Opus (not Sonnet). Rationale: by busydad CLAUDE.md rule 28, all analysis is Opus; Sonnet only writes code from a clear spec. Plan-critic IS analysis \u2014 the highest-judgment phase in the pipeline. Putting Sonnet on the rebuttal of an Opus plan is structurally backwards (weaker model, same prior bias). Cost is acceptable: ~$0.70/ticket Opus, gated to ~70% of tickets, ~$5/night. One escaped L10N-class bug costs more in remediation alone.",
-    "Insertion point = between `plan` and `tests_red` (NOT post-implement). Catching flaws before code is written avoids the cost of bouncing implement \u2192 tests \u2192 back to plan, and keeps the critic findings scoped to a stable artefact (the plan) rather than a moving one (the diff).",
-    "Output contract = strict JSON ({claim_under_test, concrete_falsifier, proposed_test}). Rationale: free-form critique is the failure mode we're trying to leave behind. If the critic cannot produce a concrete falsifier, the finding is not real \u2014 vague concerns inflate the test suite without raising quality.",
-    "Loop bound = 1 (one critic \u2192 one revise \u2192 one re-critic \u2192 ship). Operator decision 2026-05-04: re-pass enabled to capture revision-quality value, but bound stays at 1 to avoid infinite revision/objection loops.",
-    "Grounding = web fetch + repo file read enabled for the critic. Operator decision 2026-05-04: critic gets ALL tools (Read, WebFetch, Grep, Glob, Bash for read-only inspection). Rationale: L10N-1's specific failure was misunderstanding framework behaviour. A critic with no access to actual flutter source / docs has the same prior as the planner and will rubber-stamp the same false claims (LLM-vs-LLM theatre). With grounding, the critic can verify 'AppLocalizations.delegate.isSupported' by reading the generated source.",
-    "Keep the existing `think_challenge` self-prompt on the plan step. The two are complementary: think_challenge nudges the planner toward humility cheaply; plan_critic provides an independent adversarial pass with grounding. Removing think_challenge saves nothing measurable and weakens the cheap first line of defence.",
-    "Gate is single-arm (operator decision 2026-05-04, dropping the original three-arm proposal): `complexity != trivial` OR `plan.files_to_change \u2229 load_bearing_files \u2260 \u2205`. The original `risk_area_tags` arm was dropped \u2014 tags are too much backlog-hygiene burden across multiple projects, and the load-bearing files glob covers the same ground for any project that maintains its file list.",
-    "Side rule (operator decision 2026-05-04): if a small/trivial-complexity ticket's plan ends up touching a load-bearing file, the planner SHOULD reconsider whether the complexity was honest \u2014 small/trivial tickets explicitly skip regression testing, and load-bearing files demand it. The critic still runs in this case, but the ticket should likely be re-graded to medium.",
-    "Planner override path (operator decision 2026-05-04): the planner MAY dismiss a critic finding by adding it to a `dismissed_findings: [{finding_id, rationale}]` array on the revised plan. Dismissals are preserved in pipeline-state for audit. NO silent dismissal \u2014 tests_red enforces coverage of every non-dismissed finding."
-   ],
-   "open_questions": [
-    "RESOLVED Q1 (load-bearing files list \u2014 busydad starting set): app/lib/app.dart, app/lib/main.dart, app/lib/core/routing/**, app/lib/core/auth/**, app/lib/l10n/**, app/lib/data/sync/**, app/lib/data/local/database.dart, app/lib/data/migrations/**, backend/functions/src/parseInput/**, backend/functions/src/auth/**, firestore.rules, storage.rules. Per-project, declared in pipeline.config.yaml under `plan_critic.load_bearing_files`. Operator approved 2026-05-04 + author may extend.",
-    "RESOLVED Q2 (risk-area tags): dropped. Gate is single-arm \u2014 complexity OR load-bearing files only. Tags add too much backlog-hygiene burden across projects.",
-    "RESOLVED Q3 (critic tool budget): all tools (Read, WebFetch, Grep, Glob, read-only Bash). Operator approved 2026-05-04.",
-    "RESOLVED Q4 (re-pass on revision): enabled. One critic \u2192 revise \u2192 one re-critic \u2192 ship. Loop bound = 1.",
-    "RESOLVED Q5 (planner override): dismissed_findings array with rationale, preserved in pipeline-state. No silent dismissal."
-   ],
-   "fix_plan": [
-    "Phase 0 \u2014 Spec & approval",
-    "1. Write docs/proposals/PLAN-CRITIC.md: rationale (L10N-1 worked example), the three-arm gate, phase contract, output schema, loop bound, token cap (no wall-clock cap \u2014 Opus needs ~3 min), backtest plan. Get operator sign-off on the open questions Q1-Q5 before any code.",
-    "Phase 1 \u2014 Backtest harness (validates the design before we ship it)",
-    "2. Build a small harness in scripts/ that loads a historical plan JSON, runs the proposed plan_critic prompt against it (Opus, no wall-clock cap, 25K output cap, structured output), and emits the findings. Run against archived plans for L10N-1, BUG-261, BUG-262, and two 'shipped fine' control tickets (operator picks). Record per-run wall time so we can size monitoring/alerting later \u2014 informational, not a gate.",
-    "3. Acceptance bar (matches AC backtest entry): L10N-1 plan must yield a finding quoting the AppLocalizations languageCode sentence with a non-en falsifier; total catch \u2265 2/3 on the bug set; controls < 3 findings each. If the bar is not met, iterate on the prompt before shipping.",
-    "Phase 2 \u2014 Implement the phase",
-    "4. New file prompts/plan_critic.md. Adversarial framing. Required output schema embedded. Explicit anti-vagueness rules ('reject any finding without a concrete falsifier'). Grounding instructions: when a plan asserts third-party / framework behaviour, verify by reading the relevant source or docs before producing a finding (or before letting the claim pass).",
-    "5. Edit pipeline.config.yaml: add `plan_critic` step between `plan` and `tests_red`. Fields: prompt_template, model=opus, max_output_tokens=25000, heal_attempts=0, allowed_tools=[Read, WebFetch]. NO wall-clock cap \u2014 Opus on adversarial review with grounding takes ~3 minutes; constraint is the token budget, not the clock.",
-    "6. Edit pipeline.config.yaml gate: add `gate` block on the plan_critic step expressing the three-arm rule. Implementation: src/* gating helper that takes (ticket, plan_output) and returns boolean. Read the load-bearing files list and risk-area tag set from config, not hard-coded.",
-    "7. Update pipeline-state schema (pipeline-schema.md or equivalent in src/): new `plan_critic` block with fields {status, started_at, completed_at, gated_in (bool + reason), findings: [{claim_under_test, concrete_falsifier, proposed_test, dismissed: bool, dismissed_rationale: string|null}], skipped_reason}.",
-    "Phase 3 \u2014 Wire findings into tests_red",
-    "8. Edit prompts/tests_red.md to inject `plan_critic.findings` (non-dismissed) as MANDATORY test cases. Add a validator rule (`covers_plan_critic_findings`) that fails tests_red if any non-dismissed finding lacks a corresponding test_name in tests_red output.",
-    "Phase 4 \u2014 Validation",
-    "9. Dry-run on a low-stakes ticket from busydad backlog (operator picks). Confirm the new phase runs, gate behaves, output validates, tests_red consumes findings.",
-    "10. Run against next 5-10 nightly tickets. Collect: was it gated in or skipped, how many findings, were they real, did tests_red incorporate them, did the ticket complete green. Tune the prompt if false-positive rate > 30% or catch rate is invisible.",
-    "Phase 5 \u2014 Document",
-    "11. Update README.md with the new phase. Add a one-pager docs/PLAN-CRITIC.md summarising the contract for future operators."
-   ],
-   "files_likely_affected": [
-    "/home/toshe/toshelabs-pipeline/docs/proposals/PLAN-CRITIC.md (new)",
-    "/home/toshe/toshelabs-pipeline/docs/PLAN-CRITIC.md (new \u2014 operator-facing summary)",
-    "/home/toshe/toshelabs-pipeline/prompts/plan_critic.md (new)",
-    "/home/toshe/toshelabs-pipeline/prompts/tests_red.md (edit \u2014 consume findings)",
-    "/home/toshe/toshelabs-pipeline/pipeline.config.yaml (edit \u2014 add step + gate config)",
-    "/home/toshe/toshelabs-pipeline/src/* (edit \u2014 phase wiring, gate helper, schema update; exact files TBD on inspection)",
-    "/home/toshe/toshelabs-pipeline/scripts/plan-critic-backtest.* (new \u2014 harness for Phase 1)",
-    "/home/toshe/toshelabs-pipeline/README.md (edit \u2014 document new phase)"
-   ],
-   "out_of_scope": [
-    "Tightening the `complexity` enum in busydad's memory/backlog.json (currently 24+ free-form strings observed). Filed separately.",
-    "Adding adversarial steps to other phases (review, implement). The plan is the highest-leverage point; revisit after PIPE-001 has 4 weeks of production data.",
-    "Replacing the existing `think_challenge` self-prompt on the plan step. Complementary, not redundant.",
-    "Cross-ticket pattern detection ('the last 5 plans all assumed X'). Future work."
-   ],
-   "landed_commit": "f3f4db8",
-   "shipped_note": "Infrastructure shipped (prompt, step config, gate logic, backtest harness). DEFERRED: actual backtest run against archived plans, tests_red consumption of findings, dismissed_findings audit path, re-pass loop. File as PIPE-005 if/when ready.",
-   "shipped_at": "2026-05-04"
-  },
-  {
-   "id": "PIPE-002",
-   "schema_version": 1,
-   "title": "Backfill non-conformant tickets to schema v1, then flip ticket_schema.mode from warn to strict",
-   "status": "done",
-   "priority": "P1",
-   "type": "ops",
-   "complexity": "small",
-   "area": "scripts/migrate-tickets-vN-to-vM.{js,py} (new), per-project pipeline.config.yaml mode flip, project backlog files",
-   "reported": "2026-05-04",
-   "source": "Schema validator landed in commit 29c4475 in `warn` mode \u2014 busydad's BUG-266 already fails validation (missing schema_version, complexity: \"unknown\"). Validator is currently a no-op for queue inclusion; the contract is documented but not enforced. Until tickets are backfilled to v1, flipping to strict would reject every existing ticket and freeze the pipeline.",
-   "description": "Write a one-time migration pass that loads a project's backlog file, validates each ticket against schema v1, and either auto-fixes mechanical violations (add `schema_version: 1`, coerce known complexity strings into the enum, drop free-form prose from `status` into `description`) or flags tickets requiring manual triage. Then flip ticket_schema.mode from warn \u2192 strict in the project config and verify the next pipeline run passes validation cleanly.",
-   "user_impact": "Until this lands, the schema is documentation, not enforcement \u2014 the entire point of shipping the validator. Producers (operator + LLMs in busydad CLAUDE.md) won't get fast feedback on non-conformant tickets because warn mode just logs and keeps going.",
-   "acceptance_criteria": [
-    "GIVEN a project's backlog with N non-conformant tickets, WHEN the migration script runs in --dry-run, THEN it prints a per-ticket diff of proposed changes without writing.",
-    "GIVEN the same backlog, WHEN the migration runs without --dry-run, THEN every auto-fixable ticket is rewritten in place, irrecoverable tickets are flagged for manual triage, and a summary report is printed (auto-fixed: N, manual: M, untouched: K).",
-    "GIVEN busydad's backlog after migration, WHEN the pipeline loads with ticket_schema.mode=strict, THEN no ticket_rejected events fire and `actionable` count is preserved.",
-    "GIVEN the migration is idempotent, WHEN run a second time on the same backlog, THEN it produces zero changes (auto-fixed: 0)."
-   ],
-   "decisions": [
-    "Migration is per-project, invoked manually (not auto-run on pipeline startup) \u2014 auto-migration on a live backlog risks operator-edits being overwritten between sessions.",
-    "Auto-fix scope is mechanical only. Anything semantic (e.g. \"this `complexity: huge` should be `large`\" \u2014 fine; \"this `status: 'COMPLETE \u2014 three fixes...'` \u2014 flag for manual triage, do NOT guess) goes to the manual pile.",
-    "The flip to strict happens per-project, in a separate config commit. A project can sit in warn indefinitely if its backlog hygiene isn't ready."
-   ],
-   "fix_plan": [
-    "1. Write scripts/migrate-tickets.js that loads a backlog, validates each ticket against schema v1 via src/ticket-schema.js, and produces an auto-fix plan (--dry-run by default).",
-    "2. Define mechanical auto-fixes: add schema_version=1, coerce complexity from {unknown, tiny, mini} \u2192 {trivial, small} via a hardcoded map (operator can extend), strip prose from status into description for entries matching `^[A-Z]+\\s\u2014\\s` patterns.",
-    "3. Anything not auto-fixable: write to a `<id>.needs_triage.json` sidecar with the violations, leave the ticket untouched in backlog.",
-    "4. Run on busydad's state/backlog.json; review the diff; apply.",
-    "5. Flip pipeline.config.yaml ticket_schema.mode to strict for busydad. Restart pipeline. Confirm zero rejections.",
-    "6. Document in TICKET-SCHEMA.md under \"Versioning\" \u2014 \"How to migrate from version N to N+1: write scripts/migrate-tickets-N-to-M.js, follow the auto-fix-then-flag pattern\"."
-   ],
-   "files_likely_affected": [
-    "scripts/migrate-tickets.js (new)",
-    "TICKET-SCHEMA.md (extend Versioning section)",
-    "pipeline.config.yaml on each project (mode flip; not in this repo)"
-   ],
-   "out_of_scope": [
-    "Schema v2 (no v2 yet; flip happens when one is needed).",
-    "Cross-project orchestration (PIPE-003 territory).",
-    "Migrating busydad's state/backlog-v2.json \u2014 that file is a separate roadmap pile, not pipeline-actionable; same migration script could process it but isn't required for PIPE-002 to be done."
-   ],
-   "landed_commit": "5d0104e",
-   "shipped_note": "Migration script + busydad backfill to schema v1 + flip to strict mode. 1 manual triage case (T-84 has 7-char title \u2014 operator should re-title).",
-   "shipped_at": "2026-05-04"
-  },
-  {
-   "id": "PIPE-003",
-   "schema_version": 1,
-   "title": "Multi-project support \u2014 per-project config registry, project switcher (parallel work descoped)",
-   "status": "done",
-   "priority": "P1",
-   "type": "feature",
-   "complexity": "medium",
-   "area": "config registry (new), src/server.js (project selector + per-project lifecycle), src/pipeline.js (parallel-runner support), public/index.html (project picker), CLI",
-   "reported": "2026-05-04",
-   "source": "Explicit user direction 2026-05-03/04: 'the pipeline should be generic - we can use it to build any project - not just busydad - should follow project based configuration' + 'i want to be able to switch between projects'. Today the pipeline is single-project (pipeline.config.yaml hard-coded to busydad). Operator descoped intra-project parallel ticket execution 2026-05-04 \u2014 too many shared-state hazards (master, rate limit, worktree object storage); cross-project parallel comes for free since different projects already have different locks and different masters.",
-   "description": "Generalise the pipeline to host multiple projects with a directory-based registry, expose a project selector in the dashboard + CLI, and cleanly isolate per-project state. Cross-project parallel runs (two projects' pipelines active simultaneously) come for free since projects already use separate code_locks. Intra-project parallel ticket execution is OUT of scope per operator decision.",
-   "user_impact": "Today's pipeline is a single-tenant tool effectively dedicated to busydad. Generalising unlocks: (a) running pipeline against any future project the user starts, (b) parallel ticket throughput within a project (multi-runner), (c) multiple projects active concurrently. Without this, every new project requires duplicating the pipeline binary + config.",
-   "acceptance_criteria": [
-    "GIVEN a directory `~/.toshelabs/projects/` containing one YAML file per project (busydad.yaml, projectx.yaml, etc.), WHEN the server starts, THEN it loads every project found in the directory and exposes them via /api/projects.",
-    "GIVEN multiple projects loaded, WHEN the operator selects project X via the dashboard or `--project X` CLI flag, THEN subsequent /api/run* and /api/backlog* calls operate on X's config, backlog, worktree, and pipeline-state directory.",
-    "GIVEN the dashboard, WHEN the operator views it, THEN they see a project picker showing each project's actionable count + last run status + an active-project indicator.",
-    "GIVEN two operators run pipelines for two different projects on the same machine concurrently (not the same project, two different ones), WHEN both run, THEN they don't conflict \u2014 different code_locks, different worktrees, different masters.",
-    "GIVEN a project whose config does not declare `load_bearing_files` (PIPE-001 setting), WHEN plan_critic would gate, THEN it falls back to running on every non-trivial ticket (no path-glob arm; complexity arm only)."
-   ],
-   "decisions": [
-    "Registry = directory ~/.toshelabs/projects/, one file per project (NOT a single central manifest). Operator decision 2026-05-04. Rationale: simpler ops \u2014 adding a project is `cp template.yaml ~/.toshelabs/projects/newproj.yaml` and edit, no merge conflicts on a shared registry file. Pipeline enumerates the directory at startup.",
-    "Operator manages git for ~/.toshelabs/ via their existing mechanism (everything in ~/.toshelabs/ is already in git per user 2026-05-04). Pipeline does not touch git for that directory.",
-    "Intra-project parallel ticket execution = OUT of scope (operator decision 2026-05-04). Reasons: (a) master is shared; two cherry-picks at once corrupt history. (b) `files_likely_affected` is human-authored and unreliable, so file-overlap pre-flight is a guess. (c) Single Claude subscription rate-limit is shared; double-spend hits the 5h cap faster. (d) Worktree shared object storage has concurrent-git edge cases. Cross-project parallel is fine and gets supported for free.",
-    "Project ID = filename without .yaml extension (busydad.yaml \u2192 'busydad'). No separate `id:` field needed inside the file. Single source of truth (the filename) prevents drift."
-   ],
-   "open_questions": [],
-   "fix_plan": [
-    "Phase 1 \u2014 Multi-config loader",
-    "1. src/config.js: add loadAllConfigs(registryDir) that enumerates ~/.toshelabs/projects/*.yaml and returns a Map<projectId, config>. Fall back to single-config mode if registry dir doesn't exist (backwards compat for existing pipeline.config.yaml setups).",
-    "2. Each config carries its own _resolved paths (project_dir, backlog, worktree, etc.) \u2014 already per-config, no changes needed.",
-    "Phase 2 \u2014 Server routing",
-    "3. Server: maintain a Map<projectId, projectState> instead of single config + activePipeline. Each project gets its own EventEmitter (or namespaced events on a shared emitter \u2014 TBD).",
-    "4. /api/projects \u2192 list all loaded projects + their last status.",
-    "5. Project-scoped routes: /api/projects/{id}/backlog, /api/projects/{id}/run, /api/projects/{id}/status, etc.",
-    "6. Backwards-compat: top-level /api/backlog, /api/run still work, dispatch to a 'default' project (the first one or one named 'default').",
-    "Phase 3 \u2014 Dashboard",
-    "7. Project picker UI in public/index.html. Persist active-project selection in localStorage. Show actionable count per project in the picker.",
-    "8. Event stream: SSE /events?project=X filters to that project's events; ?project=all multiplexes.",
-    "Phase 4 \u2014 CLI",
-    "9. Add --project flag to the run command. Default to 'default' when single-config mode (no registry).",
-    "Phase 5 \u2014 Migration",
-    "10. Move busydad's pipeline.config.yaml \u2192 ~/.toshelabs/projects/busydad.yaml. Update CLAUDE.md and any operator docs that reference the old path.",
-    "11. Test: start server, see busydad in project list, run a busydad ticket via project-scoped API, verify isolated state."
-   ],
-   "files_likely_affected": [
-    "src/config.js (multi-config loader + registry enumeration)",
-    "src/server.js (per-project routing, project-scoped event filter)",
-    "public/index.html (project picker UI)",
-    "src/index.js / CLI entry (--project flag)",
-    "TICKET-SCHEMA.md (note schema is per-project, point at registry layout)",
-    "README.md (multi-project setup instructions)",
-    "~/.toshelabs/projects/busydad.yaml (new, migrated from pipeline.config.yaml)"
-   ],
-   "out_of_scope": [
-    "Intra-project parallel ticket execution (operator decision 2026-05-04: out of scope due to master/rate-limit/worktree shared-state hazards).",
-    "Cross-machine pipeline coordination \u2014 single host for now.",
-    "Project-level RBAC / multi-user \u2014 single operator.",
-    "Auto-discovery (scan ~/code/* for pipeline.config.yaml files) \u2014 explicit registry only."
-   ],
-   "landed_commit": "d89a818",
-   "shipped_note": "Server-side multi-project loader + /api/projects + activate route + --project CLI flag. Round-trip tested. DEFERRED: dashboard project picker UI, per-project SSE filtering, busydad config migration to ~/.toshelabs/projects/busydad.yaml (legacy path keeps working).",
-   "shipped_at": "2026-05-04"
-  },
-  {
-   "id": "PIPE-004",
-   "schema_version": 1,
-   "title": "Refuse worker edits outside configured code_dirs / docs_dir",
-   "status": "done",
-   "priority": "P2",
-   "type": "feature",
-   "complexity": "medium",
-   "area": "src/pipeline.js (PreToolUse hook for Edit/Write/MultiEdit), pipeline.config.yaml (code_dirs + docs_dir declarations)",
-   "reported": "2026-05-04",
-   "source": "Recurring class of bug: the docs_update worker step has been writing edits to canonical /home/toshe/busydad/memory/code_validation.md instead of the worktree path for weeks (BUG-262, 263, 264, 266 all leaked). Root cause was busydad CLAUDE.md hardcoding the absolute path; fixed structurally on 2026-05-03 by reorganising busydad to docs/ + state/ split. But the *mechanism* still exists: a worker can edit any path in the filesystem the subprocess can reach, and the pipeline only notices via post-hoc git diff.",
-   "description": "Add a per-project config block declaring the directories a worker is allowed to write into (`code_dirs`, `docs_dir`). Pipeline enforces via a PreToolUse hook on Edit/Write/MultiEdit/NotebookEdit: worker tool calls writing to paths outside the configured zones are rejected with a clear message. Closes the leak class regardless of project conventions.",
-   "user_impact": "Without enforcement, any future project's CLAUDE.md / docs / habits could re-introduce the same leak pattern. With enforcement, leaks are physically impossible \u2014 the worker cannot write outside the sandbox even if the prompt or convention drifts.",
-   "acceptance_criteria": [
-    "GIVEN a project config declares `code_dirs: [app/, backend/]` and `docs_dir: docs/`, WHEN a worker step issues an Edit on `/home/toshe/busydad/notes.md` (outside both), THEN the tool call is rejected with a clear PreToolUse hook error message naming the violation.",
-    "GIVEN the same config, WHEN a worker writes to `app/lib/foo.dart` or `docs/SPEC.md`, THEN the call proceeds normally.",
-    "GIVEN a step is `docs_update`, WHEN it tries to edit a path outside `docs_dir`, THEN it's rejected even if the path is inside `code_dirs` (per-step write zones \u2014 docs_update only touches docs).",
-    "GIVEN the rejection fires, WHEN the worker continues, THEN the rejection message is in the worker's tool_result stream so the LLM can adapt (typically: re-issue with the worktree-relative path).",
-    "GIVEN the project does not declare write zones, WHEN a worker edits anywhere, THEN the pipeline behaves as today (no enforcement; backwards compatible)."
-   ],
-   "decisions": [
-    "Per-step write zones, not just per-project. plan/tests_red/implement \u2192 code_dirs \u222a test_dirs. docs_update \u2192 docs_dir. review/root_cause \u2192 no writes (read-only). Configurable per step.",
-    "Enforcement via PreToolUse hook (the same mechanism Claude Code uses for permissions) \u2014 fires before the edit lands, so no rollback needed. Cleaner than post-hoc git diff inspection.",
-    "Reject message must be actionable \u2014 name the path, the configured zone, and suggest the worktree-relative equivalent if it's an obvious cwd-vs-canonical mistake."
-   ],
-   "fix_plan": [
-    "1. Define config block: per-step `write_zones: [pattern, ...]`. Defaults: plan/tests_red/implement get code_dirs+test_dirs; docs_update gets docs_dir; review/root_cause empty.",
-    "2. Implement the PreToolUse hook in spawnClaude \u2014 load the step's write_zones, intercept Edit/Write/MultiEdit/NotebookEdit, validate path against zones (glob match), reject with helpful message on miss.",
-    "3. Default write_zones to permissive (everything allowed) when not configured \u2014 backwards compat for projects that haven't migrated.",
-    "4. Configure busydad's write_zones in pipeline.config.yaml: code_dirs=[app/, backend/, feedback-admin/, extensions/, scripts/], docs_dir=docs/, test_dirs=[app/test/, backend/functions/test/].",
-    "5. Run a ticket end-to-end with enforcement on; verify docs_update can no longer leak; verify implement still touches what it needs to.",
-    "6. Document in TICKET-SCHEMA.md (project-config section) and add to PROD_SETUP.md equivalent in any future project."
-   ],
-   "files_likely_affected": [
-    "src/runner.js or src/pipeline.js (PreToolUse hook in spawnClaude)",
-    "pipeline.config.example.yaml (write_zones block per step)",
-    "src/config.js (resolve write_zone globs against project_dir)",
-    "TICKET-SCHEMA.md (note enforcement model)"
-   ],
-   "out_of_scope": [
-    "Read enforcement \u2014 workers can still read anywhere (needed for cross-cutting investigations).",
-    "Auto-detecting code_dirs from the project layout \u2014 explicit configuration only (otherwise we re-introduce the same drift problem in disguise).",
-    "Per-ticket write zone overrides \u2014 tickets don't get to widen the sandbox; if a ticket genuinely needs to touch outside, the project config gets a permanent extension."
-   ],
-   "landed_commit": "a3dc137",
-   "shipped_note": "Post-hoc detection via git diff inspection in worktree + canonical project_dir. busydad implement + docs_update opted into warn mode. DEFERRED: PreToolUse hook for true sandboxing; flip warn \u2192 strict once trusted.",
-   "shipped_at": "2026-05-04"
-  },
-  {
-   "id": "PIPE-005",
-   "schema_version": 1,
-   "title": "Full project settings editing in the dashboard \u2014 structured forms per section",
-   "status": "done",
-   "priority": "P3",
-   "type": "ux",
-   "complexity": "medium",
-   "area": "public/index.html (forms), src/server.js (PUT /api/projects/:id/config), src/config.js (atomic write + reload)",
-   "reported": "2026-05-04",
-   "source": "Operator request 2026-05-04: read-only settings panel shipped today (commit 72f0dbf) is insufficient \u2014 operator wants in-UI editing without opening YAML files. Toggle-only MVP (ticket_schema.mode, plan_critic.enabled, per-step write_zones.mode) shipping in a separate commit; this ticket covers the full structured-form editor.",
-   "description": "Per-section forms in the existing settings modal: ticket_filter (multi-select chips for status/priority/type orderings), ticket_schema (mode dropdown + overrides editor), plan_critic (enabled toggle + glob list editor), steps (per-step editor: model dropdown, max_turns numeric, tools chip-list, write_zones mode + allow-globs editor). Save writes the YAML atomically and triggers reloadConfig. Refused (409) during a pipeline run. Backup-before-write to the file's sibling .yaml.bak so a bad save can be rolled back. Show a diff preview on save with a confirm step.",
-   "user_impact": "Today operators edit pipeline.config.yaml or ~/.toshelabs/projects/*.yaml in a text editor and reload. For frequent flips (warn \u2192 strict, enabling plan_critic, adjusting write_zones globs) the YAML round-trip slows down iteration. Forms also catch typos that YAML doesn't (wrong mode value, malformed glob).",
-   "acceptance_criteria": [
-    "GIVEN no pipeline run is active, WHEN the operator changes a setting in the modal and clicks Save, THEN the project's YAML file is updated, reloadConfig is called, and the UI re-fetches /api/projects/:id to show the new state.",
-    "GIVEN a pipeline run IS active, WHEN the operator clicks Save, THEN the server returns 409 with a clear message and the modal surfaces it; no file write happens.",
-    "GIVEN any form field, WHEN the operator enters an invalid value (e.g. status not in enum, glob with malformed syntax), THEN the field is highlighted and Save is disabled until corrected.",
-    "GIVEN the YAML file before save, WHEN Save succeeds, THEN a sibling .yaml.bak is written first containing the pre-save content. Rollback = manual mv (or a future Restore button).",
-    "GIVEN a multi-section save (operator edited 3 sections at once), WHEN Save is clicked, THEN it's atomic \u2014 either all changes land or none."
-   ],
-   "fix_plan": [
-    "1. Server: PUT /api/projects/:id/config \u2014 body = full YAML-equivalent JSON. Backup, write, reloadConfig, return new resolved state.",
-    "2. UI: convert each section in the modal to a form. Submit-once-on-save (not per-field).",
-    "3. Add a Save button + diff-preview overlay. Confirm before commit.",
-    "4. Disable forms during a run; show a banner.",
-    "5. Document the .yaml.bak rollback path in TICKET-SCHEMA.md or a new docs/SETTINGS-EDITING.md."
-   ],
-   "out_of_scope": [
-    "Adding/removing entire steps (steps[] structural edits) \u2014 too easy to break the pipeline; operators do this in YAML.",
-    "Editing top-level metadata (project_dir, name) from the UI \u2014 these are identity fields, changing them is a project rename.",
-    "Schema overrides editor \u2014 covered separately in PIPE-005a if it gets filed; the JSON view in the modal is enough for now."
-   ],
-   "landed_commit": "f4e7b76",
-   "shipped_at": "2026-05-05",
-   "shipped_note": "PUT /api/projects/:id/config endpoint with backup + atomic write + reload. Dashboard Edit-YAML button with diff preview + confirm. Per-section structured forms deferred (YAML textarea covers all editing today). Round-trip verified."
-  },
-  {
-   "id": "PIPE-006",
-   "schema_version": 1,
-   "title": "MCP server \u2014 frontend interface for tickets + schema; files remain backend",
-   "status": "done",
-   "priority": "P1",
-   "type": "feature",
-   "complexity": "medium",
-   "area": "src/mcp/* (new), package.json (add @modelcontextprotocol/sdk), CLAUDE.md template for projects, TICKET-SCHEMA.md (consume-via-MCP section)",
-   "reported": "2026-05-04",
-   "source": "Operator decision 2026-05-04 \u2014 chose option A from the schema-publishing discussion. Today the schema is shipped as static files (TICKET-SCHEMA.md, schemas/ticket.v1.schema.json) and per-project CLAUDE.md additions. New projects need manual setup, schema bumps need manual re-pointing across every consumer, and there's no uniform way for an LLM in projectX to author a conformant ticket without re-implementing the contract.",
-   "description": "Expose the pipeline as an MCP server. Tools: list_projects(), get_schema(project), list_tickets(project, status?), get_ticket(project, id), create_ticket(project, ticket), update_ticket(project, id, patch), archive_ticket(project, id). Storage stays as the existing per-project YAML/JSON files (backwards-compat, hand-editable, gitignored). Validation server-side via the existing src/ticket-schema.js. Any Claude session that connects gets the schema at handshake and can author conformant tickets without copying the contract into its CLAUDE.md.",
-   "user_impact": "(a) Schema bumps propagate automatically \u2014 no per-project CLAUDE.md re-pointing. (b) New projects join the ecosystem by adding the MCP server connection, no boilerplate. (c) Cross-project visibility \u2014 list_tickets across all projects becomes a single call. (d) Foundational for PIPE-007 (pipeline self-improvement workflow) \u2014 the pipeline can have its own MCP-served backlog that any Claude session can write to.",
-   "acceptance_criteria": [
-    "GIVEN a Claude session connects to the MCP server, WHEN it calls get_schema('busydad'), THEN it receives the v1 schema with busydad's overrides applied (v2 status, P4 priority, chore/docs/manual types).",
-    "GIVEN a Claude session calls create_ticket('busydad', {...}), WHEN the ticket conforms to the schema, THEN it lands in busydad's state/backlog.json with schema_version=1 and the pipeline picks it up on next /api/backlog refresh.",
-    "GIVEN the same call with a non-conformant ticket, WHEN create_ticket runs, THEN it returns an error with field-level violations (same shape as ticket_rejected events) and writes nothing.",
-    "GIVEN multiple projects loaded, WHEN list_projects() is called, THEN it returns the same list as /api/projects.",
-    "GIVEN the busydad CLAUDE.md update, WHEN a new Claude session opens in busydad, THEN it's instructed to use the MCP create_ticket tool instead of editing state/backlog.json directly. Direct-edit still works (backwards-compat) but is documented as a fallback.",
-    "GIVEN the pipeline server is running, WHEN the MCP server is invoked (stdio transport), THEN it shares process state with the running pipeline (same emitter, same projects map). NOT a separate process \u2014 same Node process, MCP transport added alongside HTTP server."
-   ],
-   "decisions": [
-    "Files-as-backend (option A from the discussion). Storage doesn't move; just the API surface is unified.",
-    "Stdio transport (the standard for local MCP servers). HTTPS/SSE transport optional for cross-machine; defer.",
-    "MCP server runs in the same process as the pipeline server. Avoids state drift between two processes (event emitter, projects map, active project). Trade-off: pipeline crash = MCP also dies; acceptable since both are operator-managed local services.",
-    "Validation is shared with the HTTP path via the existing src/ticket-schema.js. Single source of truth \u2014 no chance of MCP and HTTP disagreeing on what's valid."
-   ],
-   "open_questions": [
-    "Q1: Tool naming \u2014 toshelabs.tickets.create vs create_ticket? Recommend the latter (shorter, MCP convention).",
-    "Q2: Authentication \u2014 none initially (local stdio only). Revisit if HTTPS transport is added.",
-    "Q3: Per-project MCP scoping \u2014 should there be a parameter on every tool call, or should the MCP session bind to one project at handshake? Recommend per-call parameter (more flexible; cross-project queries work without re-handshake)."
-   ],
-   "fix_plan": [
-    "Phase 1 \u2014 Skeleton",
-    "1. Add @modelcontextprotocol/sdk dep. Wire src/mcp/server.js to startServer() so it starts alongside HTTP.",
-    "2. Implement list_projects, get_schema, list_tickets \u2014 read-only first.",
-    "Phase 2 \u2014 Mutations",
-    "3. Implement create_ticket, update_ticket, archive_ticket. Use the same writeBacklog helper that existing routes use; keep behaviour identical.",
-    "4. Validation: every mutation runs through validateTicket with the project's effective schema (default + overrides).",
-    "Phase 3 \u2014 Documentation",
-    "5. TICKET-SCHEMA.md: add 'Authoring via MCP' section showing the recommended path.",
-    "6. busydad/CLAUDE.md: add 'When creating tickets, prefer the MCP create_ticket tool over editing state/backlog.json directly. Schema is fetched live via get_schema(busydad).'",
-    "Phase 4 \u2014 Validation",
-    "7. Test from a separate Claude session: connect to MCP, fetch schema, create a ticket, verify it appears in busydad's backlog AND passes the existing /api/backlog actionable query."
-   ],
-   "files_likely_affected": [
-    "src/mcp/server.js (new)",
-    "src/mcp/tools/{list_projects,get_schema,list_tickets,get_ticket,create_ticket,update_ticket,archive_ticket}.js (new)",
-    "src/server.js (start MCP alongside HTTP)",
-    "src/index.js (CLI flag --no-mcp if operator wants to disable)",
-    "src/backlog.js (writeBacklog helper, refactored from the existing inline writes)",
-    "package.json (@modelcontextprotocol/sdk dep)",
-    "TICKET-SCHEMA.md (Authoring via MCP section)",
-    "/home/toshe/busydad/CLAUDE.md (point at MCP)"
-   ],
-   "out_of_scope": [
-    "HTTPS / SSE transport \u2014 local stdio only for MVP.",
-    "Authentication / per-project ACL \u2014 single operator, single machine.",
-    "Migration to a real DB (option B from the discussion) \u2014 files stay; revisit when juggling 3+ projects.",
-    "Jira proxy (option C) \u2014 not the direction this project is heading."
-   ],
-   "landed_commit": "77cc7aa",
-   "shipped_at": "2026-05-04",
-   "shipped_note": "MCP server in-process with HTTP, files-as-backend. 7 tools shipped (list_projects, get_schema, list_tickets, get_ticket, create_ticket, update_ticket, archive_ticket). Stateless transport per SDK example. Validation runs server-side via shared src/ticket-schema.js. End-to-end smoke test passed: bad id rejected with pattern violation, valid ticket created/listed/archived round-trip clean. Out of scope: busydad CLAUDE.md update pointing at MCP (separate repo), HTTPS/auth (single-operator local), MCP resources surface."
-  },
-  {
-   "id": "PIPE-007",
-   "schema_version": 1,
-   "title": "Pipeline self-improvement workflow \u2014 track bugs/features for the pipeline itself",
-   "status": "done",
-   "priority": "P3",
-   "type": "ops",
-   "complexity": "small",
-   "area": "backlog/backlog.json (the pipeline's own backlog), docs (a new docs/PIPELINE-DEV.md), CLAUDE.md at the pipeline repo root",
-   "reported": "2026-05-04",
-   "source": "Operator question 2026-05-04: 'can the pipeline run tickets against itself? \u2014 perhaps not. then how do we capture bugs/features for the pipeline?' Today: pipeline bugs and features go into ~/toshelabs-pipeline/backlog/backlog.json (the pipeline's own backlog file, used in this session for PIPE-001..006). They're worked on through interactive sessions like this one, NOT through the pipeline's own SDLC, because the pipeline operates on external project repos (busydad) \u2014 running the pipeline against itself has circular-dependency risks (pipeline modifies pipeline mid-run).",
-   "description": "Document the pipeline's own self-improvement workflow as the explicit, sanctioned process: PIPE-* tickets live in ~/toshelabs-pipeline/backlog/backlog.json, conform to schema v1, are filed by the operator (or by Claude sessions through PIPE-006's MCP create_ticket once that lands), and are worked on in interactive sessions. The pipeline does NOT run against itself \u2014 that's a deliberate choice, not a missing feature. Once PIPE-006 lands, the pipeline's own backlog becomes MCP-accessible like any other project, so any Claude session can file pipeline tickets without re-implementing the schema.",
-   "acceptance_criteria": [
-    "GIVEN the pipeline repo, WHEN the operator (or an LLM) wants to file a pipeline bug or feature, THEN they have a clear documented path: append a ticket to ~/toshelabs-pipeline/backlog/backlog.json conforming to schema v1.",
-    "GIVEN PIPE-006 has shipped, WHEN an LLM session calls create_ticket('toshelabs-pipeline', {...}), THEN it works the same as any project's create_ticket and lands in the pipeline's backlog file.",
-    "GIVEN a docs/PIPELINE-DEV.md file, WHEN a new operator (or an onboarding session) reads it, THEN the self-improvement workflow is described in <100 lines: schema applies, tickets live in backlog/, no pipeline-against-itself runs, work happens interactively, MCP is the recommended authoring path post-PIPE-006."
-   ],
-   "decisions": [
-    "Pipeline does NOT run against itself. Reason: circular dependency. Pipeline runs by spawning Claude CLI, which would be modifying the pipeline source while the pipeline is interpreting it. Worktrees mitigate but don't eliminate the risk; the cost of a corrupted pipeline mid-self-modification is too high relative to the benefit (manual interactive sessions work fine).",
-    "Self-improvement is operator-driven + interactive. Always.",
-    "Once PIPE-006 ships, the pipeline becomes a 'project' in its own MCP namespace \u2014 same authoring path as any other project. No special-case API."
-   ],
-   "fix_plan": [
-    "1. Write docs/PIPELINE-DEV.md (new file in pipeline repo) \u2014 captures the self-improvement workflow.",
-    "2. Update README.md with a link to docs/PIPELINE-DEV.md from the contribution / development section.",
-    "3. Once PIPE-006 lands, update PIPELINE-DEV.md with the MCP create_ticket recipe."
-   ],
-   "out_of_scope": [
-    "Building self-hosting capability (pipeline-against-itself). Explicitly NOT a goal.",
-    "CI/CD for pipeline changes (no automated tests on commit). Future.",
-    "Pipeline release versioning. Future."
-   ],
-   "landed_commit": "f4e7b76",
-   "shipped_at": "2026-05-05",
-   "shipped_note": "docs/PIPELINE-DEV.md describes operator+Claude pattern, restart etiquette, ticket-shape conventions. README points at it."
-  },
-  {
-   "id": "PIPE-008",
-   "schema_version": 1,
-   "title": "Per-project Pipeline \u2014 concurrent runs across projects (drop activate-409)",
-   "status": "done",
-   "priority": "P1",
-   "type": "feature",
-   "complexity": "medium",
-   "area": "src/server.js (activePipelines map, project-scoped routes, status shape), public/index.html (SSE event filter, picker indicator)",
-   "reported": "2026-05-04",
-   "shipped_at": "2026-05-04",
-   "landed_commit": "55be660",
-   "shipped_note": "Replaces single activePipeline with Map<projectId, Pipeline>. Adds project-scoped run/stop/status endpoints. Drops activate 409. Per-project event tagging via emitter wrapper. Dashboard event filter + \u25cf running indicator in picker. Verified: busydad 7-ticket queue running, pension-ai activated mid-run with no 409, perProject map correctly reports busydad running and pension-ai idle.",
-   "source": "Operator pushed back 2026-05-04: 'i thought we can run two pipelines in parallel on different projects'. PIPE-003's original out-of-scope only covered intra-project parallel; cross-project parallel was claimed 'comes for free' but the implementation kept a single global activePipeline. This refactor closes that gap.",
-   "description": "Replace the global activePipeline with a Map<projectId, Pipeline>. Each Pipeline gets a project-tagging emitter wrapper. Per-project run/stop endpoints. Drop the activate-409 because switching projects is now just a display preference. Backwards-compat top-level endpoints dispatch to the active project's pipeline.",
-   "user_impact": "Two projects can run pipelines simultaneously without one blocking the other. Operator can switch the dashboard view between busydad and pension-ai mid-run, see both in the picker (\u25cf indicator), and inspect each project's settings independently.",
-   "acceptance_criteria": [
-    "GIVEN project A's pipeline is running, WHEN the operator activates project B, THEN no 409 fires.",
-    "GIVEN both projects loaded, WHEN POST /api/projects/A/run/all is called, THEN A starts and POST /api/projects/B/run/all also starts (no cross-blocking).",
-    "GIVEN both running, WHEN POST /api/projects/A/stop is called, THEN A halts and B keeps running.",
-    "GIVEN /api/status, WHEN polled, THEN runningProjects[] reflects all active pipelines and perProject{} is per-project running flags.",
-    "GIVEN dashboard SSE, WHEN events with project: A arrive while project B is the active view, THEN they don't render in the terminal feed but the picker indicator updates."
-   ]
-  },
-  {
-   "id": "PIPE-009",
-   "schema_version": 1,
-   "title": "Drop soft-stop semantic \u2014 /api/stop always SIGTERM (hard=false today is a lie)",
-   "status": "done",
-   "priority": "P2",
-   "type": "refactor",
-   "complexity": "small",
-   "area": "src/server.js (stopPipeline + /api/stop + /api/projects/:id/stop), public/index.html (stop button no longer takes a ?hard parameter), docs (TICKET-SCHEMA.md or future API doc)",
-   "reported": "2026-05-05",
-   "source": "Operator audit 2026-05-05: 'what does stop do now?' Reading the code revealed that /api/stop with hard=false (the default) calls pipeline.releaseLock() then returns status:'stopped' \u2014 but the pipeline keeps running. Subprocess unaffected, current step continues, next step starts, next ticket starts. The run only stops when it would have finished anyway. The lockfile gets deleted, which is genuinely dangerous: another process seeing the lock gone could think nothing is running and try to start a parallel pipeline against the same worktree.",
-   "description": "Remove the hard parameter from /api/stop and /api/projects/:id/stop. Both endpoints always SIGTERM the active Claude subprocess via Pipeline.stopActiveSubprocess() (which itself escalates to SIGKILL after 5s grace). Soft-stop semantic deleted entirely \u2014 it was misleading and the lock-release-without-stop side effect was actively harmful (race window where the lock looks free but a worker is still alive). Operators who want 'don't add more tickets but let the current one finish' get that semantic via a separate endpoint, filed as future work (PIPE-009b: drain endpoint).",
-   "user_impact": "(a) Stop button feels honest \u2014 clicking it actually stops the run, not just deletes the lockfile while the pipeline keeps eating tokens. (b) Eliminates the race where the lock appears free during a still-live run.",
-   "acceptance_criteria": [
-    "GIVEN /api/stop is POSTed with no body or query params, WHEN the active project's pipeline is running, THEN the active Claude subprocess receives SIGTERM, the step throws, pipeline.run() rejects, and the map entry is cleaned within seconds.",
-    "GIVEN /api/projects/:id/stop is POSTed, WHEN that specific project's pipeline is running, THEN same behavior, scoped to that project.",
-    "GIVEN a run is stopped, WHEN /api/status is queried, THEN running:false (no more lying that nothing's running while it actually is).",
-    "GIVEN the dashboard Stop button, WHEN clicked, THEN it sends POST /api/stop (no ?hard param) and the pipeline pill flips to Idle within seconds, not 'whenever the queue happens to drain'.",
-    "GIVEN the previously-existing hard query param or body field, WHEN sent, THEN it's ignored (no breakage; just a no-op since hard is now implicit always)."
-   ],
-   "decisions": [
-    "Operator decision 2026-05-05: option (b) from the discussion \u2014 remove soft-stop entirely instead of trying to make it actually stop something. The 'set a flag and stop at next checkpoint' alternative (option (a)) was discussed and rejected: a step boundary can be minutes away (flutter test, implement step) and minutes-of-graceful-stop isn't a useful semantic.",
-    "Subprocess SIGTERM with 5s SIGKILL escalation is the right default. Pipeline.stopActiveSubprocess already implements this; just always call it.",
-    "Drain semantic ('don't pull the next ticket') is filed as PIPE-009b future work, not bundled here."
-   ],
-   "fix_plan": [
-    "1. src/server.js stopPipeline: drop the hard parameter; always call stopActiveSubprocess. Update the comment to describe the actual behavior (no more 'soft stop = release lock and walk away' \u2014 that path is gone).",
-    "2. /api/stop and /api/projects/:id/stop: ignore hard query/body params (or 400 if anyone sends one \u2014 TBD; ignore is cheaper for backwards-compat).",
-    "3. public/index.html stop button: drop any ?hard=true wiring; just POST /api/stop.",
-    "4. Test: kick off busydad's queue, hit Stop, verify pipeline_stopped fires within seconds and the next /api/status shows running:false."
-   ],
-   "out_of_scope": [
-    "PIPE-009b drain endpoint (don't pull next ticket; let current finish). Separate ticket.",
-    "Changing Pipeline.stopActiveSubprocess's SIGTERM\u2192SIGKILL escalation timing.",
-    "Adding a confirmation modal on the dashboard Stop button."
-   ],
-   "landed_commit": "b522c94",
-   "shipped_at": "2026-05-05",
-   "shipped_note": "Stop is always decisive. /api/stop and /api/projects/:id/stop both SIGTERM the active subprocess (escalates to SIGKILL after 5s grace). Soft-stop deleted. Smoke-test: /api/stop idle returned 400 expected, restart cycle clean, no zombie."
-  },
-  {
-   "id": "PIPE-010",
-   "schema_version": 1,
-   "title": "Node startup defense against EADDRINUSE \u2014 retry listen, then exit(1) loud",
-   "status": "done",
-   "priority": "P3",
-   "type": "refactor",
-   "complexity": "small",
-   "area": "src/server.js (app.listen error handling + retry loop)",
-   "reported": "2026-05-05",
-   "source": "Operator hit a server zombie state on 2026-05-05: an old node-pipeline process was alive but the kernel hadn't released port 3847 yet when start.sh tried to launch the new one. Node fell into a 'Port already in use \u2014 running without UI server' fallback path: the process kept running but never bound the HTTP server, so MCP and the dashboard were unreachable. The operator only noticed when another session tried to use MCP. start.sh fix shipped in 9fc9dc8 (SIGTERM-then-poll-1s-then-SIGKILL) prevents the bind race externally, but the underlying Node behavior is still in the source as a fallback to a degraded mode that's worse than crashing.",
-   "description": "Replace Node's silent 'running without UI server' fallback with: (a) retry listen() every 100ms for up to 2s on EADDRINUSE \u2014 covers the residual race even if start.sh's SIGKILL fallback fired and the kernel needs an extra moment to reap the socket; (b) after 2s of retry, process.exit(1) with a clear log message naming the conflicting port. Refusing to start is better than running headless \u2014 the supervisor (start.sh, systemd, whatever) restarts; the operator notices immediately if the conflict persists.",
-   "user_impact": "Defense in depth with the start.sh fix. Today: if start.sh's pkill fails for any reason (parent dies between SIGTERM and SIGKILL, kernel reaping is slow, etc.), Node still falls into zombie mode and the operator gets a half-broken pipeline. With this: Node either binds successfully on retry, or exits loud and start.sh handles the restart.",
-   "acceptance_criteria": [
-    "GIVEN port :3847 is held by a dying process, WHEN node src/index.js --server is invoked, THEN listen() retries every 100ms for up to 2s before giving up.",
-    "GIVEN the retry succeeds, WHEN the dashboard is opened, THEN it works normally \u2014 no startup gap visible to the operator beyond the brief retry window.",
-    "GIVEN the retry exhausts (port still held after 2s), WHEN node fails the final listen attempt, THEN process.exit(1) with a stderr log: 'FATAL: port 3847 still bound after 2s retry; aborting.' (or similar).",
-    "GIVEN the current 'running without UI server' fallback, WHEN it would have fired today, THEN it does NOT fire \u2014 there is no longer a silent-degraded-mode path."
-   ],
-   "fix_plan": [
-    "1. src/server.js: wrap app.listen in a small retry loop. Either custom logic or use a library; custom is fine since the requirement is small.",
-    "2. Replace any existing console.log('Port 3847 already in use \u2014 running without UI server') (or whatever the exact string is) with the exit(1) path.",
-    "3. Test: kick off busydad pipeline, kill the server with start.sh stop+immediate-start, verify Node retries cleanly and binds within ~1s instead of falling through."
-   ],
-   "out_of_scope": [
-    "Configurable retry duration (2s is enough; if you need more, fix the cause not the symptom).",
-    "Health-check endpoint changes \u2014 orthogonal."
-   ],
-   "landed_commit": "b522c94",
-   "shipped_at": "2026-05-05",
-   "shipped_note": "listen() now retries every 100ms for up to 2s on EADDRINUSE. On retry exhaustion: process.exit(1) with FATAL message. Silent zombie-fallback removed. Smoke-test: starting a second server while first is bound printed FATAL and exited; first server stayed healthy."
-  },
-  {
-   "id": "PIPE-011",
-   "schema_version": 1,
-   "title": "Tighten /api/pipeline-states \u2014 async fs, correct filter, surface errors",
-   "status": "done",
-   "priority": "P3",
-   "type": "refactor",
-   "complexity": "small",
-   "area": "src/server.js (the /api/pipeline-states route)",
-   "reported": "2026-05-05",
-   "source": "Code review of b522c94 surfaced three issues in the pre-existing /api/pipeline-states endpoint that affects dashboard sidebar status indicator reliability.",
-   "description": "Endpoint reads pipeline-state JSON files to drive the per-row sidebar color cue. Three issues: (a) uses sync readFileSync inside an async route handler \u2014 blocks the event loop on every poll, (b) filename filter is /^[A-Za-z0-9_-]+\\.json$/ which excludes archive files like BUG-261B.salvaged-2026-05-03.json or BUG-261.failed-... that the dashboard might want to show; or alternately INCLUDES files it shouldnt by being too loose, (c) JSON parse errors are silently swallowed \u2014 a corrupt state file produces a missing dashboard entry with no log line.",
-   "user_impact": "Sidebar status indicator can be slow to update under load (event loop blocked on disk reads), and corrupt state files cause silent display gaps that operators only notice when they expect a status pill that never appears.",
-   "acceptance_criteria": [
-    "GIVEN the /api/pipeline-states endpoint, WHEN polled under load, THEN it uses async fs.readFile (not readFileSync) so the event loop stays responsive.",
-    "GIVEN the filename filter, WHEN it runs against the pipeline-state directory, THEN it explicitly distinguishes ACTIVE files (matching /^[A-Z][A-Z0-9]*-\\d+[A-Za-z]*\\.json$/ \u2014 same shape as ticket id) from ARCHIVED ones (with .failed-/.salvaged-/.closed- suffixes) and chooses one of the two clearly. Default: only active.",
-    "GIVEN a corrupt state file, WHEN the endpoint reads it, THEN it logs a warning with the file name and continues with the rest, instead of dropping the entry silently."
-   ],
-   "fix_plan": [
-    "1. Replace readFileSync with await readFile (already imported at the top of server.js).",
-    "2. Tighten the filename regex to match active state files only; archive variants get a separate code path or are ignored.",
-    "3. Per-file try/catch logs the file name on parse failure.",
-    "4. Smoke-test: poll the endpoint under load (e.g. ab -n 100), confirm no event-loop stalls; corrupt one file, confirm the warning fires."
-   ],
-   "out_of_scope": [
-    "Caching the response to reduce disk I/O \u2014 separate concern; revisit if the endpoint becomes a hotspot.",
-    "Adding more fields to the response shape \u2014 operators rely on the existing two (status + blocked_step)."
-   ],
-   "landed_commit": "f4e7b76",
-   "shipped_at": "2026-05-05",
-   "shipped_note": "async fs.readFile in Promise.all, explicit active-state filter, parse-error logs file name. Dashboard sidebar reflects only live tickets, archive variants hidden."
-  },
-  {
-   "id": "PIPE-013",
-   "schema_version": 1,
-   "title": "plan_critic budget calibration via backtest harness \u2014 re-enable after",
-   "status": "requested",
-   "priority": "P1",
-   "type": "ops",
-   "complexity": "small",
-   "area": "scripts/plan-critic-backtest.js (run it), pipeline.config.yaml + ~/.toshelabs/projects/busydad.yaml plan_critic settings",
-   "reported": "2026-05-05",
-   "source": "BUG-1001 hit a 180s plan_critic timeout in the autonomous overnight run. heal did not fire because shouldHeal returns false on timeout (intentional \u2014 same budget reproduces the non-result). Result: ticket failed at first attempt. plan_critic.enabled flipped to false on busydad to unblock the queue.",
-   "description": "PIPE-001 spec said the backtest harness (scripts/plan-critic-backtest.js) should be run BEFORE shipping the critic to validate the prompt + budget against archived plans. We never ran it. Run it now: feed L10N-1 + BUG-261 + BUG-262 archived plans + 2 control plans, measure typical convergence time, calibrate plan_critic.max_seconds to a value that gives the critic real time to investigate (probably 5-10 min for non-trivial busydad tickets) without burning all night on a single bad ticket. Then re-enable plan_critic.enabled=true on busydad.",
-   "user_impact": "Today plan_critic is shipped but inert (disabled on busydad). The L10N-class catch the critic was supposed to provide isnt active \u2014 any ticket whose plan asserts wrong framework behavior could ship a regression. Calibration unblocks the safety net.",
-   "acceptance_criteria": [
-    "GIVEN scripts/plan-critic-backtest.js, WHEN run with --bug-plan L10N-1 + BUG-261 + BUG-262 + --control-plan x2, THEN it produces a JSON report and prints PASS/FAIL against the acceptance bar.",
-    "GIVEN backtest passes, WHEN max_seconds is set to the 95th percentile observed convergence time + 60s buffer, THEN plan_critic.enabled is flipped to true on busydad and a smoke-test ticket runs cleanly through the critic."
-   ],
-   "fix_plan": [
-    "1. Run the backtest: node scripts/plan-critic-backtest.js --bug-plan ... --control-plan ... > backtest-report.json",
-    "2. Inspect convergence times. Pick a max_seconds value (95p + 60s buffer is a starting point).",
-    "3. Edit ~/.toshelabs/projects/busydad.yaml: plan_critic.enabled: true, plan_critic step max_seconds: <new value>.",
-    "4. Smoke-test: run a small ticket that touches a load-bearing file. Verify critic runs, converges, writes findings.",
-    "5. If still flaky: iterate on the prompt OR move to a step-by-step investigator pattern (PIPE-013b future work)."
-   ],
-   "out_of_scope": [
-    "Heal-on-timeout for plan_critic \u2014 shouldHeal-blocks-on-timeout is intentional (a second attempt with the same budget reliably reproduces the non-result). Bump the budget instead, or split the work.",
-    "Per-ticket dynamic budgets based on complexity \u2014 premature."
-   ]
-  },
-  {
-   "id": "PIPE-014",
-   "schema_version": 1,
-   "title": "/api/stop should halt the queue, not just kill the current step",
-   "status": "done",
-   "fixed_at": "2026-05-15",
-   "fix_notes": "Implemented as designed in fix_plan: Pipeline.requestStop() sets sticky stopRequested flag + kills subprocess. Checkpoints added at three loops \u2014 run() ticket loop, processTicket() step loop, runStepWithHealing() heal-attempt loop. catch in run() now marks state blocked (reason: user_stopped_via_api_stop) and breaks ticket loop instead of continue. server.js stopPipeline calls requestStop(). Manifested 2026-05-15 on predictor T-038: Stop killed plan subprocess but tests_red + implement still ran before ticket dead-ended on a gate failure.",
-   "_original_status": "requested",
-   "priority": "P2",
-   "type": "refactor",
-   "complexity": "small",
-   "area": "src/server.js (stopPipeline), src/pipeline.js (run loop graceful-exit signal)",
-   "reported": "2026-05-05",
-   "source": "During autonomous overnight run on 2026-05-05 I called POST /api/projects/busydad/stop to halt the run before editing config. The active step\u2019s subprocess was SIGTERMed (correct per PIPE-009) but Pipeline.run() then iterated to the next ticket and kept going. /api/status still showed running:true. Had to fall back to ./start.sh stop to actually halt.",
-   "description": "PIPE-009 made stop kill the active step. But Pipeline.run() catches step exceptions and moves to the next ticket \u2014 the queue continues. Need a stop_requested flag that the run() loop checks between tickets so the run actually halts after the current ticket fails/finishes. Implementation: Pipeline.requestStop() sets a flag; run() checks it at the top of the per-ticket iteration; if set, breaks the loop and exits cleanly. stopPipeline calls requestStop() before stopActiveSubprocess.",
-   "user_impact": "Operators who hit Stop expect the queue to halt, not the next ticket to start a few seconds later. Today they have to either ./start.sh stop the whole server or chain N stop calls (one per remaining ticket).",
-   "acceptance_criteria": [
-    "GIVEN a 5-ticket queue running, WHEN POST /api/projects/:id/stop is called mid-step, THEN the active step is SIGTERMed AND the queue is halted (no next ticket starts).",
-    "GIVEN the same scenario, WHEN /api/status is queried 10s later, THEN running:false for that project.",
-    "GIVEN the orchestrator\u2019s crash recovery, WHEN /api/projects/:id/run/all is called next, THEN the in-progress ticket is resumed cleanly via the existing crash-recovery path."
-   ],
-   "fix_plan": [
-    "1. src/pipeline.js: add this.stopRequested = false in constructor, requestStop() method that sets it to true.",
-    "2. run() loop: check this.stopRequested at the TOP of the per-ticket for-loop. If true, break + emit pipeline_stopped_by_request.",
-    "3. src/server.js stopPipeline: call pipeline.requestStop() before stopActiveSubprocess. Order matters \u2014 set the flag first so the queue exit path runs after the step throws.",
-    "4. Test: 3-ticket queue, hit stop after ticket 1, confirm ticket 2 doesnt start."
-   ],
-   "out_of_scope": [
-    "Mid-step graceful-stop checkpoints (let the step finish then stop). Filed historically as PIPE-009b future work; same reason as before \u2014 minutes-of-wait isnt useful semantic."
-   ]
-  },
-  {
-   "id": "PIPE-015",
-   "schema_version": 1,
-   "title": "spawn claude \u2014 retry on ENOENT + capture rich diagnostics",
-   "status": "done",
-   "priority": "P2",
-   "type": "ops",
-   "complexity": "small",
-   "area": "src/runner.js (trySpawnClaudeWithRetry helper, spawnClaude wrapper)",
-   "reported": "2026-05-06",
-   "source": "Overnight autonomous run on 2026-05-05 hit two intermittent 'spawn claude ENOENT' failures across ~100 spawns (~2%). Existing error handler dropped err.code/path/syscall and surfaced only 'Failed to spawn claude: spawn claude ENOENT' \u2014 no evidence to diagnose from. Likely cause is generic WSL filesystem flakiness or a fork/exec race; we don't have hard evidence and probably never will without rich diagnostics on every future occurrence.",
-   "description": "Wrap the OS-level spawn in a small retry helper: 5 attempts \u00d7 1s spacing on ENOENT, fail-fast on any other error code (EACCES/ENOMEM aren't transient). On every ENOENT log a structured diag \u2014 err.code/errno/syscall/path/spawnfile, the claudeBin we asked for, the PATH passed in env (truncated), and fs.realpath() of the binary at the moment of failure (null = file genuinely missing; truthy = transient race, file is actually on disk). Race the 'spawn' event vs 'error' to detect successful spawn deterministically.",
-   "user_impact": "Tickets no longer fail individually for a transient spawn race that resolves on the very next attempt. When a real persistent ENOENT does occur (PATH misconfiguration, claude uninstalled, etc.) the diag block tells the operator exactly what was missing and where it was looked for.",
-   "acceptance_criteria": [
-    "GIVEN claude is on PATH, WHEN spawnClaude runs, THEN it spawns successfully on attempt 1 and the diagnostic logs do not fire.",
-    "GIVEN a transient ENOENT, WHEN a subsequent retry succeeds, THEN '[runner] spawn claude OK on attempt N/5' is logged and the ticket continues normally.",
-    "GIVEN a persistent ENOENT, WHEN all 5 attempts fail, THEN the rejected error message includes attempt count + interval AND the rich diag (with realpath_of_claude_bin, path_env_head) is in the warn logs for every attempt.",
-    "GIVEN a non-ENOENT spawn error (EACCES etc.), WHEN it fires, THEN it surfaces immediately on attempt 1 (no retry)."
-   ],
-   "fix_plan": [
-    "1. src/runner.js: add trySpawnClaudeWithRetry(claudeBin, args, spawnOpts, onRetryDiag). Loop 5\u00d7, race proc.once('spawn') vs proc.once('error'), retry on ENOENT only.",
-    "2. On each ENOENT capture diag: err.code/errno/syscall/path/spawnfile + claudeBin + PATH env head + realpath() of claudeBin. console.warn with JSON.",
-    "3. Convert spawnClaude to async, await trySpawnClaudeWithRetry before the existing Promise wrapper. The post-spawn proc.on('error') handler stays as a backstop for rare post-spawn failures.",
-    "4. Smoke-test: normal pipeline run still works; verify no behavior change on the happy path."
-   ],
-   "out_of_scope": [
-    "Diagnosing the actual root cause of the WSL ENOENT \u2014 without evidence we'd be speculating. The diag captured here is the evidence collection step; a future ticket can investigate once we have one or two real diag blocks captured.",
-    "Exponential backoff or jitter \u2014 5 \u00d7 1s is fine for a ~2% transient; if we ever see clustered failures across many spawns we can revisit."
-   ]
-  },
-  {
-   "id": "PIPE-016",
-   "schema_version": 1,
-   "title": "planner: trace consumer surface when a change touches a type \u2014 close the cross-file blind spot",
-   "status": "requested",
-   "priority": "P2",
-   "type": "enhancement",
-   "complexity": "small",
-   "area": "prompts/plan.md (busydad + pension-ai), prompts in any future onboarded project",
-   "reported": "2026-05-06",
-   "source": "BUG-279 post-mortem (2026-05-06): planner produced a complete, well-architected plan for adding an `autoReminderSuppressed` field to EntryModel + the Drift Entries table. Implement followed faithfully. tests_green failed because nine pre-existing test fixtures construct Drift `Entry(...)` rows directly \u2014 Drift's `withDefault(Constant(false))` is a SQL-level default, not a Dart-constructor default, so the generated row class made the new field a required parameter and every fixture failed to compile. The planner's `files_to_change` list never included the consumer test fixtures because the prompt asks the planner to enumerate intended changes, not to enumerate downstream blast radius. Heals couldn't recover (see PIPE-017). Operator hand-finished the ticket.",
-   "description": "Extend prompts/plan.md with an explicit type-impact check before the planner finalises files_to_change. When the change adds a field, removes a field, or changes a constructor signature on a type, the planner must Grep the codebase for direct constructions of that type (test fixtures included) and add them to files_to_change with what_to_do='[fixture-update] add new field with default value'. The check is dirt-cheap (one extra Grep round) and addresses a recurring failure mode where the planner is locally correct but globally incomplete.",
-   "user_impact": "Today the pipeline silently fails on tickets that touch foundational types (EntryModel, ReminderModel, repository signatures) \u2014 heal can't see the consumer files, exhausts attempts, ticket marked failed, operator has to hand-finish. Adds 0\u201330s of planner time, prevents one or more hour-long ticket dead-ends per batch.",
-   "acceptance_criteria": [
-    "GIVEN a ticket whose plan adds a field to a type T, WHEN the planner produces files_to_change, THEN the list includes every file that constructs T directly (verified via Grep `T(`).",
-    "GIVEN a ticket that does NOT touch a type signature, WHEN the planner runs, THEN no spurious fixture-update entries appear (the check no-ops cleanly).",
-    "GIVEN a Drift table change adding a column, WHEN the planner runs, THEN the plan calls out that build_runner must regenerate code AND lists every direct Entry/RowClass constructor in the test tree."
-   ],
-   "fix_plan": [
-    "1. Read busydad/prompts/plan.md and pension-ai/prompts/plan.md (likely identical or near-identical).",
-    "2. Add a new section before files_to_change is emitted: 'Type-impact check \u2014 when your change adds/removes/changes a field on a class, OR adds a column to a Drift table, run Grep `<TypeName>(` across lib/ and test/. Every file that matches must appear in files_to_change with what_to_do = `[fixture-update] add <field>: <default-value>`. This is a hard requirement.'",
-    "3. Add a one-line example in the prompt: 'e.g. adding `autoReminderSuppressed` to EntryModel \u2192 grep `EntryModel(` AND `Entry(` (the Drift row class) \u2192 9 fixture files need a one-line addition.'",
-    "4. Smoke-test by re-running a ticket of similar shape and verifying the planner now lists fixture files. If it does not, iterate on the prompt wording.",
-    "5. Backport the prompt change to pension-ai once verified on busydad."
-   ],
-   "out_of_scope": [
-    "Static analysis tooling to enforce this \u2014 prompt-level guidance is enough for now; if it doesn't take, we revisit.",
-    "Auto-applying the fixture updates (planner declares, implement does the work \u2014 no change to roles)."
-   ]
-  },
-  {
-   "id": "PIPE-017",
-   "schema_version": 1,
-   "title": "heal: inject failing-test source into the prompt so heals can reason about cross-file breaks",
-   "status": "requested",
-   "priority": "P2",
-   "type": "enhancement",
-   "complexity": "medium",
-   "area": "src/pipeline.js (runStepWithHealing), prompts/implement.md (acknowledge new variable)",
-   "reported": "2026-05-06",
-   "source": "BUG-279 post-mortem (2026-05-06): tests_green reported `loading X` failures for two pre-existing test files the LLM had never read. The heal prompt knew the test NAMES but not the test SOURCE. The LLM's heal attempts saw 'tests_green failed: 2 new failures' and tried to fix the production code \u2014 they had no way to see the actual compile error or the unread fixture file. Heals exhausted, ticket failed. Same pattern would defeat any heal where the failure is in a file outside the LLM's working set.",
-   "description": "When tests_green hands a failure list to the heal step, also inject the source of each failing test file (truncated to first ~200 lines or 8KB, whichever is smaller \u2014 enough to capture imports + assertions). The heal then has the actual evidence: 'this fixture's Entry(...) call is missing your new required field' rather than 'a test failed somewhere'. Composes with PIPE-016 (planner-side prevention) \u2014 even when planner misses a consumer, heal can recover. Cost: a few thousand input tokens per heal attempt, almost all of it cache-hit on the retry.",
-   "user_impact": "Today, pipeline failures on cross-file breaks are unrecoverable without operator intervention. With PIPE-017 the heal can self-correct on first or second attempt for the broad class of 'I broke a consumer I didn't know existed'. Estimated to save 2\u20134 ticket-blocked-failed events per overnight batch on busydad-shaped projects.",
-   "acceptance_criteria": [
-    "GIVEN tests_green fails with new_failed_tests pointing at file F, WHEN the heal prompt is constructed, THEN F's source (first 200 lines) is appended to the prompt under a clearly-labeled heading.",
-    "GIVEN multiple failing test files, WHEN the heal runs, THEN each unique file's source is included once (deduped on path).",
-    "GIVEN a `loading X` failure (compile-time, no test name), WHEN the heal runs, THEN the source of X is included AND the heal prompt explicitly notes 'this file failed to compile \u2014 fix the import/type mismatch'.",
-    "GIVEN the source dump exceeds budget (e.g. 50+ failing files), WHEN the heal runs, THEN it caps at the top N (by failure count) and notes the truncation."
-   ],
-   "fix_plan": [
-    "1. src/pipeline.js: locate the tests_green heal-prompt construction. Identify where new_failed_tests is materialised into the heal context.",
-    "2. Add a helper readFailingTestSources(failures, projectDir, maxFiles=10, maxBytes=8192) that returns a Map<path, sourceSnippet>. Read each file once, slice to the cap, prepend `// File: <relative path>\\n` so the LLM knows which is which.",
-    "3. Append a section to the heal prompt: 'Failing test file sources (for compile-error / cross-cutting failures):\\n```dart\\n<dump>\\n```\\nCheck whether your changes broke imports or constructor calls in these files. If yes, update them as part of this heal.'",
-    "4. Update prompts/implement.md to acknowledge: 'You may receive failing test file sources in the heal prompt \u2014 treat them as additional files_to_change you must update or revert.'",
-    "5. Test on a synthetic ticket: add a required field to a widely-used type, watch first-attempt fail, watch heal succeed by updating fixtures.",
-    "6. Validate the cache-hit assumption: the heal prefix grows by ~5\u201310k input tokens, which should be cached on retry. Inspect cacheHitRatio metric on a real heal cycle to confirm."
-   ],
-   "out_of_scope": [
-    "Sourcemap-aware analysis (showing only the relevant function) \u2014 first version dumps the file head, simpler and more robust.",
-    "Symmetric injection for analyzer errors (PIPE-017b future work) \u2014 analyzer failures already include the file path AND the error site in the message; the marginal value of file source is lower there.",
-    "Automatic test rewriting \u2014 heal still has to reason about whether the test or the implementation is wrong; we just give it the source so reasoning is possible."
-   ]
-  },
-  {
-   "id": "PIPE-018",
-   "schema_version": 1,
-   "title": "think-loop: findings never feed back into the plan/implementation \u2014 best-result is the findings list, not a revised artifact",
-   "status": "requested",
-   "priority": "P1",
-   "type": "bug",
-   "complexity": "large",
-   "area": "src/think-loop.js (compare/bestResult handling), src/pipeline.js (think-loop call + reloadStepFromDisk)",
-   "reported": "2026-05-15",
-   "source": "predictor T-001 (2026-05-15): plan_critic correctly prescribed `rm -rf app/` before `flutter create`, but that fix never reached the executed plan. Root cause: when COMPARE returns BETTER, think-loop sets bestResult = challengeResult, but challengeResult is the JSON findings ARRAY, not a regenerated plan/implementation. So the loop 'improves' by replacing the plan with a list of complaints; the actual artifact the next step consumes is never revised from the findings. Critic insight is computed and discarded. Combined with worktree-mode this produced repeated false/structural findings.",
-   "acceptance": "When the challenger produces actionable findings and COMPARE rules them an improvement, the step's actual output artifact (plan JSON / code) is regenerated incorporating the findings before the next step consumes it; a follow-up challenge on the revised artifact no longer re-raises the same finding. Add a regression test that a prescribed plan fix (e.g. an added pre-step) appears in the finalized plan."
-  }
- ]
+  "schema": "backlog-v1",
+  "updated_at": "2026-05-17",
+  "_last_session_note": "2026-05-17 \u2014 predictor run review: shipped tests_green crash-gate fix + predictor backend extras config + PIPE-018 review-step kind:'code' fix. Filed PIPE-020 (dependency-ordering). T-023 keystone failed (purchases_flutter v10 API: gateway typed Future<CustomerInfo> but v10 returns Future<PurchaseResult>); T-024/26/27 merged hollow, T-025 cascade-blocked. Re-queue plan: T-023 first.",
+  "tickets": [
+    {
+      "id": "PIPE-001",
+      "title": "Add `plan_critic` phase between plan and tests_red \u2014 falsify plan claims before code is written",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "pipeline.config.yaml, prompts/plan_critic.md (new), src/* (phase wiring), pipeline-state schema (new step entry), prompts/tests_red.md (consume critic findings)",
+      "reported": "2026-05-03",
+      "source": "Concrete escape: busydad ticket L10N-1 (commit f90db04, v1.0.99). Pipeline ran plan \u2192 tests_red \u2192 implement \u2192 review \u2192 done, all phases green, but the plan's `edge_cases` array contained the unverified claim 'AppLocalizations.delegate.isSupported checks languageCode only \u2014 en_GB matches \"en\", so app strings still load correctly'. That claim is false (the generated AppLocalizations delegate matches the full Locale, not just languageCode). Tests_red wrote tests consistent with the wrong claim; implement built code consistent with it; review compared code to plan and passed both wrong-against-wrong. Result: every Bulgarian-locale phone (and ~47 other Material-supported / AppLocalizations-unsupported locales) crashed on first frame in production. The existing `think_challenge` self-prompt on the plan step is not enough \u2014 it ran on L10N-1 and still missed it. Self-critique inside the same session is structurally weaker than a separate session with a separate prompt and grounding access. Full forensic in busydad memory/backlog.json BUG-267.source.",
+      "description": "Insert a new pipeline phase named `plan_critic` between `plan` and `tests_red`. Phase reads the plan output (especially `edge_cases`, `risk`, and any sentence asserting framework / library / runtime behaviour) and emits structured findings, each of which must include a concrete falsifying input and a proposed test that would fail if the claim is wrong. Findings are auto-promoted into mandatory tests_red cases. Phase runs in a fresh Claude session with adversarial framing and grounding access (web fetch + framework source read), so it has actual ground truth, not just the same prior that produced the buggy plan.",
+      "user_impact": "Catches the failure mode that produces L10N-class escapes \u2014 coherent wrongness across plan/tests/implementation built on a single false belief. Each escape today costs multiple downstream tickets to remediate (BUG-261A, BUG-261B, BUG-267 for L10N-1 alone) plus user trust. Catch-rate target: would have caught L10N-1, BUG-261 root cause, and at least one of BUG-262 / BUG-266 in backtest.",
+      "acceptance_criteria": [
+        "GIVEN a ticket whose `complexity` is not `trivial`, WHEN the pipeline transitions out of the `plan` step, THEN the new `plan_critic` step runs before `tests_red` is started.",
+        "GIVEN a ticket of ANY complexity (including trivial/small) whose plan touches any load-bearing file, WHEN the plan completes, THEN `plan_critic` runs regardless. Side rule: if a small/trivial-complexity ticket plan ends up touching a load-bearing file, the planner SHOULD also reconsider whether the complexity tag was honest \u2014 bumping a load-bearing change from trivial to medium prevents the regression-test gap that small/trivial tickets explicitly defer.",
+        "GIVEN a ticket whose `complexity` is `trivial` AND that does not touch a load-bearing file, WHEN the plan completes, THEN `plan_critic` is skipped and the pipeline proceeds directly to `tests_red`.",
+        "GIVEN `plan_critic` runs, WHEN it produces output, THEN the output validates against a strict JSON schema: array of objects with required keys `claim_under_test` (string, must quote text from the plan), `concrete_falsifier` (string, must be a specific input value, not a category), `proposed_test` (string, runnable test description). Free-form prose, vague objections, or findings without all three fields are rejected by the validator and do not count as findings.",
+        "GIVEN `plan_critic` returns one or more valid findings, WHEN the pipeline transitions to `tests_red`, THEN the tests_red prompt is given the findings as MANDATORY test cases (must be present in `test_files`/`test_names` of the tests_red output, otherwise tests_red fails its `covers_plan_criteria` rule).",
+        "GIVEN `plan_critic` finds at least one issue AND the planner revises the plan, WHEN the revised plan is produced, THEN `plan_critic` runs ONCE more on the revision (loop bound = 1). If the second pass still objects, the plan ships and downstream phases proceed \u2014 preventing infinite loops.",
+        "GIVEN `plan_critic` runs, WHEN it exceeds 90 seconds wall-clock OR 25,000 tokens of output, THEN it is terminated; whatever valid findings it has produced are used; absence of findings under cap is treated as 'no objections'.",
+        "GIVEN the `plan_critic` step itself errors (model error, timeout, infra failure), WHEN the pipeline is configured with `plan_critic.heal_attempts = 0`, THEN the step does not retry; the operator is paged and the ticket halts at this step rather than silently skipping.",
+        "GIVEN the new phase is added, WHEN the existing pipeline-state schema is updated, THEN every ticket file in `projects/{name}/pipeline-state/` includes a `plan_critic` block (status, completed_at, findings[], dismissed_findings[], skipped_reason if applicable). Old files without the block are treated as `skipped: legacy` and do not break replay.",
+        "GIVEN the planner explicitly disagrees with a critic finding (knows it's out of scope), WHEN the planner produces the revised plan, THEN it MAY include a `dismissed_findings: [{finding_id, rationale}]` array. Dismissed findings are preserved in pipeline-state for audit. Silent dismissal (omitting a finding without acknowledging it in dismissed_findings) is forbidden \u2014 tests_red MUST cover every non-dismissed finding.",
+        "Backtest: GIVEN we re-run `plan_critic` against the archived plans for L10N-1, BUG-261 (root cause), BUG-262, and two arbitrary 'shipped fine' tickets, WHEN we measure findings, THEN L10N-1's plan must produce a finding whose `claim_under_test` quotes the AppLocalizations languageCode sentence AND whose `concrete_falsifier` is a non-en languageCode (e.g. `bg_BG`, `de_DE`). Catch rate on the three real bug plans must be \u2265 2/3. False-positive rate on the two control plans must be < 3 findings each (calibration check)."
+      ],
+      "decisions": [
+        "Model = Opus (not Sonnet). Rationale: by busydad CLAUDE.md rule 28, all analysis is Opus; Sonnet only writes code from a clear spec. Plan-critic IS analysis \u2014 the highest-judgment phase in the pipeline. Putting Sonnet on the rebuttal of an Opus plan is structurally backwards (weaker model, same prior bias). Cost is acceptable: ~$0.70/ticket Opus, gated to ~70% of tickets, ~$5/night. One escaped L10N-class bug costs more in remediation alone.",
+        "Insertion point = between `plan` and `tests_red` (NOT post-implement). Catching flaws before code is written avoids the cost of bouncing implement \u2192 tests \u2192 back to plan, and keeps the critic findings scoped to a stable artefact (the plan) rather than a moving one (the diff).",
+        "Output contract = strict JSON ({claim_under_test, concrete_falsifier, proposed_test}). Rationale: free-form critique is the failure mode we're trying to leave behind. If the critic cannot produce a concrete falsifier, the finding is not real \u2014 vague concerns inflate the test suite without raising quality.",
+        "Loop bound = 1 (one critic \u2192 one revise \u2192 one re-critic \u2192 ship). Operator decision 2026-05-04: re-pass enabled to capture revision-quality value, but bound stays at 1 to avoid infinite revision/objection loops.",
+        "Grounding = web fetch + repo file read enabled for the critic. Operator decision 2026-05-04: critic gets ALL tools (Read, WebFetch, Grep, Glob, Bash for read-only inspection). Rationale: L10N-1's specific failure was misunderstanding framework behaviour. A critic with no access to actual flutter source / docs has the same prior as the planner and will rubber-stamp the same false claims (LLM-vs-LLM theatre). With grounding, the critic can verify 'AppLocalizations.delegate.isSupported' by reading the generated source.",
+        "Keep the existing `think_challenge` self-prompt on the plan step. The two are complementary: think_challenge nudges the planner toward humility cheaply; plan_critic provides an independent adversarial pass with grounding. Removing think_challenge saves nothing measurable and weakens the cheap first line of defence.",
+        "Gate is single-arm (operator decision 2026-05-04, dropping the original three-arm proposal): `complexity != trivial` OR `plan.files_to_change \u2229 load_bearing_files \u2260 \u2205`. The original `risk_area_tags` arm was dropped \u2014 tags are too much backlog-hygiene burden across multiple projects, and the load-bearing files glob covers the same ground for any project that maintains its file list.",
+        "Side rule (operator decision 2026-05-04): if a small/trivial-complexity ticket's plan ends up touching a load-bearing file, the planner SHOULD reconsider whether the complexity was honest \u2014 small/trivial tickets explicitly skip regression testing, and load-bearing files demand it. The critic still runs in this case, but the ticket should likely be re-graded to medium.",
+        "Planner override path (operator decision 2026-05-04): the planner MAY dismiss a critic finding by adding it to a `dismissed_findings: [{finding_id, rationale}]` array on the revised plan. Dismissals are preserved in pipeline-state for audit. NO silent dismissal \u2014 tests_red enforces coverage of every non-dismissed finding."
+      ],
+      "open_questions": [
+        "RESOLVED Q1 (load-bearing files list \u2014 busydad starting set): app/lib/app.dart, app/lib/main.dart, app/lib/core/routing/**, app/lib/core/auth/**, app/lib/l10n/**, app/lib/data/sync/**, app/lib/data/local/database.dart, app/lib/data/migrations/**, backend/functions/src/parseInput/**, backend/functions/src/auth/**, firestore.rules, storage.rules. Per-project, declared in pipeline.config.yaml under `plan_critic.load_bearing_files`. Operator approved 2026-05-04 + author may extend.",
+        "RESOLVED Q2 (risk-area tags): dropped. Gate is single-arm \u2014 complexity OR load-bearing files only. Tags add too much backlog-hygiene burden across projects.",
+        "RESOLVED Q3 (critic tool budget): all tools (Read, WebFetch, Grep, Glob, read-only Bash). Operator approved 2026-05-04.",
+        "RESOLVED Q4 (re-pass on revision): enabled. One critic \u2192 revise \u2192 one re-critic \u2192 ship. Loop bound = 1.",
+        "RESOLVED Q5 (planner override): dismissed_findings array with rationale, preserved in pipeline-state. No silent dismissal."
+      ],
+      "fix_plan": [
+        "Phase 0 \u2014 Spec & approval",
+        "1. Write docs/proposals/PLAN-CRITIC.md: rationale (L10N-1 worked example), the three-arm gate, phase contract, output schema, loop bound, token cap (no wall-clock cap \u2014 Opus needs ~3 min), backtest plan. Get operator sign-off on the open questions Q1-Q5 before any code.",
+        "Phase 1 \u2014 Backtest harness (validates the design before we ship it)",
+        "2. Build a small harness in scripts/ that loads a historical plan JSON, runs the proposed plan_critic prompt against it (Opus, no wall-clock cap, 25K output cap, structured output), and emits the findings. Run against archived plans for L10N-1, BUG-261, BUG-262, and two 'shipped fine' control tickets (operator picks). Record per-run wall time so we can size monitoring/alerting later \u2014 informational, not a gate.",
+        "3. Acceptance bar (matches AC backtest entry): L10N-1 plan must yield a finding quoting the AppLocalizations languageCode sentence with a non-en falsifier; total catch \u2265 2/3 on the bug set; controls < 3 findings each. If the bar is not met, iterate on the prompt before shipping.",
+        "Phase 2 \u2014 Implement the phase",
+        "4. New file prompts/plan_critic.md. Adversarial framing. Required output schema embedded. Explicit anti-vagueness rules ('reject any finding without a concrete falsifier'). Grounding instructions: when a plan asserts third-party / framework behaviour, verify by reading the relevant source or docs before producing a finding (or before letting the claim pass).",
+        "5. Edit pipeline.config.yaml: add `plan_critic` step between `plan` and `tests_red`. Fields: prompt_template, model=opus, max_output_tokens=25000, heal_attempts=0, allowed_tools=[Read, WebFetch]. NO wall-clock cap \u2014 Opus on adversarial review with grounding takes ~3 minutes; constraint is the token budget, not the clock.",
+        "6. Edit pipeline.config.yaml gate: add `gate` block on the plan_critic step expressing the three-arm rule. Implementation: src/* gating helper that takes (ticket, plan_output) and returns boolean. Read the load-bearing files list and risk-area tag set from config, not hard-coded.",
+        "7. Update pipeline-state schema (pipeline-schema.md or equivalent in src/): new `plan_critic` block with fields {status, started_at, completed_at, gated_in (bool + reason), findings: [{claim_under_test, concrete_falsifier, proposed_test, dismissed: bool, dismissed_rationale: string|null}], skipped_reason}.",
+        "Phase 3 \u2014 Wire findings into tests_red",
+        "8. Edit prompts/tests_red.md to inject `plan_critic.findings` (non-dismissed) as MANDATORY test cases. Add a validator rule (`covers_plan_critic_findings`) that fails tests_red if any non-dismissed finding lacks a corresponding test_name in tests_red output.",
+        "Phase 4 \u2014 Validation",
+        "9. Dry-run on a low-stakes ticket from busydad backlog (operator picks). Confirm the new phase runs, gate behaves, output validates, tests_red consumes findings.",
+        "10. Run against next 5-10 nightly tickets. Collect: was it gated in or skipped, how many findings, were they real, did tests_red incorporate them, did the ticket complete green. Tune the prompt if false-positive rate > 30% or catch rate is invisible.",
+        "Phase 5 \u2014 Document",
+        "11. Update README.md with the new phase. Add a one-pager docs/PLAN-CRITIC.md summarising the contract for future operators."
+      ],
+      "files_likely_affected": [
+        "/home/toshe/toshelabs-pipeline/docs/proposals/PLAN-CRITIC.md (new)",
+        "/home/toshe/toshelabs-pipeline/docs/PLAN-CRITIC.md (new \u2014 operator-facing summary)",
+        "/home/toshe/toshelabs-pipeline/prompts/plan_critic.md (new)",
+        "/home/toshe/toshelabs-pipeline/prompts/tests_red.md (edit \u2014 consume findings)",
+        "/home/toshe/toshelabs-pipeline/pipeline.config.yaml (edit \u2014 add step + gate config)",
+        "/home/toshe/toshelabs-pipeline/src/* (edit \u2014 phase wiring, gate helper, schema update; exact files TBD on inspection)",
+        "/home/toshe/toshelabs-pipeline/scripts/plan-critic-backtest.* (new \u2014 harness for Phase 1)",
+        "/home/toshe/toshelabs-pipeline/README.md (edit \u2014 document new phase)"
+      ],
+      "out_of_scope": [
+        "Tightening the `complexity` enum in busydad's memory/backlog.json (currently 24+ free-form strings observed). Filed separately.",
+        "Adding adversarial steps to other phases (review, implement). The plan is the highest-leverage point; revisit after PIPE-001 has 4 weeks of production data.",
+        "Replacing the existing `think_challenge` self-prompt on the plan step. Complementary, not redundant.",
+        "Cross-ticket pattern detection ('the last 5 plans all assumed X'). Future work."
+      ],
+      "landed_commit": "f3f4db8",
+      "shipped_note": "Infrastructure shipped (prompt, step config, gate logic, backtest harness). DEFERRED: actual backtest run against archived plans, tests_red consumption of findings, dismissed_findings audit path, re-pass loop. File as PIPE-005 if/when ready.",
+      "shipped_at": "2026-05-04"
+    },
+    {
+      "id": "PIPE-002",
+      "schema_version": 1,
+      "title": "Backfill non-conformant tickets to schema v1, then flip ticket_schema.mode from warn to strict",
+      "status": "done",
+      "priority": "P1",
+      "type": "ops",
+      "complexity": "small",
+      "area": "scripts/migrate-tickets-vN-to-vM.{js,py} (new), per-project pipeline.config.yaml mode flip, project backlog files",
+      "reported": "2026-05-04",
+      "source": "Schema validator landed in commit 29c4475 in `warn` mode \u2014 busydad's BUG-266 already fails validation (missing schema_version, complexity: \"unknown\"). Validator is currently a no-op for queue inclusion; the contract is documented but not enforced. Until tickets are backfilled to v1, flipping to strict would reject every existing ticket and freeze the pipeline.",
+      "description": "Write a one-time migration pass that loads a project's backlog file, validates each ticket against schema v1, and either auto-fixes mechanical violations (add `schema_version: 1`, coerce known complexity strings into the enum, drop free-form prose from `status` into `description`) or flags tickets requiring manual triage. Then flip ticket_schema.mode from warn \u2192 strict in the project config and verify the next pipeline run passes validation cleanly.",
+      "user_impact": "Until this lands, the schema is documentation, not enforcement \u2014 the entire point of shipping the validator. Producers (operator + LLMs in busydad CLAUDE.md) won't get fast feedback on non-conformant tickets because warn mode just logs and keeps going.",
+      "acceptance_criteria": [
+        "GIVEN a project's backlog with N non-conformant tickets, WHEN the migration script runs in --dry-run, THEN it prints a per-ticket diff of proposed changes without writing.",
+        "GIVEN the same backlog, WHEN the migration runs without --dry-run, THEN every auto-fixable ticket is rewritten in place, irrecoverable tickets are flagged for manual triage, and a summary report is printed (auto-fixed: N, manual: M, untouched: K).",
+        "GIVEN busydad's backlog after migration, WHEN the pipeline loads with ticket_schema.mode=strict, THEN no ticket_rejected events fire and `actionable` count is preserved.",
+        "GIVEN the migration is idempotent, WHEN run a second time on the same backlog, THEN it produces zero changes (auto-fixed: 0)."
+      ],
+      "decisions": [
+        "Migration is per-project, invoked manually (not auto-run on pipeline startup) \u2014 auto-migration on a live backlog risks operator-edits being overwritten between sessions.",
+        "Auto-fix scope is mechanical only. Anything semantic (e.g. \"this `complexity: huge` should be `large`\" \u2014 fine; \"this `status: 'COMPLETE \u2014 three fixes...'` \u2014 flag for manual triage, do NOT guess) goes to the manual pile.",
+        "The flip to strict happens per-project, in a separate config commit. A project can sit in warn indefinitely if its backlog hygiene isn't ready."
+      ],
+      "fix_plan": [
+        "1. Write scripts/migrate-tickets.js that loads a backlog, validates each ticket against schema v1 via src/ticket-schema.js, and produces an auto-fix plan (--dry-run by default).",
+        "2. Define mechanical auto-fixes: add schema_version=1, coerce complexity from {unknown, tiny, mini} \u2192 {trivial, small} via a hardcoded map (operator can extend), strip prose from status into description for entries matching `^[A-Z]+\\s\u2014\\s` patterns.",
+        "3. Anything not auto-fixable: write to a `<id>.needs_triage.json` sidecar with the violations, leave the ticket untouched in backlog.",
+        "4. Run on busydad's state/backlog.json; review the diff; apply.",
+        "5. Flip pipeline.config.yaml ticket_schema.mode to strict for busydad. Restart pipeline. Confirm zero rejections.",
+        "6. Document in TICKET-SCHEMA.md under \"Versioning\" \u2014 \"How to migrate from version N to N+1: write scripts/migrate-tickets-N-to-M.js, follow the auto-fix-then-flag pattern\"."
+      ],
+      "files_likely_affected": [
+        "scripts/migrate-tickets.js (new)",
+        "TICKET-SCHEMA.md (extend Versioning section)",
+        "pipeline.config.yaml on each project (mode flip; not in this repo)"
+      ],
+      "out_of_scope": [
+        "Schema v2 (no v2 yet; flip happens when one is needed).",
+        "Cross-project orchestration (PIPE-003 territory).",
+        "Migrating busydad's state/backlog-v2.json \u2014 that file is a separate roadmap pile, not pipeline-actionable; same migration script could process it but isn't required for PIPE-002 to be done."
+      ],
+      "landed_commit": "5d0104e",
+      "shipped_note": "Migration script + busydad backfill to schema v1 + flip to strict mode. 1 manual triage case (T-84 has 7-char title \u2014 operator should re-title).",
+      "shipped_at": "2026-05-04"
+    },
+    {
+      "id": "PIPE-003",
+      "schema_version": 1,
+      "title": "Multi-project support \u2014 per-project config registry, project switcher (parallel work descoped)",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "config registry (new), src/server.js (project selector + per-project lifecycle), src/pipeline.js (parallel-runner support), public/index.html (project picker), CLI",
+      "reported": "2026-05-04",
+      "source": "Explicit user direction 2026-05-03/04: 'the pipeline should be generic - we can use it to build any project - not just busydad - should follow project based configuration' + 'i want to be able to switch between projects'. Today the pipeline is single-project (pipeline.config.yaml hard-coded to busydad). Operator descoped intra-project parallel ticket execution 2026-05-04 \u2014 too many shared-state hazards (master, rate limit, worktree object storage); cross-project parallel comes for free since different projects already have different locks and different masters.",
+      "description": "Generalise the pipeline to host multiple projects with a directory-based registry, expose a project selector in the dashboard + CLI, and cleanly isolate per-project state. Cross-project parallel runs (two projects' pipelines active simultaneously) come for free since projects already use separate code_locks. Intra-project parallel ticket execution is OUT of scope per operator decision.",
+      "user_impact": "Today's pipeline is a single-tenant tool effectively dedicated to busydad. Generalising unlocks: (a) running pipeline against any future project the user starts, (b) parallel ticket throughput within a project (multi-runner), (c) multiple projects active concurrently. Without this, every new project requires duplicating the pipeline binary + config.",
+      "acceptance_criteria": [
+        "GIVEN a directory `~/.toshelabs/projects/` containing one YAML file per project (busydad.yaml, projectx.yaml, etc.), WHEN the server starts, THEN it loads every project found in the directory and exposes them via /api/projects.",
+        "GIVEN multiple projects loaded, WHEN the operator selects project X via the dashboard or `--project X` CLI flag, THEN subsequent /api/run* and /api/backlog* calls operate on X's config, backlog, worktree, and pipeline-state directory.",
+        "GIVEN the dashboard, WHEN the operator views it, THEN they see a project picker showing each project's actionable count + last run status + an active-project indicator.",
+        "GIVEN two operators run pipelines for two different projects on the same machine concurrently (not the same project, two different ones), WHEN both run, THEN they don't conflict \u2014 different code_locks, different worktrees, different masters.",
+        "GIVEN a project whose config does not declare `load_bearing_files` (PIPE-001 setting), WHEN plan_critic would gate, THEN it falls back to running on every non-trivial ticket (no path-glob arm; complexity arm only)."
+      ],
+      "decisions": [
+        "Registry = directory ~/.toshelabs/projects/, one file per project (NOT a single central manifest). Operator decision 2026-05-04. Rationale: simpler ops \u2014 adding a project is `cp template.yaml ~/.toshelabs/projects/newproj.yaml` and edit, no merge conflicts on a shared registry file. Pipeline enumerates the directory at startup.",
+        "Operator manages git for ~/.toshelabs/ via their existing mechanism (everything in ~/.toshelabs/ is already in git per user 2026-05-04). Pipeline does not touch git for that directory.",
+        "Intra-project parallel ticket execution = OUT of scope (operator decision 2026-05-04). Reasons: (a) master is shared; two cherry-picks at once corrupt history. (b) `files_likely_affected` is human-authored and unreliable, so file-overlap pre-flight is a guess. (c) Single Claude subscription rate-limit is shared; double-spend hits the 5h cap faster. (d) Worktree shared object storage has concurrent-git edge cases. Cross-project parallel is fine and gets supported for free.",
+        "Project ID = filename without .yaml extension (busydad.yaml \u2192 'busydad'). No separate `id:` field needed inside the file. Single source of truth (the filename) prevents drift."
+      ],
+      "open_questions": [],
+      "fix_plan": [
+        "Phase 1 \u2014 Multi-config loader",
+        "1. src/config.js: add loadAllConfigs(registryDir) that enumerates ~/.toshelabs/projects/*.yaml and returns a Map<projectId, config>. Fall back to single-config mode if registry dir doesn't exist (backwards compat for existing pipeline.config.yaml setups).",
+        "2. Each config carries its own _resolved paths (project_dir, backlog, worktree, etc.) \u2014 already per-config, no changes needed.",
+        "Phase 2 \u2014 Server routing",
+        "3. Server: maintain a Map<projectId, projectState> instead of single config + activePipeline. Each project gets its own EventEmitter (or namespaced events on a shared emitter \u2014 TBD).",
+        "4. /api/projects \u2192 list all loaded projects + their last status.",
+        "5. Project-scoped routes: /api/projects/{id}/backlog, /api/projects/{id}/run, /api/projects/{id}/status, etc.",
+        "6. Backwards-compat: top-level /api/backlog, /api/run still work, dispatch to a 'default' project (the first one or one named 'default').",
+        "Phase 3 \u2014 Dashboard",
+        "7. Project picker UI in public/index.html. Persist active-project selection in localStorage. Show actionable count per project in the picker.",
+        "8. Event stream: SSE /events?project=X filters to that project's events; ?project=all multiplexes.",
+        "Phase 4 \u2014 CLI",
+        "9. Add --project flag to the run command. Default to 'default' when single-config mode (no registry).",
+        "Phase 5 \u2014 Migration",
+        "10. Move busydad's pipeline.config.yaml \u2192 ~/.toshelabs/projects/busydad.yaml. Update CLAUDE.md and any operator docs that reference the old path.",
+        "11. Test: start server, see busydad in project list, run a busydad ticket via project-scoped API, verify isolated state."
+      ],
+      "files_likely_affected": [
+        "src/config.js (multi-config loader + registry enumeration)",
+        "src/server.js (per-project routing, project-scoped event filter)",
+        "public/index.html (project picker UI)",
+        "src/index.js / CLI entry (--project flag)",
+        "TICKET-SCHEMA.md (note schema is per-project, point at registry layout)",
+        "README.md (multi-project setup instructions)",
+        "~/.toshelabs/projects/busydad.yaml (new, migrated from pipeline.config.yaml)"
+      ],
+      "out_of_scope": [
+        "Intra-project parallel ticket execution (operator decision 2026-05-04: out of scope due to master/rate-limit/worktree shared-state hazards).",
+        "Cross-machine pipeline coordination \u2014 single host for now.",
+        "Project-level RBAC / multi-user \u2014 single operator.",
+        "Auto-discovery (scan ~/code/* for pipeline.config.yaml files) \u2014 explicit registry only."
+      ],
+      "landed_commit": "d89a818",
+      "shipped_note": "Server-side multi-project loader + /api/projects + activate route + --project CLI flag. Round-trip tested. DEFERRED: dashboard project picker UI, per-project SSE filtering, busydad config migration to ~/.toshelabs/projects/busydad.yaml (legacy path keeps working).",
+      "shipped_at": "2026-05-04"
+    },
+    {
+      "id": "PIPE-004",
+      "schema_version": 1,
+      "title": "Refuse worker edits outside configured code_dirs / docs_dir",
+      "status": "done",
+      "priority": "P2",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/pipeline.js (PreToolUse hook for Edit/Write/MultiEdit), pipeline.config.yaml (code_dirs + docs_dir declarations)",
+      "reported": "2026-05-04",
+      "source": "Recurring class of bug: the docs_update worker step has been writing edits to canonical /home/toshe/busydad/memory/code_validation.md instead of the worktree path for weeks (BUG-262, 263, 264, 266 all leaked). Root cause was busydad CLAUDE.md hardcoding the absolute path; fixed structurally on 2026-05-03 by reorganising busydad to docs/ + state/ split. But the *mechanism* still exists: a worker can edit any path in the filesystem the subprocess can reach, and the pipeline only notices via post-hoc git diff.",
+      "description": "Add a per-project config block declaring the directories a worker is allowed to write into (`code_dirs`, `docs_dir`). Pipeline enforces via a PreToolUse hook on Edit/Write/MultiEdit/NotebookEdit: worker tool calls writing to paths outside the configured zones are rejected with a clear message. Closes the leak class regardless of project conventions.",
+      "user_impact": "Without enforcement, any future project's CLAUDE.md / docs / habits could re-introduce the same leak pattern. With enforcement, leaks are physically impossible \u2014 the worker cannot write outside the sandbox even if the prompt or convention drifts.",
+      "acceptance_criteria": [
+        "GIVEN a project config declares `code_dirs: [app/, backend/]` and `docs_dir: docs/`, WHEN a worker step issues an Edit on `/home/toshe/busydad/notes.md` (outside both), THEN the tool call is rejected with a clear PreToolUse hook error message naming the violation.",
+        "GIVEN the same config, WHEN a worker writes to `app/lib/foo.dart` or `docs/SPEC.md`, THEN the call proceeds normally.",
+        "GIVEN a step is `docs_update`, WHEN it tries to edit a path outside `docs_dir`, THEN it's rejected even if the path is inside `code_dirs` (per-step write zones \u2014 docs_update only touches docs).",
+        "GIVEN the rejection fires, WHEN the worker continues, THEN the rejection message is in the worker's tool_result stream so the LLM can adapt (typically: re-issue with the worktree-relative path).",
+        "GIVEN the project does not declare write zones, WHEN a worker edits anywhere, THEN the pipeline behaves as today (no enforcement; backwards compatible)."
+      ],
+      "decisions": [
+        "Per-step write zones, not just per-project. plan/tests_red/implement \u2192 code_dirs \u222a test_dirs. docs_update \u2192 docs_dir. review/root_cause \u2192 no writes (read-only). Configurable per step.",
+        "Enforcement via PreToolUse hook (the same mechanism Claude Code uses for permissions) \u2014 fires before the edit lands, so no rollback needed. Cleaner than post-hoc git diff inspection.",
+        "Reject message must be actionable \u2014 name the path, the configured zone, and suggest the worktree-relative equivalent if it's an obvious cwd-vs-canonical mistake."
+      ],
+      "fix_plan": [
+        "1. Define config block: per-step `write_zones: [pattern, ...]`. Defaults: plan/tests_red/implement get code_dirs+test_dirs; docs_update gets docs_dir; review/root_cause empty.",
+        "2. Implement the PreToolUse hook in spawnClaude \u2014 load the step's write_zones, intercept Edit/Write/MultiEdit/NotebookEdit, validate path against zones (glob match), reject with helpful message on miss.",
+        "3. Default write_zones to permissive (everything allowed) when not configured \u2014 backwards compat for projects that haven't migrated.",
+        "4. Configure busydad's write_zones in pipeline.config.yaml: code_dirs=[app/, backend/, feedback-admin/, extensions/, scripts/], docs_dir=docs/, test_dirs=[app/test/, backend/functions/test/].",
+        "5. Run a ticket end-to-end with enforcement on; verify docs_update can no longer leak; verify implement still touches what it needs to.",
+        "6. Document in TICKET-SCHEMA.md (project-config section) and add to PROD_SETUP.md equivalent in any future project."
+      ],
+      "files_likely_affected": [
+        "src/runner.js or src/pipeline.js (PreToolUse hook in spawnClaude)",
+        "pipeline.config.example.yaml (write_zones block per step)",
+        "src/config.js (resolve write_zone globs against project_dir)",
+        "TICKET-SCHEMA.md (note enforcement model)"
+      ],
+      "out_of_scope": [
+        "Read enforcement \u2014 workers can still read anywhere (needed for cross-cutting investigations).",
+        "Auto-detecting code_dirs from the project layout \u2014 explicit configuration only (otherwise we re-introduce the same drift problem in disguise).",
+        "Per-ticket write zone overrides \u2014 tickets don't get to widen the sandbox; if a ticket genuinely needs to touch outside, the project config gets a permanent extension."
+      ],
+      "landed_commit": "a3dc137",
+      "shipped_note": "Post-hoc detection via git diff inspection in worktree + canonical project_dir. busydad implement + docs_update opted into warn mode. DEFERRED: PreToolUse hook for true sandboxing; flip warn \u2192 strict once trusted.",
+      "shipped_at": "2026-05-04"
+    },
+    {
+      "id": "PIPE-005",
+      "schema_version": 1,
+      "title": "Full project settings editing in the dashboard \u2014 structured forms per section",
+      "status": "done",
+      "priority": "P3",
+      "type": "ux",
+      "complexity": "medium",
+      "area": "public/index.html (forms), src/server.js (PUT /api/projects/:id/config), src/config.js (atomic write + reload)",
+      "reported": "2026-05-04",
+      "source": "Operator request 2026-05-04: read-only settings panel shipped today (commit 72f0dbf) is insufficient \u2014 operator wants in-UI editing without opening YAML files. Toggle-only MVP (ticket_schema.mode, plan_critic.enabled, per-step write_zones.mode) shipping in a separate commit; this ticket covers the full structured-form editor.",
+      "description": "Per-section forms in the existing settings modal: ticket_filter (multi-select chips for status/priority/type orderings), ticket_schema (mode dropdown + overrides editor), plan_critic (enabled toggle + glob list editor), steps (per-step editor: model dropdown, max_turns numeric, tools chip-list, write_zones mode + allow-globs editor). Save writes the YAML atomically and triggers reloadConfig. Refused (409) during a pipeline run. Backup-before-write to the file's sibling .yaml.bak so a bad save can be rolled back. Show a diff preview on save with a confirm step.",
+      "user_impact": "Today operators edit pipeline.config.yaml or ~/.toshelabs/projects/*.yaml in a text editor and reload. For frequent flips (warn \u2192 strict, enabling plan_critic, adjusting write_zones globs) the YAML round-trip slows down iteration. Forms also catch typos that YAML doesn't (wrong mode value, malformed glob).",
+      "acceptance_criteria": [
+        "GIVEN no pipeline run is active, WHEN the operator changes a setting in the modal and clicks Save, THEN the project's YAML file is updated, reloadConfig is called, and the UI re-fetches /api/projects/:id to show the new state.",
+        "GIVEN a pipeline run IS active, WHEN the operator clicks Save, THEN the server returns 409 with a clear message and the modal surfaces it; no file write happens.",
+        "GIVEN any form field, WHEN the operator enters an invalid value (e.g. status not in enum, glob with malformed syntax), THEN the field is highlighted and Save is disabled until corrected.",
+        "GIVEN the YAML file before save, WHEN Save succeeds, THEN a sibling .yaml.bak is written first containing the pre-save content. Rollback = manual mv (or a future Restore button).",
+        "GIVEN a multi-section save (operator edited 3 sections at once), WHEN Save is clicked, THEN it's atomic \u2014 either all changes land or none."
+      ],
+      "fix_plan": [
+        "1. Server: PUT /api/projects/:id/config \u2014 body = full YAML-equivalent JSON. Backup, write, reloadConfig, return new resolved state.",
+        "2. UI: convert each section in the modal to a form. Submit-once-on-save (not per-field).",
+        "3. Add a Save button + diff-preview overlay. Confirm before commit.",
+        "4. Disable forms during a run; show a banner.",
+        "5. Document the .yaml.bak rollback path in TICKET-SCHEMA.md or a new docs/SETTINGS-EDITING.md."
+      ],
+      "out_of_scope": [
+        "Adding/removing entire steps (steps[] structural edits) \u2014 too easy to break the pipeline; operators do this in YAML.",
+        "Editing top-level metadata (project_dir, name) from the UI \u2014 these are identity fields, changing them is a project rename.",
+        "Schema overrides editor \u2014 covered separately in PIPE-005a if it gets filed; the JSON view in the modal is enough for now."
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "PUT /api/projects/:id/config endpoint with backup + atomic write + reload. Dashboard Edit-YAML button with diff preview + confirm. Per-section structured forms deferred (YAML textarea covers all editing today). Round-trip verified."
+    },
+    {
+      "id": "PIPE-006",
+      "schema_version": 1,
+      "title": "MCP server \u2014 frontend interface for tickets + schema; files remain backend",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/mcp/* (new), package.json (add @modelcontextprotocol/sdk), CLAUDE.md template for projects, TICKET-SCHEMA.md (consume-via-MCP section)",
+      "reported": "2026-05-04",
+      "source": "Operator decision 2026-05-04 \u2014 chose option A from the schema-publishing discussion. Today the schema is shipped as static files (TICKET-SCHEMA.md, schemas/ticket.v1.schema.json) and per-project CLAUDE.md additions. New projects need manual setup, schema bumps need manual re-pointing across every consumer, and there's no uniform way for an LLM in projectX to author a conformant ticket without re-implementing the contract.",
+      "description": "Expose the pipeline as an MCP server. Tools: list_projects(), get_schema(project), list_tickets(project, status?), get_ticket(project, id), create_ticket(project, ticket), update_ticket(project, id, patch), archive_ticket(project, id). Storage stays as the existing per-project YAML/JSON files (backwards-compat, hand-editable, gitignored). Validation server-side via the existing src/ticket-schema.js. Any Claude session that connects gets the schema at handshake and can author conformant tickets without copying the contract into its CLAUDE.md.",
+      "user_impact": "(a) Schema bumps propagate automatically \u2014 no per-project CLAUDE.md re-pointing. (b) New projects join the ecosystem by adding the MCP server connection, no boilerplate. (c) Cross-project visibility \u2014 list_tickets across all projects becomes a single call. (d) Foundational for PIPE-007 (pipeline self-improvement workflow) \u2014 the pipeline can have its own MCP-served backlog that any Claude session can write to.",
+      "acceptance_criteria": [
+        "GIVEN a Claude session connects to the MCP server, WHEN it calls get_schema('busydad'), THEN it receives the v1 schema with busydad's overrides applied (v2 status, P4 priority, chore/docs/manual types).",
+        "GIVEN a Claude session calls create_ticket('busydad', {...}), WHEN the ticket conforms to the schema, THEN it lands in busydad's state/backlog.json with schema_version=1 and the pipeline picks it up on next /api/backlog refresh.",
+        "GIVEN the same call with a non-conformant ticket, WHEN create_ticket runs, THEN it returns an error with field-level violations (same shape as ticket_rejected events) and writes nothing.",
+        "GIVEN multiple projects loaded, WHEN list_projects() is called, THEN it returns the same list as /api/projects.",
+        "GIVEN the busydad CLAUDE.md update, WHEN a new Claude session opens in busydad, THEN it's instructed to use the MCP create_ticket tool instead of editing state/backlog.json directly. Direct-edit still works (backwards-compat) but is documented as a fallback.",
+        "GIVEN the pipeline server is running, WHEN the MCP server is invoked (stdio transport), THEN it shares process state with the running pipeline (same emitter, same projects map). NOT a separate process \u2014 same Node process, MCP transport added alongside HTTP server."
+      ],
+      "decisions": [
+        "Files-as-backend (option A from the discussion). Storage doesn't move; just the API surface is unified.",
+        "Stdio transport (the standard for local MCP servers). HTTPS/SSE transport optional for cross-machine; defer.",
+        "MCP server runs in the same process as the pipeline server. Avoids state drift between two processes (event emitter, projects map, active project). Trade-off: pipeline crash = MCP also dies; acceptable since both are operator-managed local services.",
+        "Validation is shared with the HTTP path via the existing src/ticket-schema.js. Single source of truth \u2014 no chance of MCP and HTTP disagreeing on what's valid."
+      ],
+      "open_questions": [
+        "Q1: Tool naming \u2014 toshelabs.tickets.create vs create_ticket? Recommend the latter (shorter, MCP convention).",
+        "Q2: Authentication \u2014 none initially (local stdio only). Revisit if HTTPS transport is added.",
+        "Q3: Per-project MCP scoping \u2014 should there be a parameter on every tool call, or should the MCP session bind to one project at handshake? Recommend per-call parameter (more flexible; cross-project queries work without re-handshake)."
+      ],
+      "fix_plan": [
+        "Phase 1 \u2014 Skeleton",
+        "1. Add @modelcontextprotocol/sdk dep. Wire src/mcp/server.js to startServer() so it starts alongside HTTP.",
+        "2. Implement list_projects, get_schema, list_tickets \u2014 read-only first.",
+        "Phase 2 \u2014 Mutations",
+        "3. Implement create_ticket, update_ticket, archive_ticket. Use the same writeBacklog helper that existing routes use; keep behaviour identical.",
+        "4. Validation: every mutation runs through validateTicket with the project's effective schema (default + overrides).",
+        "Phase 3 \u2014 Documentation",
+        "5. TICKET-SCHEMA.md: add 'Authoring via MCP' section showing the recommended path.",
+        "6. busydad/CLAUDE.md: add 'When creating tickets, prefer the MCP create_ticket tool over editing state/backlog.json directly. Schema is fetched live via get_schema(busydad).'",
+        "Phase 4 \u2014 Validation",
+        "7. Test from a separate Claude session: connect to MCP, fetch schema, create a ticket, verify it appears in busydad's backlog AND passes the existing /api/backlog actionable query."
+      ],
+      "files_likely_affected": [
+        "src/mcp/server.js (new)",
+        "src/mcp/tools/{list_projects,get_schema,list_tickets,get_ticket,create_ticket,update_ticket,archive_ticket}.js (new)",
+        "src/server.js (start MCP alongside HTTP)",
+        "src/index.js (CLI flag --no-mcp if operator wants to disable)",
+        "src/backlog.js (writeBacklog helper, refactored from the existing inline writes)",
+        "package.json (@modelcontextprotocol/sdk dep)",
+        "TICKET-SCHEMA.md (Authoring via MCP section)",
+        "/home/toshe/busydad/CLAUDE.md (point at MCP)"
+      ],
+      "out_of_scope": [
+        "HTTPS / SSE transport \u2014 local stdio only for MVP.",
+        "Authentication / per-project ACL \u2014 single operator, single machine.",
+        "Migration to a real DB (option B from the discussion) \u2014 files stay; revisit when juggling 3+ projects.",
+        "Jira proxy (option C) \u2014 not the direction this project is heading."
+      ],
+      "landed_commit": "77cc7aa",
+      "shipped_at": "2026-05-04",
+      "shipped_note": "MCP server in-process with HTTP, files-as-backend. 7 tools shipped (list_projects, get_schema, list_tickets, get_ticket, create_ticket, update_ticket, archive_ticket). Stateless transport per SDK example. Validation runs server-side via shared src/ticket-schema.js. End-to-end smoke test passed: bad id rejected with pattern violation, valid ticket created/listed/archived round-trip clean. Out of scope: busydad CLAUDE.md update pointing at MCP (separate repo), HTTPS/auth (single-operator local), MCP resources surface."
+    },
+    {
+      "id": "PIPE-007",
+      "schema_version": 1,
+      "title": "Pipeline self-improvement workflow \u2014 track bugs/features for the pipeline itself",
+      "status": "done",
+      "priority": "P3",
+      "type": "ops",
+      "complexity": "small",
+      "area": "backlog/backlog.json (the pipeline's own backlog), docs (a new docs/PIPELINE-DEV.md), CLAUDE.md at the pipeline repo root",
+      "reported": "2026-05-04",
+      "source": "Operator question 2026-05-04: 'can the pipeline run tickets against itself? \u2014 perhaps not. then how do we capture bugs/features for the pipeline?' Today: pipeline bugs and features go into ~/toshelabs-pipeline/backlog/backlog.json (the pipeline's own backlog file, used in this session for PIPE-001..006). They're worked on through interactive sessions like this one, NOT through the pipeline's own SDLC, because the pipeline operates on external project repos (busydad) \u2014 running the pipeline against itself has circular-dependency risks (pipeline modifies pipeline mid-run).",
+      "description": "Document the pipeline's own self-improvement workflow as the explicit, sanctioned process: PIPE-* tickets live in ~/toshelabs-pipeline/backlog/backlog.json, conform to schema v1, are filed by the operator (or by Claude sessions through PIPE-006's MCP create_ticket once that lands), and are worked on in interactive sessions. The pipeline does NOT run against itself \u2014 that's a deliberate choice, not a missing feature. Once PIPE-006 lands, the pipeline's own backlog becomes MCP-accessible like any other project, so any Claude session can file pipeline tickets without re-implementing the schema.",
+      "acceptance_criteria": [
+        "GIVEN the pipeline repo, WHEN the operator (or an LLM) wants to file a pipeline bug or feature, THEN they have a clear documented path: append a ticket to ~/toshelabs-pipeline/backlog/backlog.json conforming to schema v1.",
+        "GIVEN PIPE-006 has shipped, WHEN an LLM session calls create_ticket('toshelabs-pipeline', {...}), THEN it works the same as any project's create_ticket and lands in the pipeline's backlog file.",
+        "GIVEN a docs/PIPELINE-DEV.md file, WHEN a new operator (or an onboarding session) reads it, THEN the self-improvement workflow is described in <100 lines: schema applies, tickets live in backlog/, no pipeline-against-itself runs, work happens interactively, MCP is the recommended authoring path post-PIPE-006."
+      ],
+      "decisions": [
+        "Pipeline does NOT run against itself. Reason: circular dependency. Pipeline runs by spawning Claude CLI, which would be modifying the pipeline source while the pipeline is interpreting it. Worktrees mitigate but don't eliminate the risk; the cost of a corrupted pipeline mid-self-modification is too high relative to the benefit (manual interactive sessions work fine).",
+        "Self-improvement is operator-driven + interactive. Always.",
+        "Once PIPE-006 ships, the pipeline becomes a 'project' in its own MCP namespace \u2014 same authoring path as any other project. No special-case API."
+      ],
+      "fix_plan": [
+        "1. Write docs/PIPELINE-DEV.md (new file in pipeline repo) \u2014 captures the self-improvement workflow.",
+        "2. Update README.md with a link to docs/PIPELINE-DEV.md from the contribution / development section.",
+        "3. Once PIPE-006 lands, update PIPELINE-DEV.md with the MCP create_ticket recipe."
+      ],
+      "out_of_scope": [
+        "Building self-hosting capability (pipeline-against-itself). Explicitly NOT a goal.",
+        "CI/CD for pipeline changes (no automated tests on commit). Future.",
+        "Pipeline release versioning. Future."
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "docs/PIPELINE-DEV.md describes operator+Claude pattern, restart etiquette, ticket-shape conventions. README points at it."
+    },
+    {
+      "id": "PIPE-008",
+      "schema_version": 1,
+      "title": "Per-project Pipeline \u2014 concurrent runs across projects (drop activate-409)",
+      "status": "done",
+      "priority": "P1",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/server.js (activePipelines map, project-scoped routes, status shape), public/index.html (SSE event filter, picker indicator)",
+      "reported": "2026-05-04",
+      "shipped_at": "2026-05-04",
+      "landed_commit": "55be660",
+      "shipped_note": "Replaces single activePipeline with Map<projectId, Pipeline>. Adds project-scoped run/stop/status endpoints. Drops activate 409. Per-project event tagging via emitter wrapper. Dashboard event filter + \u25cf running indicator in picker. Verified: busydad 7-ticket queue running, pension-ai activated mid-run with no 409, perProject map correctly reports busydad running and pension-ai idle.",
+      "source": "Operator pushed back 2026-05-04: 'i thought we can run two pipelines in parallel on different projects'. PIPE-003's original out-of-scope only covered intra-project parallel; cross-project parallel was claimed 'comes for free' but the implementation kept a single global activePipeline. This refactor closes that gap.",
+      "description": "Replace the global activePipeline with a Map<projectId, Pipeline>. Each Pipeline gets a project-tagging emitter wrapper. Per-project run/stop endpoints. Drop the activate-409 because switching projects is now just a display preference. Backwards-compat top-level endpoints dispatch to the active project's pipeline.",
+      "user_impact": "Two projects can run pipelines simultaneously without one blocking the other. Operator can switch the dashboard view between busydad and pension-ai mid-run, see both in the picker (\u25cf indicator), and inspect each project's settings independently.",
+      "acceptance_criteria": [
+        "GIVEN project A's pipeline is running, WHEN the operator activates project B, THEN no 409 fires.",
+        "GIVEN both projects loaded, WHEN POST /api/projects/A/run/all is called, THEN A starts and POST /api/projects/B/run/all also starts (no cross-blocking).",
+        "GIVEN both running, WHEN POST /api/projects/A/stop is called, THEN A halts and B keeps running.",
+        "GIVEN /api/status, WHEN polled, THEN runningProjects[] reflects all active pipelines and perProject{} is per-project running flags.",
+        "GIVEN dashboard SSE, WHEN events with project: A arrive while project B is the active view, THEN they don't render in the terminal feed but the picker indicator updates."
+      ]
+    },
+    {
+      "id": "PIPE-009",
+      "schema_version": 1,
+      "title": "Drop soft-stop semantic \u2014 /api/stop always SIGTERM (hard=false today is a lie)",
+      "status": "done",
+      "priority": "P2",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (stopPipeline + /api/stop + /api/projects/:id/stop), public/index.html (stop button no longer takes a ?hard parameter), docs (TICKET-SCHEMA.md or future API doc)",
+      "reported": "2026-05-05",
+      "source": "Operator audit 2026-05-05: 'what does stop do now?' Reading the code revealed that /api/stop with hard=false (the default) calls pipeline.releaseLock() then returns status:'stopped' \u2014 but the pipeline keeps running. Subprocess unaffected, current step continues, next step starts, next ticket starts. The run only stops when it would have finished anyway. The lockfile gets deleted, which is genuinely dangerous: another process seeing the lock gone could think nothing is running and try to start a parallel pipeline against the same worktree.",
+      "description": "Remove the hard parameter from /api/stop and /api/projects/:id/stop. Both endpoints always SIGTERM the active Claude subprocess via Pipeline.stopActiveSubprocess() (which itself escalates to SIGKILL after 5s grace). Soft-stop semantic deleted entirely \u2014 it was misleading and the lock-release-without-stop side effect was actively harmful (race window where the lock looks free but a worker is still alive). Operators who want 'don't add more tickets but let the current one finish' get that semantic via a separate endpoint, filed as future work (PIPE-009b: drain endpoint).",
+      "user_impact": "(a) Stop button feels honest \u2014 clicking it actually stops the run, not just deletes the lockfile while the pipeline keeps eating tokens. (b) Eliminates the race where the lock appears free during a still-live run.",
+      "acceptance_criteria": [
+        "GIVEN /api/stop is POSTed with no body or query params, WHEN the active project's pipeline is running, THEN the active Claude subprocess receives SIGTERM, the step throws, pipeline.run() rejects, and the map entry is cleaned within seconds.",
+        "GIVEN /api/projects/:id/stop is POSTed, WHEN that specific project's pipeline is running, THEN same behavior, scoped to that project.",
+        "GIVEN a run is stopped, WHEN /api/status is queried, THEN running:false (no more lying that nothing's running while it actually is).",
+        "GIVEN the dashboard Stop button, WHEN clicked, THEN it sends POST /api/stop (no ?hard param) and the pipeline pill flips to Idle within seconds, not 'whenever the queue happens to drain'.",
+        "GIVEN the previously-existing hard query param or body field, WHEN sent, THEN it's ignored (no breakage; just a no-op since hard is now implicit always)."
+      ],
+      "decisions": [
+        "Operator decision 2026-05-05: option (b) from the discussion \u2014 remove soft-stop entirely instead of trying to make it actually stop something. The 'set a flag and stop at next checkpoint' alternative (option (a)) was discussed and rejected: a step boundary can be minutes away (flutter test, implement step) and minutes-of-graceful-stop isn't a useful semantic.",
+        "Subprocess SIGTERM with 5s SIGKILL escalation is the right default. Pipeline.stopActiveSubprocess already implements this; just always call it.",
+        "Drain semantic ('don't pull the next ticket') is filed as PIPE-009b future work, not bundled here."
+      ],
+      "fix_plan": [
+        "1. src/server.js stopPipeline: drop the hard parameter; always call stopActiveSubprocess. Update the comment to describe the actual behavior (no more 'soft stop = release lock and walk away' \u2014 that path is gone).",
+        "2. /api/stop and /api/projects/:id/stop: ignore hard query/body params (or 400 if anyone sends one \u2014 TBD; ignore is cheaper for backwards-compat).",
+        "3. public/index.html stop button: drop any ?hard=true wiring; just POST /api/stop.",
+        "4. Test: kick off busydad's queue, hit Stop, verify pipeline_stopped fires within seconds and the next /api/status shows running:false."
+      ],
+      "out_of_scope": [
+        "PIPE-009b drain endpoint (don't pull next ticket; let current finish). Separate ticket.",
+        "Changing Pipeline.stopActiveSubprocess's SIGTERM\u2192SIGKILL escalation timing.",
+        "Adding a confirmation modal on the dashboard Stop button."
+      ],
+      "landed_commit": "b522c94",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "Stop is always decisive. /api/stop and /api/projects/:id/stop both SIGTERM the active subprocess (escalates to SIGKILL after 5s grace). Soft-stop deleted. Smoke-test: /api/stop idle returned 400 expected, restart cycle clean, no zombie."
+    },
+    {
+      "id": "PIPE-010",
+      "schema_version": 1,
+      "title": "Node startup defense against EADDRINUSE \u2014 retry listen, then exit(1) loud",
+      "status": "done",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (app.listen error handling + retry loop)",
+      "reported": "2026-05-05",
+      "source": "Operator hit a server zombie state on 2026-05-05: an old node-pipeline process was alive but the kernel hadn't released port 3847 yet when start.sh tried to launch the new one. Node fell into a 'Port already in use \u2014 running without UI server' fallback path: the process kept running but never bound the HTTP server, so MCP and the dashboard were unreachable. The operator only noticed when another session tried to use MCP. start.sh fix shipped in 9fc9dc8 (SIGTERM-then-poll-1s-then-SIGKILL) prevents the bind race externally, but the underlying Node behavior is still in the source as a fallback to a degraded mode that's worse than crashing.",
+      "description": "Replace Node's silent 'running without UI server' fallback with: (a) retry listen() every 100ms for up to 2s on EADDRINUSE \u2014 covers the residual race even if start.sh's SIGKILL fallback fired and the kernel needs an extra moment to reap the socket; (b) after 2s of retry, process.exit(1) with a clear log message naming the conflicting port. Refusing to start is better than running headless \u2014 the supervisor (start.sh, systemd, whatever) restarts; the operator notices immediately if the conflict persists.",
+      "user_impact": "Defense in depth with the start.sh fix. Today: if start.sh's pkill fails for any reason (parent dies between SIGTERM and SIGKILL, kernel reaping is slow, etc.), Node still falls into zombie mode and the operator gets a half-broken pipeline. With this: Node either binds successfully on retry, or exits loud and start.sh handles the restart.",
+      "acceptance_criteria": [
+        "GIVEN port :3847 is held by a dying process, WHEN node src/index.js --server is invoked, THEN listen() retries every 100ms for up to 2s before giving up.",
+        "GIVEN the retry succeeds, WHEN the dashboard is opened, THEN it works normally \u2014 no startup gap visible to the operator beyond the brief retry window.",
+        "GIVEN the retry exhausts (port still held after 2s), WHEN node fails the final listen attempt, THEN process.exit(1) with a stderr log: 'FATAL: port 3847 still bound after 2s retry; aborting.' (or similar).",
+        "GIVEN the current 'running without UI server' fallback, WHEN it would have fired today, THEN it does NOT fire \u2014 there is no longer a silent-degraded-mode path."
+      ],
+      "fix_plan": [
+        "1. src/server.js: wrap app.listen in a small retry loop. Either custom logic or use a library; custom is fine since the requirement is small.",
+        "2. Replace any existing console.log('Port 3847 already in use \u2014 running without UI server') (or whatever the exact string is) with the exit(1) path.",
+        "3. Test: kick off busydad pipeline, kill the server with start.sh stop+immediate-start, verify Node retries cleanly and binds within ~1s instead of falling through."
+      ],
+      "out_of_scope": [
+        "Configurable retry duration (2s is enough; if you need more, fix the cause not the symptom).",
+        "Health-check endpoint changes \u2014 orthogonal."
+      ],
+      "landed_commit": "b522c94",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "listen() now retries every 100ms for up to 2s on EADDRINUSE. On retry exhaustion: process.exit(1) with FATAL message. Silent zombie-fallback removed. Smoke-test: starting a second server while first is bound printed FATAL and exited; first server stayed healthy."
+    },
+    {
+      "id": "PIPE-011",
+      "schema_version": 1,
+      "title": "Tighten /api/pipeline-states \u2014 async fs, correct filter, surface errors",
+      "status": "done",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (the /api/pipeline-states route)",
+      "reported": "2026-05-05",
+      "source": "Code review of b522c94 surfaced three issues in the pre-existing /api/pipeline-states endpoint that affects dashboard sidebar status indicator reliability.",
+      "description": "Endpoint reads pipeline-state JSON files to drive the per-row sidebar color cue. Three issues: (a) uses sync readFileSync inside an async route handler \u2014 blocks the event loop on every poll, (b) filename filter is /^[A-Za-z0-9_-]+\\.json$/ which excludes archive files like BUG-261B.salvaged-2026-05-03.json or BUG-261.failed-... that the dashboard might want to show; or alternately INCLUDES files it shouldnt by being too loose, (c) JSON parse errors are silently swallowed \u2014 a corrupt state file produces a missing dashboard entry with no log line.",
+      "user_impact": "Sidebar status indicator can be slow to update under load (event loop blocked on disk reads), and corrupt state files cause silent display gaps that operators only notice when they expect a status pill that never appears.",
+      "acceptance_criteria": [
+        "GIVEN the /api/pipeline-states endpoint, WHEN polled under load, THEN it uses async fs.readFile (not readFileSync) so the event loop stays responsive.",
+        "GIVEN the filename filter, WHEN it runs against the pipeline-state directory, THEN it explicitly distinguishes ACTIVE files (matching /^[A-Z][A-Z0-9]*-\\d+[A-Za-z]*\\.json$/ \u2014 same shape as ticket id) from ARCHIVED ones (with .failed-/.salvaged-/.closed- suffixes) and chooses one of the two clearly. Default: only active.",
+        "GIVEN a corrupt state file, WHEN the endpoint reads it, THEN it logs a warning with the file name and continues with the rest, instead of dropping the entry silently."
+      ],
+      "fix_plan": [
+        "1. Replace readFileSync with await readFile (already imported at the top of server.js).",
+        "2. Tighten the filename regex to match active state files only; archive variants get a separate code path or are ignored.",
+        "3. Per-file try/catch logs the file name on parse failure.",
+        "4. Smoke-test: poll the endpoint under load (e.g. ab -n 100), confirm no event-loop stalls; corrupt one file, confirm the warning fires."
+      ],
+      "out_of_scope": [
+        "Caching the response to reduce disk I/O \u2014 separate concern; revisit if the endpoint becomes a hotspot.",
+        "Adding more fields to the response shape \u2014 operators rely on the existing two (status + blocked_step)."
+      ],
+      "landed_commit": "f4e7b76",
+      "shipped_at": "2026-05-05",
+      "shipped_note": "async fs.readFile in Promise.all, explicit active-state filter, parse-error logs file name. Dashboard sidebar reflects only live tickets, archive variants hidden."
+    },
+    {
+      "id": "PIPE-013",
+      "schema_version": 1,
+      "title": "plan_critic budget calibration via backtest harness \u2014 re-enable after",
+      "status": "requested",
+      "priority": "P1",
+      "type": "ops",
+      "complexity": "small",
+      "area": "scripts/plan-critic-backtest.js (run it), pipeline.config.yaml + ~/.toshelabs/projects/busydad.yaml plan_critic settings",
+      "reported": "2026-05-05",
+      "source": "BUG-1001 hit a 180s plan_critic timeout in the autonomous overnight run. heal did not fire because shouldHeal returns false on timeout (intentional \u2014 same budget reproduces the non-result). Result: ticket failed at first attempt. plan_critic.enabled flipped to false on busydad to unblock the queue.",
+      "description": "PIPE-001 spec said the backtest harness (scripts/plan-critic-backtest.js) should be run BEFORE shipping the critic to validate the prompt + budget against archived plans. We never ran it. Run it now: feed L10N-1 + BUG-261 + BUG-262 archived plans + 2 control plans, measure typical convergence time, calibrate plan_critic.max_seconds to a value that gives the critic real time to investigate (probably 5-10 min for non-trivial busydad tickets) without burning all night on a single bad ticket. Then re-enable plan_critic.enabled=true on busydad.",
+      "user_impact": "Today plan_critic is shipped but inert (disabled on busydad). The L10N-class catch the critic was supposed to provide isnt active \u2014 any ticket whose plan asserts wrong framework behavior could ship a regression. Calibration unblocks the safety net.",
+      "acceptance_criteria": [
+        "GIVEN scripts/plan-critic-backtest.js, WHEN run with --bug-plan L10N-1 + BUG-261 + BUG-262 + --control-plan x2, THEN it produces a JSON report and prints PASS/FAIL against the acceptance bar.",
+        "GIVEN backtest passes, WHEN max_seconds is set to the 95th percentile observed convergence time + 60s buffer, THEN plan_critic.enabled is flipped to true on busydad and a smoke-test ticket runs cleanly through the critic."
+      ],
+      "fix_plan": [
+        "1. Run the backtest: node scripts/plan-critic-backtest.js --bug-plan ... --control-plan ... > backtest-report.json",
+        "2. Inspect convergence times. Pick a max_seconds value (95p + 60s buffer is a starting point).",
+        "3. Edit ~/.toshelabs/projects/busydad.yaml: plan_critic.enabled: true, plan_critic step max_seconds: <new value>.",
+        "4. Smoke-test: run a small ticket that touches a load-bearing file. Verify critic runs, converges, writes findings.",
+        "5. If still flaky: iterate on the prompt OR move to a step-by-step investigator pattern (PIPE-013b future work)."
+      ],
+      "out_of_scope": [
+        "Heal-on-timeout for plan_critic \u2014 shouldHeal-blocks-on-timeout is intentional (a second attempt with the same budget reliably reproduces the non-result). Bump the budget instead, or split the work.",
+        "Per-ticket dynamic budgets based on complexity \u2014 premature."
+      ]
+    },
+    {
+      "id": "PIPE-014",
+      "schema_version": 1,
+      "title": "/api/stop should halt the queue, not just kill the current step",
+      "status": "done",
+      "fixed_at": "2026-05-15",
+      "fix_notes": "Implemented as designed in fix_plan: Pipeline.requestStop() sets sticky stopRequested flag + kills subprocess. Checkpoints added at three loops \u2014 run() ticket loop, processTicket() step loop, runStepWithHealing() heal-attempt loop. catch in run() now marks state blocked (reason: user_stopped_via_api_stop) and breaks ticket loop instead of continue. server.js stopPipeline calls requestStop(). Manifested 2026-05-15 on predictor T-038: Stop killed plan subprocess but tests_red + implement still ran before ticket dead-ended on a gate failure.",
+      "_original_status": "requested",
+      "priority": "P2",
+      "type": "refactor",
+      "complexity": "small",
+      "area": "src/server.js (stopPipeline), src/pipeline.js (run loop graceful-exit signal)",
+      "reported": "2026-05-05",
+      "source": "During autonomous overnight run on 2026-05-05 I called POST /api/projects/busydad/stop to halt the run before editing config. The active step\u2019s subprocess was SIGTERMed (correct per PIPE-009) but Pipeline.run() then iterated to the next ticket and kept going. /api/status still showed running:true. Had to fall back to ./start.sh stop to actually halt.",
+      "description": "PIPE-009 made stop kill the active step. But Pipeline.run() catches step exceptions and moves to the next ticket \u2014 the queue continues. Need a stop_requested flag that the run() loop checks between tickets so the run actually halts after the current ticket fails/finishes. Implementation: Pipeline.requestStop() sets a flag; run() checks it at the top of the per-ticket iteration; if set, breaks the loop and exits cleanly. stopPipeline calls requestStop() before stopActiveSubprocess.",
+      "user_impact": "Operators who hit Stop expect the queue to halt, not the next ticket to start a few seconds later. Today they have to either ./start.sh stop the whole server or chain N stop calls (one per remaining ticket).",
+      "acceptance_criteria": [
+        "GIVEN a 5-ticket queue running, WHEN POST /api/projects/:id/stop is called mid-step, THEN the active step is SIGTERMed AND the queue is halted (no next ticket starts).",
+        "GIVEN the same scenario, WHEN /api/status is queried 10s later, THEN running:false for that project.",
+        "GIVEN the orchestrator\u2019s crash recovery, WHEN /api/projects/:id/run/all is called next, THEN the in-progress ticket is resumed cleanly via the existing crash-recovery path."
+      ],
+      "fix_plan": [
+        "1. src/pipeline.js: add this.stopRequested = false in constructor, requestStop() method that sets it to true.",
+        "2. run() loop: check this.stopRequested at the TOP of the per-ticket for-loop. If true, break + emit pipeline_stopped_by_request.",
+        "3. src/server.js stopPipeline: call pipeline.requestStop() before stopActiveSubprocess. Order matters \u2014 set the flag first so the queue exit path runs after the step throws.",
+        "4. Test: 3-ticket queue, hit stop after ticket 1, confirm ticket 2 doesnt start."
+      ],
+      "out_of_scope": [
+        "Mid-step graceful-stop checkpoints (let the step finish then stop). Filed historically as PIPE-009b future work; same reason as before \u2014 minutes-of-wait isnt useful semantic."
+      ]
+    },
+    {
+      "id": "PIPE-015",
+      "schema_version": 1,
+      "title": "spawn claude \u2014 retry on ENOENT + capture rich diagnostics",
+      "status": "done",
+      "priority": "P2",
+      "type": "ops",
+      "complexity": "small",
+      "area": "src/runner.js (trySpawnClaudeWithRetry helper, spawnClaude wrapper)",
+      "reported": "2026-05-06",
+      "source": "Overnight autonomous run on 2026-05-05 hit two intermittent 'spawn claude ENOENT' failures across ~100 spawns (~2%). Existing error handler dropped err.code/path/syscall and surfaced only 'Failed to spawn claude: spawn claude ENOENT' \u2014 no evidence to diagnose from. Likely cause is generic WSL filesystem flakiness or a fork/exec race; we don't have hard evidence and probably never will without rich diagnostics on every future occurrence.",
+      "description": "Wrap the OS-level spawn in a small retry helper: 5 attempts \u00d7 1s spacing on ENOENT, fail-fast on any other error code (EACCES/ENOMEM aren't transient). On every ENOENT log a structured diag \u2014 err.code/errno/syscall/path/spawnfile, the claudeBin we asked for, the PATH passed in env (truncated), and fs.realpath() of the binary at the moment of failure (null = file genuinely missing; truthy = transient race, file is actually on disk). Race the 'spawn' event vs 'error' to detect successful spawn deterministically.",
+      "user_impact": "Tickets no longer fail individually for a transient spawn race that resolves on the very next attempt. When a real persistent ENOENT does occur (PATH misconfiguration, claude uninstalled, etc.) the diag block tells the operator exactly what was missing and where it was looked for.",
+      "acceptance_criteria": [
+        "GIVEN claude is on PATH, WHEN spawnClaude runs, THEN it spawns successfully on attempt 1 and the diagnostic logs do not fire.",
+        "GIVEN a transient ENOENT, WHEN a subsequent retry succeeds, THEN '[runner] spawn claude OK on attempt N/5' is logged and the ticket continues normally.",
+        "GIVEN a persistent ENOENT, WHEN all 5 attempts fail, THEN the rejected error message includes attempt count + interval AND the rich diag (with realpath_of_claude_bin, path_env_head) is in the warn logs for every attempt.",
+        "GIVEN a non-ENOENT spawn error (EACCES etc.), WHEN it fires, THEN it surfaces immediately on attempt 1 (no retry)."
+      ],
+      "fix_plan": [
+        "1. src/runner.js: add trySpawnClaudeWithRetry(claudeBin, args, spawnOpts, onRetryDiag). Loop 5\u00d7, race proc.once('spawn') vs proc.once('error'), retry on ENOENT only.",
+        "2. On each ENOENT capture diag: err.code/errno/syscall/path/spawnfile + claudeBin + PATH env head + realpath() of claudeBin. console.warn with JSON.",
+        "3. Convert spawnClaude to async, await trySpawnClaudeWithRetry before the existing Promise wrapper. The post-spawn proc.on('error') handler stays as a backstop for rare post-spawn failures.",
+        "4. Smoke-test: normal pipeline run still works; verify no behavior change on the happy path."
+      ],
+      "out_of_scope": [
+        "Diagnosing the actual root cause of the WSL ENOENT \u2014 without evidence we'd be speculating. The diag captured here is the evidence collection step; a future ticket can investigate once we have one or two real diag blocks captured.",
+        "Exponential backoff or jitter \u2014 5 \u00d7 1s is fine for a ~2% transient; if we ever see clustered failures across many spawns we can revisit."
+      ]
+    },
+    {
+      "id": "PIPE-016",
+      "schema_version": 1,
+      "title": "planner: trace consumer surface when a change touches a type \u2014 close the cross-file blind spot",
+      "status": "done",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "prompts/plan.md (busydad + pension-ai), prompts in any future onboarded project",
+      "reported": "2026-05-06",
+      "source": "BUG-279 post-mortem (2026-05-06): planner produced a complete, well-architected plan for adding an `autoReminderSuppressed` field to EntryModel + the Drift Entries table. Implement followed faithfully. tests_green failed because nine pre-existing test fixtures construct Drift `Entry(...)` rows directly \u2014 Drift's `withDefault(Constant(false))` is a SQL-level default, not a Dart-constructor default, so the generated row class made the new field a required parameter and every fixture failed to compile. The planner's `files_to_change` list never included the consumer test fixtures because the prompt asks the planner to enumerate intended changes, not to enumerate downstream blast radius. Heals couldn't recover (see PIPE-017). Operator hand-finished the ticket.",
+      "description": "Extend prompts/plan.md with an explicit type-impact check before the planner finalises files_to_change. When the change adds a field, removes a field, or changes a constructor signature on a type, the planner must Grep the codebase for direct constructions of that type (test fixtures included) and add them to files_to_change with what_to_do='[fixture-update] add new field with default value'. The check is dirt-cheap (one extra Grep round) and addresses a recurring failure mode where the planner is locally correct but globally incomplete.",
+      "user_impact": "Today the pipeline silently fails on tickets that touch foundational types (EntryModel, ReminderModel, repository signatures) \u2014 heal can't see the consumer files, exhausts attempts, ticket marked failed, operator has to hand-finish. Adds 0\u201330s of planner time, prevents one or more hour-long ticket dead-ends per batch.",
+      "acceptance_criteria": [
+        "GIVEN a ticket whose plan adds a field to a type T, WHEN the planner produces files_to_change, THEN the list includes every file that constructs T directly (verified via Grep `T(`).",
+        "GIVEN a ticket that does NOT touch a type signature, WHEN the planner runs, THEN no spurious fixture-update entries appear (the check no-ops cleanly).",
+        "GIVEN a Drift table change adding a column, WHEN the planner runs, THEN the plan calls out that build_runner must regenerate code AND lists every direct Entry/RowClass constructor in the test tree."
+      ],
+      "fix_plan": [
+        "1. Read busydad/prompts/plan.md and pension-ai/prompts/plan.md (likely identical or near-identical).",
+        "2. Add a new section before files_to_change is emitted: 'Type-impact check \u2014 when your change adds/removes/changes a field on a class, OR adds a column to a Drift table, run Grep `<TypeName>(` across lib/ and test/. Every file that matches must appear in files_to_change with what_to_do = `[fixture-update] add <field>: <default-value>`. This is a hard requirement.'",
+        "3. Add a one-line example in the prompt: 'e.g. adding `autoReminderSuppressed` to EntryModel \u2192 grep `EntryModel(` AND `Entry(` (the Drift row class) \u2192 9 fixture files need a one-line addition.'",
+        "4. Smoke-test by re-running a ticket of similar shape and verifying the planner now lists fixture files. If it does not, iterate on the prompt wording.",
+        "5. Backport the prompt change to pension-ai once verified on busydad."
+      ],
+      "out_of_scope": [
+        "Static analysis tooling to enforce this \u2014 prompt-level guidance is enough for now; if it doesn't take, we revisit.",
+        "Auto-applying the fixture updates (planner declares, implement does the work \u2014 no change to roles)."
+      ]
+    },
+    {
+      "id": "PIPE-017",
+      "schema_version": 1,
+      "title": "heal: inject failing-test source into the prompt so heals can reason about cross-file breaks",
+      "status": "done",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/pipeline.js (runStepWithHealing), prompts/implement.md (acknowledge new variable)",
+      "reported": "2026-05-06",
+      "source": "BUG-279 post-mortem (2026-05-06): tests_green reported `loading X` failures for two pre-existing test files the LLM had never read. The heal prompt knew the test NAMES but not the test SOURCE. The LLM's heal attempts saw 'tests_green failed: 2 new failures' and tried to fix the production code \u2014 they had no way to see the actual compile error or the unread fixture file. Heals exhausted, ticket failed. Same pattern would defeat any heal where the failure is in a file outside the LLM's working set.",
+      "description": "When tests_green hands a failure list to the heal step, also inject the source of each failing test file (truncated to first ~200 lines or 8KB, whichever is smaller \u2014 enough to capture imports + assertions). The heal then has the actual evidence: 'this fixture's Entry(...) call is missing your new required field' rather than 'a test failed somewhere'. Composes with PIPE-016 (planner-side prevention) \u2014 even when planner misses a consumer, heal can recover. Cost: a few thousand input tokens per heal attempt, almost all of it cache-hit on the retry.",
+      "user_impact": "Today, pipeline failures on cross-file breaks are unrecoverable without operator intervention. With PIPE-017 the heal can self-correct on first or second attempt for the broad class of 'I broke a consumer I didn't know existed'. Estimated to save 2\u20134 ticket-blocked-failed events per overnight batch on busydad-shaped projects.",
+      "acceptance_criteria": [
+        "GIVEN tests_green fails with new_failed_tests pointing at file F, WHEN the heal prompt is constructed, THEN F's source (first 200 lines) is appended to the prompt under a clearly-labeled heading.",
+        "GIVEN multiple failing test files, WHEN the heal runs, THEN each unique file's source is included once (deduped on path).",
+        "GIVEN a `loading X` failure (compile-time, no test name), WHEN the heal runs, THEN the source of X is included AND the heal prompt explicitly notes 'this file failed to compile \u2014 fix the import/type mismatch'.",
+        "GIVEN the source dump exceeds budget (e.g. 50+ failing files), WHEN the heal runs, THEN it caps at the top N (by failure count) and notes the truncation."
+      ],
+      "fix_plan": [
+        "1. src/pipeline.js: locate the tests_green heal-prompt construction. Identify where new_failed_tests is materialised into the heal context.",
+        "2. Add a helper readFailingTestSources(failures, projectDir, maxFiles=10, maxBytes=8192) that returns a Map<path, sourceSnippet>. Read each file once, slice to the cap, prepend `// File: <relative path>\\n` so the LLM knows which is which.",
+        "3. Append a section to the heal prompt: 'Failing test file sources (for compile-error / cross-cutting failures):\\n```dart\\n<dump>\\n```\\nCheck whether your changes broke imports or constructor calls in these files. If yes, update them as part of this heal.'",
+        "4. Update prompts/implement.md to acknowledge: 'You may receive failing test file sources in the heal prompt \u2014 treat them as additional files_to_change you must update or revert.'",
+        "5. Test on a synthetic ticket: add a required field to a widely-used type, watch first-attempt fail, watch heal succeed by updating fixtures.",
+        "6. Validate the cache-hit assumption: the heal prefix grows by ~5\u201310k input tokens, which should be cached on retry. Inspect cacheHitRatio metric on a real heal cycle to confirm."
+      ],
+      "out_of_scope": [
+        "Sourcemap-aware analysis (showing only the relevant function) \u2014 first version dumps the file head, simpler and more robust.",
+        "Symmetric injection for analyzer errors (PIPE-017b future work) \u2014 analyzer failures already include the file path AND the error site in the message; the marginal value of file source is lower there.",
+        "Automatic test rewriting \u2014 heal still has to reason about whether the test or the implementation is wrong; we just give it the source so reasoning is possible."
+      ]
+    },
+    {
+      "id": "PIPE-018",
+      "schema_version": 1,
+      "title": "think-loop: findings never feed back into the plan/implementation \u2014 best-result is the findings list, not a revised artifact",
+      "status": "done",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "large",
+      "area": "src/think-loop.js (compare/bestResult handling), src/pipeline.js (think-loop call + reloadStepFromDisk)",
+      "reported": "2026-05-15",
+      "source": "predictor T-001 (2026-05-15): plan_critic correctly prescribed `rm -rf app/` before `flutter create`, but that fix never reached the executed plan. Root cause: when COMPARE returns BETTER, think-loop sets bestResult = challengeResult, but challengeResult is the JSON findings ARRAY, not a regenerated plan/implementation. So the loop 'improves' by replacing the plan with a list of complaints; the actual artifact the next step consumes is never revised from the findings. Critic insight is computed and discarded. Combined with worktree-mode this produced repeated false/structural findings.",
+      "acceptance": "When the challenger produces actionable findings and COMPARE rules them an improvement, the step's actual output artifact (plan JSON / code) is regenerated incorporating the findings before the next step consumes it; a follow-up challenge on the revised artifact no longer re-raises the same finding. Add a regression test that a prescribed plan fix (e.g. an added pre-step) appears in the finalized plan."
+    },
+    {
+      "id": "PIPE-019",
+      "schema_version": 1,
+      "title": "Graceful restart-between-tickets \u2014 relaunch on fresh code without losing the in-flight ticket",
+      "status": "done",
+      "priority": "P2",
+      "type": "feature",
+      "complexity": "medium",
+      "area": "src/pipeline.js (run loop + RESTART_EXIT_CODE), src/server.js (/api/restart-after-ticket), start.sh (supervisor loop)",
+      "reported": "2026-05-16",
+      "source": "Operator need (2026-05-16): deploying new pipeline code required /api/stop, which kills the in-flight ticket mid-step and wastes its work (e.g. T-003 plan after 3h). There was no way to say \"finish what you are on, then restart on the new code, then keep going\".",
+      "description": "Add an operator-armed graceful restart that takes effect at a clean ticket boundary. requestRestartAfterTicket() sets a sticky flag WITHOUT killing the subprocess; the current ticket runs to completion and is cherry-picked; run() then releases the lock and exits with RESTART_EXIT_CODE (75); the start.sh supervisor loop relaunches node on freshly-deployed code; the queue resumes automatically because done tickets are skipped via their pipeline-state. Contrast /api/stop (PIPE-014) which is immediate + lossy.",
+      "user_impact": "Operator can deploy pipeline improvements during a long overnight batch without discarding the ticket in flight or babysitting the restart. Removes the stop/lose-work/restart/re-burn-tokens cycle.",
+      "acceptance_criteria": [
+        "GIVEN a pipeline running ticket T, WHEN POST /api/restart-after-ticket, THEN T finishes and is cherry-picked before any restart (no subprocess kill).",
+        "GIVEN the restart flag is armed, WHEN T completes, THEN run() releases the lock and the process exits with code 75.",
+        "GIVEN node exits 75, WHEN under start.sh, THEN the supervisor relaunches node once on current code and the queue continues with remaining requested tickets.",
+        "GIVEN node exits 0/1/130, WHEN under start.sh, THEN the supervisor stops (no relaunch).",
+        "GIVEN no pipeline is running, WHEN POST /api/restart-after-ticket, THEN 400 with guidance to restart normally."
+      ],
+      "out_of_scope": [
+        "Per-project selective restart \u2014 process restart is server-wide; multi-project concurrent runs are interrupted (acceptable for a code-deploy restart).",
+        "Dashboard button \u2014 endpoint only for now; can be wired in public/index.html later.",
+        "Auto-restart on detected new code \u2014 restart is explicitly operator-armed."
+      ]
+    },
+    {
+      "id": "PIPE-020",
+      "schema_version": 1,
+      "title": "Dependency-ordering integrity \u2014 a failed/discarded keystone ticket must block or flag its dependents instead of merging them green",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "large",
+      "area": "src/pipeline.js (run loop, ticket selection, cherry-pick/merge gate), backlog/ticket schema (dependency field), src/backlog.js",
+      "reported": "2026-05-17",
+      "source": "Investigation of the 2026-05-16/17 predictor run. T-023 (Pro Pack IAP + entitlement layer) failed and its worktree branch was discarded. The pipeline then ran T-024, T-026, T-027 \u2014 all explicitly 'Pro Pack gated' \u2014 and merged them as done, plus attempted T-025, on a tree where EntitlementService / proPackUnlockedProvider never existed. Dependents silently re-invented fragmented gating (isProProvider in what_if_providers.dart, cosmetic_providers.dart). T-025 then non-converged because the think-loop correctly detected there was no entitlement infra to wire to. No dependency edge was declared or enforced, so a keystone failure produced a green-but-hollow batch.",
+      "description": "Tickets have no declared dependency relationships, and the run loop has no gate that checks whether a ticket's prerequisites actually landed. When a keystone ticket fails or its branch is discarded (atomic worktree), every downstream ticket still runs and merges, producing code that compiles but whose stated premise (here: Pro Pack entitlement gating) has no foundation. Add (1) an optional depends_on:[ticket-id] field to the ticket schema; (2) a pre-flight gate in the run loop that, before starting ticket T, verifies every depends_on entry reached done with a merged branch \u2014 if not, T is skipped and marked blocked with reason 'dependency <id> not satisfied (status=<s>)' rather than run; (3) surface the blocked-on-dependency state in the dashboard/report so the operator sees the cascade instead of a misleading all-green batch. Consider also a lightweight heuristic warning when a ticket's plan references symbols/files that a failed sibling was supposed to create.",
+      "user_impact": "Operator can trust that a green batch is actually coherent. A single keystone failure no longer silently invalidates every dependent ticket and waste a night of tokens building features on a missing foundation. Cascade failures become visible and actionable at the point they occur.",
+      "acceptance_criteria": [
+        "GIVEN ticket B has depends_on:[A] and A is not done-with-merged-branch, WHEN the run loop reaches B, THEN B is not executed and is marked blocked with reason naming A and A's status",
+        "GIVEN A later completes successfully on a re-queue, WHEN the loop reaches B again, THEN B runs normally",
+        "GIVEN a ticket with no depends_on, WHEN the loop reaches it, THEN behaviour is unchanged (no regression)",
+        "The blocked-on-dependency reason is visible in pipeline-state, the dashboard, and the daily report",
+        "Schema change is backward compatible \u2014 existing tickets without depends_on validate unchanged"
+      ],
+      "out_of_scope": [
+        "Automatic dependency inference from plan text (heuristic warning only, if included at all)",
+        "Re-ordering the backlog to satisfy dependencies automatically \u2014 operator still owns ordering",
+        "Retroactive re-validation of already-merged dependents (handled per-incident, e.g. the T-024/26/27 Pro Pack recovery)"
+      ]
+    }
+  ]
 }

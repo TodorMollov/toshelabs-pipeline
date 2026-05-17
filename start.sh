@@ -74,16 +74,32 @@ case "${1:-start}" in
     # stop_and_wait is a no-op if nothing's running; safe to call
     # before every start so no orphan can interfere with the new bind.
     stop_and_wait || exit 1
-    # rotate previous log once so we keep one generation
+    # rotate previous log once so we keep one generation. Done ONCE here,
+    # not per relaunch — a PIPE-019 graceful restart must not shred the
+    # log history of the run it's continuing.
     [ -f pipeline.log ] && mv -f pipeline.log pipeline.log.1
-    # Run in the foreground and stream logs to this terminal while still
-    # teeing to pipeline.log (rotation, .server.pid, and stop_and_wait's
-    # pgrep all keep working). Process substitution keeps $! = node's pid,
-    # not tee's. Ctrl+C stops the server cleanly.
-    NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" > >(tee -a pipeline.log) 2>&1 &
-    NODE_PID=$!
-    echo "$NODE_PID" > "$PIDFILE"
-    echo "Started (PID $NODE_PID) — logs streaming below, also in pipeline.log. Ctrl+C to stop."
-    wait "$NODE_PID"
+    # PIPE-019 supervisor loop. node exits 75 (RESTART_EXIT_CODE) to ask
+    # for a clean relaunch on freshly-deployed code after finishing the
+    # current ticket; any other exit code (0 normal, 1 crash, 130 Ctrl+C)
+    # ends the supervisor. Process substitution keeps $! = node's pid (not
+    # tee's) so .server.pid and stop_and_wait's pgrep keep working.
+    while true; do
+      NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" node src/index.js --server "$@" > >(tee -a pipeline.log) 2>&1 &
+      NODE_PID=$!
+      echo "$NODE_PID" > "$PIDFILE"
+      echo "Started (PID $NODE_PID) — logs streaming below, also in pipeline.log. Ctrl+C to stop."
+      wait "$NODE_PID"
+      RC=$?
+      if [ "$RC" -ne 75 ]; then
+        rm -f "$PIDFILE"
+        echo "Server exited (code $RC) — supervisor stopping."
+        exit "$RC"
+      fi
+      echo "[PIPE-019] graceful restart requested (exit 75) — relaunching on current code…"
+      # Wait (bounded) for the listening socket to free before re-binding.
+      # The server also has EADDRINUSE retry (PIPE-010) as a backstop.
+      w=0
+      while ! port_is_free && [ "$w" -lt 10 ]; do sleep 1; w=$((w + 1)); done
+    done
     ;;
 esac

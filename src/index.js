@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { program } from 'commander';
-import { loadConfig, loadAllConfigs } from './config.js';
+import { loadConfig, loadAllConfigs, readPersistedActiveProject, persistActiveProject, activeProjectFilePath } from './config.js';
 import { startServer } from './server.js';
 import { Pipeline } from './pipeline.js';
 
@@ -39,15 +39,26 @@ async function main() {
       process.exit(1);
     }
     activeId = opts.project;
+    // Explicit --project is operator intent — persist it so a later
+    // bare restart resumes here. The alphabetical fallback below is NOT
+    // persisted (it's an implicit default, not a choice).
+    persistActiveProject(activeId);
   } else {
-    // Prefer (in order): the project whose name matches the legacy
-    // config (if loaded), then the first non-template project (id
-    // doesn't start with `_`), then the first registry entry as last
-    // resort. Treating `_*.yaml` as placeholder/template by convention
-    // — if you want a project to be eligible as default, give it a
-    // real id.
+    // Prefer (in order): the last operator-activated project persisted
+    // across restarts (so a hard start.sh restart doesn't silently switch
+    // a multi-day run to a different project), then the first non-template
+    // project (id doesn't start with `_`), then the first registry entry
+    // as last resort. Treating `_*.yaml` as placeholder/template by
+    // convention — if you want a project to be eligible as default, give
+    // it a real id.
     const ids = [...projects.keys()];
-    activeId = ids.find((id) => !id.startsWith('_')) || ids[0];
+    const persisted = readPersistedActiveProject();
+    if (persisted && projects.has(persisted)) {
+      activeId = persisted;
+      console.log(`[projects] resuming persisted active project '${persisted}' (from ${activeProjectFilePath()})`);
+    } else {
+      activeId = ids.find((id) => !id.startsWith('_')) || ids[0];
+    }
   }
   // CRITICAL: shallow-clone the active project's config into a NEW
   // mutable holder. The `projects` Map stores the canonical configs

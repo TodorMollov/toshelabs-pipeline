@@ -31,6 +31,12 @@ import { checkWriteZones, formatViolations, globMatch as globMatchSimple } from 
 // duplicates in a single day's ops log. Cleared on server restart.
 const _crashedDetectedThisBoot = new Set();
 
+// PIPE-019: exit code run() uses to ask the start.sh supervisor for a
+// clean relaunch (graceful restart-between-tickets). 75 = EX_TEMPFAIL
+// ("try again") from sysexits.h — distinct from 0 (normal stop) and 1
+// (crash), so the supervisor can tell "relaunch me" from "I'm done".
+export const RESTART_EXIT_CODE = 75;
+
 // Per-step worker-output schema (2026-04-27 architectural fix).
 // Workers write a flat JSON object to {worker_output_dir}/{ticket}/{step}.json.
 // The orchestrator's ingestWorkerOutput accepts ONLY the fields listed here for
@@ -99,6 +105,14 @@ export class Pipeline {
     // current attempt — the heal loop retried, or the supervisor
     // marched to the next step / ticket.
     this.stopRequested = false;
+    // PIPE-019: graceful restart-between-tickets. Unlike stopRequested
+    // this does NOT kill the running subprocess — the current ticket is
+    // allowed to finish cleanly. At the next ticket boundary run() exits
+    // the process with RESTART_EXIT_CODE; the start.sh supervisor relaunches
+    // node (picking up freshly-deployed code) and the queue resumes —
+    // already-`done` tickets are skipped via their pipeline-state, so the
+    // remaining `requested` tickets continue automatically.
+    this.restartRequested = false;
     // Worktree-per-pipeline-run: when enabled, the orchestrator runs
     // each ticket in {pipelineHome}/projects/{name}/worktree rather
     // than in config.project_dir, so the operator can keep editing
@@ -139,6 +153,18 @@ export class Pipeline {
   requestStop() {
     this.stopRequested = true;
     return this.stopActiveSubprocess();
+  }
+
+  /**
+   * PIPE-019: operator-initiated graceful restart. Sets a sticky flag but
+   * deliberately does NOT touch the running subprocess — the in-flight
+   * ticket runs to completion (and is cherry-picked) before run() exits
+   * the process at the next ticket boundary. Idempotent. Returns the flag
+   * so the API can confirm it was armed.
+   */
+  requestRestartAfterTicket() {
+    this.restartRequested = true;
+    return this.restartRequested;
   }
 
   /**
@@ -392,6 +418,19 @@ export class Pipeline {
           this.activeWorktree = null;
           this.worktreeBranch = null;
         }
+
+        // PIPE-019: clean ticket boundary reached. If the operator armed a
+        // graceful restart, stop pulling new tickets now — the just-finished
+        // ticket is already archived/cherry-picked. The outer finally exits
+        // the process so the supervisor relaunches on fresh code.
+        if (this.restartRequested) {
+          this._restartAfterRun = true;
+          this.emit('pipeline_restart_observed', {
+            completed: ticket.id,
+            remaining: queue.length - i - 1,
+          });
+          break;
+        }
       }
 
       // Phase 3-5: Integration tests, docs, build
@@ -399,6 +438,14 @@ export class Pipeline {
     } finally {
       await this.releaseLock();
       this.stopUsageMonitor();
+      // PIPE-019: lock released + usage monitor stopped → safe to hand
+      // control back to the supervisor for a fresh-code relaunch. The
+      // queue resumes automatically (done tickets skipped via state).
+      if (this._restartAfterRun) {
+        this.emit('pipeline_restarting', { exitCode: RESTART_EXIT_CODE });
+        // Give the SSE flush a tick so the dashboard sees the event.
+        setTimeout(() => process.exit(RESTART_EXIT_CODE), 250);
+      }
     }
   }
 
@@ -657,10 +704,40 @@ export class Pipeline {
 
           // If tests pass (no new failures AND no new analyzer errors) or
           // we've exhausted heal attempts, proceed to gate.
-          const needsHeal = (stepArtifacts.new_failures > 0) || (stepArtifacts.new_analyzer_errors > 0);
+          //
+          // A crashed / "produced no stats" run reports 0 new_failures
+          // (nothing was collected), so the failure-count check alone lets a
+          // broken suite sail straight to the gate. T-015: `flutter test
+          // test/` exited 1 on a test-file compile error, 0 tests collected,
+          // gate passed, review+docs ran, then the loop's final all_pass
+          // check blocked the ticket — ~6 min wasted. Treat a broken run as
+          // needing heal too: heal's compileHint path is built for exactly
+          // this. unit_no_tests ("No tests were found") stays benign.
+          const runBroken = stepArtifacts.unit_crashed
+            || stepArtifacts.unit_skipped_compile_errors
+            || (stepArtifacts.unit_ran_nothing && !stepArtifacts.unit_no_tests);
+          const needsHeal = runBroken || (stepArtifacts.new_failures > 0) || (stepArtifacts.new_analyzer_errors > 0);
           if (!needsHeal || healAttempt >= maxHealAttempts) {
             const planArtifacts = pipelineState.steps.plan || {};
             const validation = validateStep(stepArtifacts, stepConfig, planArtifacts);
+
+            // Defence in depth: validateStep only checks new_failures==0 &&
+            // new_analyzer_errors==0, both of which are 0 for a crashed /
+            // ran-nothing suite. all_pass is the authoritative signal — set
+            // only by the native runTestsGreen, never by a worker — and
+            // already encodes crash, ran-nothing, extra-failures and
+            // analyzer state. Without this a broken suite passes the
+            // per-step gate and only trips the loop's final consistency
+            // check after review+docs have already burned a cycle (T-015).
+            if (validation.pass && stepArtifacts.all_pass !== true) {
+              const why = stepArtifacts.unit_crashed ? 'test run crashed'
+                : stepArtifacts.unit_ran_nothing ? 'test command produced no stats (check cmd/cwd)'
+                : stepArtifacts.unit_skipped_compile_errors ? 'tests skipped due to compile errors'
+                : (stepArtifacts.new_extra_failures && stepArtifacts.new_extra_failures.length) ? 'new failures outside the changed surface'
+                : 'all_pass is not true';
+              validation.pass = false;
+              validation.failures.push(`tests_green did not actually pass: ${why} (exit ${stepArtifacts.unit_exit_code}, ${stepArtifacts.unit_tests?.passed ?? 0} passed / ${stepArtifacts.unit_tests?.failed ?? 0} failed)`);
+            }
 
             this.emit('step_gate', { ticket: ticket.id, step: 'tests_green', pass: validation.pass, failures: validation.failures });
 
@@ -701,13 +778,15 @@ export class Pipeline {
             ? `\n\n⚠️  LOAD ERRORS DETECTED (${loadErrors.length} of ${newFailedTests.length}). When a test fails with "loading <path>" or an "URI doesn't exist / undefined class" message, the test file cannot compile — usually because an imported package is NOT in the project's manifest. DO NOT try to fix the test logic first. FIRST:\n1. Read the failing test file and list every \`package:\` / \`import ... from\` it uses.\n2. Compare against pubspec.yaml / package.json.\n3. If any dependency is missing, add it (for Dart: under dev_dependencies with a compatible version; for Node: npm install / add to package.json).\n4. Then re-examine remaining test failures once compile errors are gone.`
             : '';
 
+          const failingSourceBlock = this.buildFailingTestSourceBlock(newFailedTests);
+
           const fixPrompt = `You are fixing failing tests for ticket ${ticket.id}: "${ticket.title}".
 
 ${newAnalyzerErrCount > 0 ? `NEW ANALYZER ERRORS (${newAnalyzerErrCount} — fix these first):\n${stepArtifacts.analyze_output_summary || '(see full analyzer output in pipeline state)'}\n\n` : ''}FAILING TESTS (${stepArtifacts.new_failures} new failures — preexisting red tests are filtered out):
 ${newFailedTests.join('\n')}
 
 TEST OUTPUT (last lines):
-${stepArtifacts.test_output_summary}${compileHint}${depHint}
+${stepArtifacts.test_output_summary}${compileHint}${depHint}${failingSourceBlock}
 
 PIPELINE STATE:
 ${JSON.stringify({ plan: pipelineState.steps.plan, implement: pipelineState.steps.implement, tests_green: pipelineState.steps.tests_green })}
@@ -883,12 +962,42 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       pipelineState = stepResult.pipelineState;
 
       // Think loop (if configured for this step) — skip for low-risk tickets
+      let thinkLoopResult = null;
       if (stepConfig.think_loop && stepConfig.think_challenge) {
         const risk = pipelineState.steps.plan?.risk;
         if (risk === 'low') {
           this.emit('think_loop_skipped', { ticket: ticket.id, step: stepConfig.name, reason: 'low risk' });
         } else {
           this.emit('think_loop_start', { ticket: ticket.id, step: stepConfig.name, risk });
+
+          // PIPE-018: tell think-loop where the step's real output artifact
+          // lives so an accepted critique is APPLIED, not discarded.
+          //  - plan/root_cause: structured JSON the next step consumes →
+          //    rewrite the worker-output {step}.json, then re-ingest below.
+          //  - implement/review: the artifact IS the source in the worktree
+          //    → the revise call edits it directly (kind:'code').
+          //  - others: no consumable artifact → legacy advisory.
+          //
+          // review was previously kind:'none' (advisory). That made the two
+          // PIPE-018 mechanisms fight each other: round 1 finds real code
+          // bugs and is judged "better", but with kind:'none' the findings
+          // are stored, never applied. Round 2 re-reads the same unchanged
+          // source, re-raises the identical finding, and the non-convergence
+          // guard blocks the ticket (predictor T-018 global StateProviders,
+          // T-025 unused proPackProvider — both blocked this exact way).
+          // review's yaml grants Edit/Write, so apply findings to source
+          // just like implement.
+          let reviseTarget;
+          if (stepConfig.name === 'plan' || stepConfig.name === 'root_cause') {
+            reviseTarget = {
+              kind: 'json',
+              artifactPath: resolve(this.config._resolved.workerOutputDir, ticket.id, `${stepConfig.name}.json`),
+            };
+          } else if (stepConfig.name === 'implement' || stepConfig.name === 'review') {
+            reviseTarget = { kind: 'code' };
+          } else {
+            reviseTarget = { kind: 'none' };
+          }
 
           const tlResult = await thinkLoop({
             initialResult: stepResult.lastResult || '',
@@ -902,7 +1011,9 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             config: this.effectiveConfig(),
             ticket,
             emitter: this.emitter,
+            reviseTarget,
           });
+          thinkLoopResult = tlResult;
 
           // A+B: think-loop hit a hard blocker / non-convergence. Do NOT
           // proceed to burn implement/review/heal on a doomed plan — halt
@@ -915,6 +1026,20 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             e.blockedReason = tlResult.blockedReason;
             e.blockedStep = stepConfig.name;
             throw e;
+          }
+
+          // PIPE-018: the revise phase rewrote the worker-output JSON in
+          // place. reloadStepFromDisk reads the CANONICAL pipeline JSON,
+          // not the worker artifact — so without re-ingesting, the revised
+          // plan would never reach pipelineState.steps and the next step
+          // would still consume the pre-fix version. Re-run the same
+          // whitelisted ingest the step itself used, then persist.
+          if (tlResult?.revised && tlResult.reviseKind === 'json') {
+            const ingested = await this.ingestWorkerOutput(ticket.id, stepConfig.name, pipelineState);
+            if (ingested) {
+              try { await this.savePipelineJson(ticket.id, pipelineState); } catch { /* best-effort */ }
+              this.emit('think_revise_ingested', { ticket: ticket.id, step: stepConfig.name });
+            }
           }
 
           // Re-read pipeline JSON after think loop (may have been updated)
@@ -968,6 +1093,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         filesChanged: filesChanged || filesUpdated,
         status: stepArtifactsFinal.status || 'done',
         usagePercent: this.getUsagePercent().percent,
+        // Instrumentation: the think-loop's cost+outcome was previously
+        // SSE-only and unmeasurable after the fact. Persist a compact
+        // summary onto the step metric so the reports API exposes
+        // benefit-per-token (rounds, how many critiques were applied,
+        // and the loop's own token spend).
+        thinkLoop: thinkLoopResult ? {
+          rounds: thinkLoopResult.rounds,
+          discards: thinkLoopResult.discards,
+          improvements: thinkLoopResult.improvements,
+          revised: !!thinkLoopResult.revised,
+          blocked: !!thinkLoopResult.blocked,
+          blockedReason: thinkLoopResult.blockedReason || null,
+          tokens: thinkLoopResult.tokens,
+          history: thinkLoopResult.history,
+        } : null,
       };
       stepMetrics.push(metric);
 
@@ -1343,6 +1483,62 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // wholesale-reload site at the worker-completion path picked them up; the
   // step loop skipped implement/tests_green/review/docs_update; squash-merge
   // landed on master with no implementation verification.
+  // PIPE-017: pre-load the source of each failing test (or compile-broken
+  // file) into the heal prompt. Without this the heal only sees "a test
+  // failed somewhere" and has to spend turns Re-reading; with it, it has
+  // the actual evidence ("this fixture's Entry(...) is missing the new
+  // required field"). Composes with PIPE-016 (planner-side prevention):
+  // even when the planner misses a consumer, heal can recover from the
+  // source it can now see. Dedupes on path, ranks by how many failures
+  // reference the file, caps at maxFiles, truncates each to 200 lines/8KB.
+  buildFailingTestSourceBlock(failedTests, opts = {}) {
+    const MAX_FILES = opts.maxFiles || 8;
+    const MAX_LINES = 200;
+    const MAX_BYTES = 8 * 1024;
+    if (!Array.isArray(failedTests) || failedTests.length === 0) return '';
+    const loadErrorPattern = /loading\s+\/|uri_does_not_exist|undefined[_ ]class|undefined[_ ]function|Target of URI doesn't exist/i;
+    const pathRe = /([\w./@-]+\.(?:dart|tsx|ts|jsx|js|py))/g;
+    const counts = new Map();      // path -> # of failing entries referencing it
+    const compilePaths = new Set(); // paths that came from a compile/load error
+    for (const entry of failedTests) {
+      if (typeof entry !== 'string') continue;
+      const isCompile = loadErrorPattern.test(entry);
+      const seen = new Set();
+      let m;
+      pathRe.lastIndex = 0;
+      while ((m = pathRe.exec(entry)) !== null) {
+        const p = m[1];
+        if (seen.has(p)) continue;
+        seen.add(p);
+        counts.set(p, (counts.get(p) || 0) + 1);
+        if (isCompile) compilePaths.add(p);
+      }
+    }
+    if (counts.size === 0) return '';
+    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, MAX_FILES);
+    const blocks = [];
+    for (const [rel] of ranked) {
+      const abs = rel.startsWith('/') ? rel : resolve(this.cwd, rel);
+      let src;
+      try { src = readFileSync(abs, 'utf-8'); } catch { continue; }
+      const lines = src.split('\n');
+      const totalBytes = Buffer.byteLength(src, 'utf-8');
+      let body = lines.slice(0, MAX_LINES).join('\n');
+      if (Buffer.byteLength(body, 'utf-8') > MAX_BYTES) body = body.slice(0, MAX_BYTES);
+      const truncated = lines.length > MAX_LINES || totalBytes > MAX_BYTES
+        ? `\n… [truncated; full file is ${lines.length} lines / ${totalBytes}B]` : '';
+      const compileNote = compilePaths.has(rel)
+        ? ' note="this file failed to COMPILE — fix the import/type mismatch here first, do not touch test logic"' : '';
+      blocks.push(`<failing_source path="${rel}"${compileNote}>\n${body}${truncated}\n</failing_source>`);
+    }
+    if (blocks.length === 0) return '';
+    const omitted = counts.size - ranked.length;
+    const cap = omitted > 0
+      ? ` (showing the ${blocks.length} most-referenced of ${counts.size} failing source files; ${omitted} omitted — fix these first)`
+      : '';
+    return `\n\nFAILING SOURCE FILES — pre-loaded so you can reason about cross-file breaks (e.g. a fixture's Type(...) call missing a new required field) WITHOUT re-Reading them${cap}:\n\n${blocks.join('\n\n')}\n`;
+  }
+
   async reloadStepFromDisk(ticketId, stepName, prevState) {
     const fresh = await this.loadPipelineJson(ticketId);
     if (!fresh) return prevState;

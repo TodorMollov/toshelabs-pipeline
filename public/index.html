@@ -914,6 +914,7 @@
   <div style="padding:8px 12px;display:flex;gap:6px;border-bottom:1px solid var(--border)">
     <button onclick="runAll()" id="btnRunAll" style="flex:1;background:var(--green-dim);border:1px solid var(--green);color:var(--green);font-size:11px;font-weight:600;padding:6px 0;border-radius:4px;cursor:pointer;font-family:inherit">&#9654; Run All</button>
     <button onclick="stopPipeline()" id="btnStop" style="flex:1;background:var(--red-dim);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 0;border-radius:4px;cursor:pointer;font-family:inherit" disabled>&#9632; Stop</button>
+    <button onclick="restartAfterTicket()" id="btnRestartAfter" title="Finish the in-flight ticket, then relaunch on fresh code (no work lost). PIPE-019." style="flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 0;border-radius:4px;cursor:pointer;font-family:inherit" disabled>&#8635; Restart after ticket</button>
     <button onclick="forceUnlock()" id="btnUnlock" style="background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);font-size:11px;font-weight:600;padding:6px 8px;border-radius:4px;cursor:pointer;font-family:inherit" title="Force-release code lock">&#128275;</button>
   </div>
 
@@ -1153,6 +1154,26 @@ async function stopPipeline() {
   appendTerminal('Pipeline stopped by user', 'system');
 }
 
+async function restartAfterTicket() {
+  const btn = document.getElementById('btnRestartAfter');
+  try {
+    const r = await fetch('/api/restart-after-ticket', { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      appendTerminal(`Restart-after-ticket rejected: ${data.error || r.status}`, 'error');
+      return;
+    }
+    appendTerminal('Graceful restart armed — current ticket will finish, then relaunch on fresh code (PIPE-019).', 'system');
+    if (btn) {
+      btn.disabled = true;
+      btn.style.color = 'var(--text-muted)';
+      btn.textContent = '↻ Restart armed';
+    }
+  } catch (e) {
+    appendTerminal(`Restart-after-ticket failed: ${e.message}`, 'error');
+  }
+}
+
 async function forceUnlock() {
   const r = await fetch('/api/unlock', { method: 'POST' });
   const data = await r.json();
@@ -1171,16 +1192,19 @@ function setRunning(v) {
   const pill = document.getElementById('statusPill');
   const btnAll = document.getElementById('btnRunAll');
   const btnStop = document.getElementById('btnStop');
+  const btnRestartAfter = document.getElementById('btnRestartAfter');
   const stat = document.getElementById('statStatus');
   if (v) {
     pill.className = 'status-pill running'; pill.innerHTML = '<div class="dot"></div> Running';
     btnAll.disabled = true; btnAll.style.opacity = '0.4';
     btnStop.disabled = false; btnStop.style.color = 'var(--red)'; btnStop.style.borderColor = 'var(--red)';
+    if (btnRestartAfter) { btnRestartAfter.disabled = false; btnRestartAfter.style.color = 'var(--yellow)'; btnRestartAfter.style.borderColor = 'var(--yellow)'; btnRestartAfter.textContent = '↻ Restart after ticket'; }
     stat.textContent = 'Running'; stat.style.color = 'var(--yellow)';
   } else {
     pill.className = 'status-pill idle'; pill.textContent = 'Idle';
     btnAll.disabled = false; btnAll.style.opacity = '1';
     btnStop.disabled = true; btnStop.style.color = 'var(--text-muted)'; btnStop.style.borderColor = 'var(--border)';
+    if (btnRestartAfter) { btnRestartAfter.disabled = true; btnRestartAfter.style.color = 'var(--text-muted)'; btnRestartAfter.style.borderColor = 'var(--border)'; btnRestartAfter.textContent = '↻ Restart after ticket'; }
     state.running = false;
     state.runningTicket = null; state.runningStep = null;
     stat.textContent = 'Idle'; stat.style.color = '';

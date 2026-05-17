@@ -6,7 +6,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { loadBacklog, filterAndSort, reorderTicket, archiveTicket } from './backlog.js';
-import { reloadConfig, loadAllConfigs } from './config.js';
+import { reloadConfig, loadAllConfigs, persistActiveProject } from './config.js';
 import { createMcpServer, mountMcpOnExpress } from './mcp/server.js';
 import { Pipeline } from './pipeline.js';
 import { EventLogger } from './event-log.js';
@@ -760,6 +760,9 @@ export async function startServer(config) {
     Object.assign(config, { ...target });
     Object.defineProperty(config, '_projects', { value: preservedProjects, enumerable: false });
     Object.defineProperty(config, '_activeProjectId', { value: targetId, enumerable: false, writable: true });
+    // Persist so a hard restart (start.sh, not a PIPE-019 exit-75
+    // relaunch) resumes this project instead of the alphabetical default.
+    persistActiveProject(targetId);
     emitter.emit('project_activated', { id: targetId, name: config.name });
     console.log(`[projects] activated ${targetId} (project_dir=${config.project_dir})`);
     res.json({ active: targetId, name: config.name, project_dir: config.project_dir });
@@ -1023,6 +1026,35 @@ export async function startServer(config) {
   //
   // PIPE-008: this endpoint stops the ACTIVE PROJECT's pipeline only.
   // Use /api/projects/:id/stop to stop a non-active project's run.
+  // PIPE-019: graceful restart-between-tickets. Arms a sticky flag on the
+  // running pipeline; the CURRENT ticket finishes (and is cherry-picked)
+  // and then run() exits with RESTART_EXIT_CODE so the start.sh supervisor
+  // relaunches node on freshly-deployed code. The queue resumes
+  // automatically — already-done tickets are skipped via pipeline-state.
+  // Unlike /api/stop this does NOT kill the subprocess (no work is lost).
+  app.post('/api/restart-after-ticket', async (req, res) => {
+    const projectId = config._activeProjectId || config.name || 'default';
+    const entry = activePipelines.get(projectId);
+    if (!entry) {
+      return res.status(400).json({
+        error: 'No pipeline running — nothing to restart between tickets. Restart the server normally to pick up new code.',
+      });
+    }
+    const { pipeline } = entry;
+    if (typeof pipeline.requestRestartAfterTicket !== 'function') {
+      return res.status(409).json({
+        error: 'Running pipeline pre-dates graceful restart (PIPE-019). Use /api/stop, then restart.',
+      });
+    }
+    pipeline.requestRestartAfterTicket();
+    emitter.emit('restart_after_ticket_requested', { project: projectId });
+    return res.json({
+      status: 'restart_armed',
+      project: projectId,
+      note: 'Current ticket will finish, then the server restarts and the queue continues.',
+    });
+  });
+
   app.post('/api/stop', async (req, res) => {
     const projectId = config._activeProjectId || config.name || 'default';
 

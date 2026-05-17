@@ -1,3 +1,4 @@
+import { readFile } from 'fs/promises';
 import { spawnClaude } from './runner.js';
 
 // Normalize a challenge's findings into a stable set of issue signatures so
@@ -50,6 +51,16 @@ export async function thinkLoop({
   config,
   ticket,
   emitter,
+  // PIPE-018: where the step's real output artifact lives, so an
+  // accepted critique is APPLIED to it rather than discarded.
+  //   { kind: 'json', artifactPath } → rewrite that JSON file in place
+  //   { kind: 'code' }               → edit source in the working dir
+  //   { kind: 'none' } (default)     → legacy: bestResult = findings text,
+  //                                    nothing is applied (e.g. review step)
+  reviseTarget = { kind: 'none' },
+  // DI seam for tests — defaults to the real CLI spawn. Production callers
+  // never pass this; the regression suite injects a deterministic fake.
+  spawn = spawnClaude,
 }) {
   const maxRounds = config.think_loop.max_rounds;
   const maxDiscards = config.think_loop.max_discards;
@@ -59,8 +70,17 @@ export async function thinkLoop({
   let rounds = 0;
   let blocked = false;
   let blockedReason = '';
+  let revised = false;
   const history = [];
   const issueFirstSeenRound = new Map(); // signature -> round first seen
+  // Instrumentation: token cost of the loop itself, broken out by phase,
+  // so the report can show what the think-loop actually spent (it was
+  // previously invisible — only the per-call [usage] log line existed).
+  const tokens = {
+    challengeIn: 0, challengeOut: 0,
+    compareIn: 0, compareOut: 0,
+    reviseIn: 0, reviseOut: 0,
+  };
 
   while (rounds < maxRounds && discards < maxDiscards) {
     rounds++;
@@ -93,7 +113,7 @@ No prose. No explanations. No complete rewrites. Just the findings array, or NO_
     try {
       let chIn = 0, chOut = 0, chTools = 0;
       const chStart = Date.now();
-      const response = await spawnClaude({
+      const response = await spawn({
         prompt: challengePrompt,
         model: config.session.model,
         tools: ['Read', 'Grep', 'Glob'],
@@ -116,6 +136,8 @@ No prose. No explanations. No complete rewrites. Just the findings array, or NO_
         },
       });
       challengeResult = response.result;
+      tokens.challengeIn += chIn;
+      tokens.challengeOut += chOut;
       const chSecs = Math.round((Date.now() - chStart) / 1000);
       console.log(`[usage] ${ticket.id}/${stepName} (think-challenge-${rounds}) | ${config.session.model} | ${chSecs}s | ${chIn.toLocaleString()} in / ${chOut.toLocaleString()} out | ${chTools} tools`);
       emitter?.emit('step_attempt_done', { ticket: ticket.id, step: `${stepName}_think_challenge`, round: rounds, model: config.session.model, inputTokens: chIn, outputTokens: chOut, toolCalls: chTools });
@@ -206,7 +228,7 @@ Do not hedge. Pick one.`;
     try {
       let cmpIn = 0, cmpOut = 0;
       const cmpStart = Date.now();
-      compareResponse = await spawnClaude({
+      compareResponse = await spawn({
         prompt: comparePrompt,
         model: 'haiku',
         tools: [],
@@ -226,6 +248,8 @@ Do not hedge. Pick one.`;
           });
         },
       });
+      tokens.compareIn += cmpIn;
+      tokens.compareOut += cmpOut;
       const cmpSecs = Math.round((Date.now() - cmpStart) / 1000);
       console.log(`[usage] ${ticket.id}/${stepName} (think-compare-${rounds}) | haiku | ${cmpSecs}s | ${cmpIn.toLocaleString()} in / ${cmpOut.toLocaleString()} out`);
       emitter?.emit('step_attempt_done', { ticket: ticket.id, step: `${stepName}_think_compare`, round: rounds, model: 'haiku', inputTokens: cmpIn, outputTokens: cmpOut });
@@ -245,16 +269,90 @@ Do not hedge. Pick one.`;
     const reason = verdict.replace(/^(BETTER|WORSE)[:\s]*/i, '').trim();
 
     if (isBetter) {
-      bestResult = challengeResult;
-      history.push({ round: rounds, outcome: 'improved', reason });
-      emitter?.emit('think_round_end', {
-        ticket: ticket.id,
-        step: stepName,
-        round: rounds,
-        outcome: 'improved',
-        reason,
-        discards,
-      });
+      // PIPE-018: the critique is genuinely better — but `challengeResult`
+      // is the FINDINGS list, not a fixed artifact. Previously we did
+      // `bestResult = challengeResult`, so the next step consumed the
+      // original (unfixed) plan/code and the critic insight was discarded
+      // (predictor T-001: plan_critic's `rm -rf app/` pre-step never
+      // reached the executed plan). Now we APPLY the findings to the real
+      // artifact so the fix actually lands. kind:'none' keeps the legacy
+      // advisory behaviour (e.g. the review step has no consumable artifact).
+      if (reviseTarget.kind === 'none') {
+        bestResult = challengeResult;
+        history.push({ round: rounds, outcome: 'improved', reason });
+        emitter?.emit('think_round_end', {
+          ticket: ticket.id, step: stepName, round: rounds,
+          outcome: 'improved', reason, discards,
+        });
+      } else {
+        const isJson = reviseTarget.kind === 'json';
+        const revisePrompt = isJson
+          ? `Apply these accepted review findings to the "${stepName}" output artifact for ticket ${ticket.id}.
+
+The artifact is the JSON file at: ${reviseTarget.artifactPath}
+
+FINDINGS TO INCORPORATE:
+${challengeResult}
+
+Read that JSON file, then OVERWRITE it (Write tool) with valid JSON that keeps EXACTLY the same top-level fields/schema but incorporates every fix above. Change only what the findings require. Do not add commentary, do not wrap in markdown — the file must remain machine-parseable JSON.`
+          : `Apply these accepted review findings to the implementation for ticket ${ticket.id} by editing the actual source files in the working directory.
+
+FINDINGS TO INCORPORATE:
+${challengeResult}
+
+Make the minimal edits the findings prescribe (Read/Edit/Write). Do NOT run tests — the pipeline re-runs them. Do not rewrite unrelated code.`;
+
+        let reviseResult;
+        try {
+          let rvIn = 0, rvOut = 0, rvTools = 0;
+          reviseResult = await spawn({
+            prompt: revisePrompt,
+            model: config.session.model,
+            tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write'],
+            maxTurns: 15,
+            workingDir: config.project_dir,
+            sessionId: null,
+            bare: true,
+            onData: (event) => {
+              const usage = event.message?.usage || event.usage;
+              if (usage?.input_tokens) rvIn = usage.input_tokens;
+              if (usage?.output_tokens) rvOut += usage.output_tokens;
+              if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') rvTools++;
+              emitter?.emit('claude_event', {
+                ticket: ticket.id, step: stepName, phase: 'think_revise',
+                round: rounds, event,
+              });
+            },
+          });
+          tokens.reviseIn += rvIn;
+          tokens.reviseOut += rvOut;
+          console.log(`[usage] ${ticket.id}/${stepName} (think-revise-${rounds}) | ${config.session.model} | ${rvIn.toLocaleString()} in / ${rvOut.toLocaleString()} out | ${rvTools} tools`);
+          emitter?.emit('step_attempt_done', { ticket: ticket.id, step: `${stepName}_think_revise`, round: rounds, model: config.session.model, inputTokens: rvIn, outputTokens: rvOut, toolCalls: rvTools });
+        } catch (err) {
+          if (err.rateLimited) throw err;
+          emitter?.emit('think_error', { ticket: ticket.id, step: stepName, round: rounds, error: `revise failed: ${err.message}` });
+          break;
+        }
+
+        // bestResult must reflect the REVISED artifact so the next round's
+        // challenge critiques the fixed version (and the non-convergence
+        // detector correctly flags a fix that didn't take).
+        if (isJson) {
+          try {
+            bestResult = await readFile(reviseTarget.artifactPath, 'utf-8');
+          } catch {
+            bestResult = reviseResult?.result || challengeResult;
+          }
+        } else {
+          bestResult = '(implementation revised in working directory per findings)';
+        }
+        revised = true;
+        history.push({ round: rounds, outcome: 'improved', reason, applied: true });
+        emitter?.emit('think_round_end', {
+          ticket: ticket.id, step: stepName, round: rounds,
+          outcome: 'improved', reason, discards, applied: true,
+        });
+      }
     } else {
       discards++;
       history.push({ round: rounds, outcome: 'discarded', reason });
@@ -269,6 +367,7 @@ Do not hedge. Pick one.`;
     }
   }
 
+  const improvements = history.filter((h) => h.outcome === 'improved').length;
   if (blocked) {
     emitter?.emit('think_blocked', {
       ticket: ticket.id,
@@ -277,6 +376,8 @@ Do not hedge. Pick one.`;
       discards,
       reason: blockedReason,
       history,
+      tokens,
+      revised,
     });
   } else {
     emitter?.emit('think_converged', {
@@ -284,10 +385,19 @@ Do not hedge. Pick one.`;
       step: stepName,
       rounds,
       discards,
-      improvements: history.filter((h) => h.outcome === 'improved').length,
+      improvements,
+      revised,
+      tokens,
       history,
     });
   }
 
-  return { result: bestResult, rounds, discards, history, blocked, blockedReason };
+  return {
+    result: bestResult,
+    rounds, discards, improvements, history,
+    blocked, blockedReason,
+    revised,
+    reviseKind: reviseTarget.kind,
+    tokens,
+  };
 }
