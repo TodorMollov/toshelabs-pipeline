@@ -357,30 +357,56 @@ export class Pipeline {
           continue;
         }
 
-        // Archive the ticket. Backlog files are gitignored so this is a
-        // file-only operation that doesn't touch git history.
-        await archiveTicket(ticket.id, this.config);
-
-        // Worktree mode: cherry-pick the ticket commit from the worktree's
-        // side branch onto the operator's master in the primary checkout.
-        // We only attempt this when the ticket actually committed (the
-        // commit step in processTicket records sha on pipelineState).
+        // PIPE-020: archive is gated on the ticket *landing on master*, not
+        // on merely reaching status:done. The old order archived first and
+        // then attempted the cherry-pick; a failed cherry-pick (CONFLICT,
+        // DIRTY, WRONG_BRANCH, …) left the ticket archived as `done` with
+        // the work stranded behind a pipeline/pending-merge-* tag and never
+        // on master. The archive is the ledger the operator trusts, so
+        // "done in the archive" MUST mean "shipped to master". This is the
+        // same anti-mis-ship stance loadOrCreatePipelineJson takes: a not-
+        // landed ticket stays in the backlog and re-runs rather than being
+        // recorded as done.
+        //
+        // Two land paths:
+        //   • worktree mode → cherry-pick the side-branch commit onto the
+        //     operator's master here; archive only if it lands.
+        //   • checkpoint/non-worktree mode → the commit was already made
+        //     directly on master earlier in processTicket (no ticket_sha to
+        //     cherry-pick), so reaching here already means landed — archive
+        //     as before. A worktree ticket that produced no commit also
+        //     falls here (nothing to ship).
         if (worktreeCtx && finalState?.checkpoint?.ticket_sha) {
           const sha = finalState.checkpoint.ticket_sha;
           const result = cherryPickToMaster(this.config.project_dir, sha, worktreeCtx.defaultBranch);
-          if (result.ok) {
-            this.emit('worktree_merged', { ticket: ticket.id, sha: result.headSha, source: sha });
-            console.log(`[worktree] ${ticket.id}: cherry-picked ${sha.slice(0, 7)} onto ${worktreeCtx.defaultBranch} (${result.headSha.slice(0, 7)})`);
+          // EMPTY = git found the patch already present on master (identical
+          // content landed by another route). The change *is* shipped, so
+          // this counts as landed; archiving prevents the un-archived
+          // ticket from re-queuing forever to apply a no-op patch.
+          const landed = result.ok || result.code === 'EMPTY';
+          if (landed) {
+            const masterSha = result.headSha || sha;
+            this.emit('worktree_merged', { ticket: ticket.id, sha: masterSha, source: sha, empty: !result.ok });
+            console.log(`[worktree] ${ticket.id}: ${result.ok
+              ? `cherry-picked ${sha.slice(0, 7)} onto ${worktreeCtx.defaultBranch} (${masterSha.slice(0, 7)})`
+              : `already present on ${worktreeCtx.defaultBranch} (empty cherry-pick) — treating as landed`}`);
             // Persist merge status so the dashboard / next run can see it.
-            finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: result.headSha };
+            finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: masterSha, empty: !result.ok };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+            // Landed → safe to archive. Backlog files are gitignored so
+            // this is a file-only operation that doesn't touch git history.
+            // landedCommit threads the real master sha into the archive and
+            // closed-bugs ledger so the audit can verify done == shipped.
+            await archiveTicket(ticket.id, this.config, { landedCommit: masterSha });
           } else {
-            // Anchor the unmerged sha with a tag in the primary repo
-            // (worktree shares object storage). The next ticket's
-            // prepareWorktreeForTicket resets the side branch to
-            // master, which would otherwise leave the commit only
-            // reachable via reflog. The tag keeps it permanently
-            // resolvable for the operator's manual cherry-pick.
+            // NOT landed. Do NOT archive — the ticket stays in the backlog
+            // so it re-queues on the next run (loadOrCreatePipelineJson
+            // resets the stale done-state) until it lands or the operator
+            // resolves the conflict. Anchor the unmerged sha with a tag in
+            // the primary repo (worktree shares object storage; the next
+            // prepareWorktreeForTicket resets the side branch, which would
+            // otherwise leave the commit reachable only via reflog). The
+            // tag keeps it permanently resolvable for a manual cherry-pick.
             const tag = `pipeline/pending-merge-${ticket.id}`;
             try {
               execSync(`git tag -f ${tag} ${sha}`, { cwd: this.config.project_dir, encoding: 'utf-8', timeout: 10000 });
@@ -395,12 +421,19 @@ export class Pipeline {
               head: result.head,
               branch: worktreeCtx.branch,
               tag,
+              archived: false,
               hint: `cd ${this.config.project_dir} && git cherry-pick ${tag}`,
             });
-            console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); commit ${sha.slice(0, 7)} anchored at tag ${tag}`);
+            console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); NOT archived — will re-queue; commit ${sha.slice(0, 7)} anchored at tag ${tag}`);
             finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
           }
+        } else {
+          // Checkpoint/non-worktree path (or worktree ticket with no
+          // commit): nothing to cherry-pick, the work — if any — is already
+          // on master. Backlog files are gitignored so this is a file-only
+          // operation that doesn't touch git history.
+          await archiveTicket(ticket.id, this.config);
         }
 
         // Pause between tickets if requested
@@ -696,6 +729,19 @@ export class Pipeline {
         const maxHealAttempts = 3;
         let healAttempt = 0;
         let testsGreenResult;
+        // #1 heal regression guard: a heal must not make the tree worse.
+        // Track the failure score the heal was asked to fix; on the next
+        // run compare against it. heal-1 on T-011 cleared 4 analyzer
+        // errors but introduced 10 test failures, then heal-2 had to dig
+        // out from that worse state. We now (a) escalate the model the
+        // moment a heal regresses and (b) abort honestly after two
+        // consecutive regressions rather than burning the remaining
+        // attempts on a poisoned tree.
+        let prevHealScore = null;
+        let healRegressed = false;
+        let consecutiveRegressions = 0;
+        const failureScore = (a) => (a.new_failures || 0) + (a.new_analyzer_errors || 0)
+          + ((a.unit_crashed || a.unit_skipped_compile_errors || (a.unit_ran_nothing && !a.unit_no_tests)) ? 1 : 0);
 
         while (true) {
           testsGreenResult = await this.runTestsGreen(ticket, pipelineState);
@@ -717,6 +763,31 @@ export class Pipeline {
             || stepArtifacts.unit_skipped_compile_errors
             || (stepArtifacts.unit_ran_nothing && !stepArtifacts.unit_no_tests);
           const needsHeal = runBroken || (stepArtifacts.new_failures > 0) || (stepArtifacts.new_analyzer_errors > 0);
+
+          // #1: compare this run's failure score against the score the
+          // previous heal was handed. Strictly worse = that heal
+          // regressed the tree.
+          const curScore = failureScore(stepArtifacts);
+          if (needsHeal && prevHealScore !== null) {
+            if (curScore > prevHealScore) {
+              healRegressed = true;
+              consecutiveRegressions += 1;
+              this.emit('tests_green_heal_regressed', { ticket: ticket.id, attempt: healAttempt, before: prevHealScore, after: curScore });
+              console.log(`[self-heal] ${ticket.id}/tests_green: heal-${healAttempt} REGRESSED (score ${prevHealScore} → ${curScore}) — escalating model; not building further on the worse tree`);
+              if (consecutiveRegressions >= 2) {
+                // Two heals in a row made it worse. More attempts on a
+                // poisoned tree dig the hole deeper — fail honestly now
+                // (processTicket reverts to baseline) instead of burning
+                // the last rung.
+                this.emit('step_gate_failed', { ticket: ticket.id, step: 'tests_green', failures: [`heal regressed twice (score ${prevHealScore} → ${curScore})`] });
+                throw new Error(`Gate failed for ${ticket.id}/tests_green: heal regressed twice (score → ${curScore}); aborting before further damage to the working tree`);
+              }
+            } else {
+              healRegressed = false;
+              consecutiveRegressions = 0;
+            }
+          }
+
           if (!needsHeal || healAttempt >= maxHealAttempts) {
             const planArtifacts = pipelineState.steps.plan || {};
             const validation = validateStep(stepArtifacts, stepConfig, planArtifacts);
@@ -760,6 +831,9 @@ export class Pipeline {
 
           // Tests have new failures (or new analyzer errors) — ask Claude to fix
           healAttempt++;
+          // Remember the score this heal is being handed, so the next
+          // run can tell whether the heal helped or regressed (#1).
+          prevHealScore = curScore;
           const newFailedTests = stepArtifacts.new_failed_tests || stepArtifacts.failed_tests || [];
           const newAnalyzerErrCount = stepArtifacts.new_analyzer_errors || 0;
           const compileFirst = stepArtifacts.unit_skipped_compile_errors;
@@ -795,10 +869,21 @@ Fix the code so these tests pass. Read the failing test files to understand what
 
 After fixing, DO NOT run the tests — the pipeline will re-run them automatically.`;
 
-          // Model escalation ladder: most heal fixes are trivial (missing
-          // import, null check, typo) — haiku handles them cheaply. Escalate
-          // only when a cheaper model has already failed on the same run.
-          const healModel = healAttempt === 1 ? 'haiku' : healAttempt === 2 ? 'sonnet' : 'opus';
+          // Model escalation ladder. Most heal fixes are trivial (missing
+          // import, null check, typo) — the cheap rung handles them. But
+          // #2: on a large/coupled ticket, or a compile-class failure, the
+          // cheap rung regresses (it fixes the symptom it's pointed at and
+          // breaks something cross-file — exactly heal-1 on T-011). Start
+          // the ladder above the cheap rung in those cases so the first
+          // heal already has the depth to reason across files. And if the
+          // previous heal regressed (#1), jump straight up another rung.
+          const ladder = this.config.restart?.escalation_ladder || ['haiku', 'sonnet', 'opus'];
+          const planFiles = (pipelineState.steps.plan?.files_to_change || []).length;
+          const coupled = planFiles > 5 || /\b(med|medium|high)\b/i.test(String(pipelineState.steps.plan?.risk || ''));
+          const compileClass = newAnalyzerErrCount > 0 || compileFirst;
+          const startRung = (coupled || compileClass) ? 1 : 0;
+          const rung = Math.min(ladder.length - 1, startRung + (healAttempt - 1) + (healRegressed ? 1 : 0));
+          const healModel = ladder[rung] || 'opus';
           try {
             let healIn = 0, healOut = 0, healTools = 0;
             const healStart = Date.now();

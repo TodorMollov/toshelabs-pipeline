@@ -996,30 +996,56 @@ async function loadPipelineStates() {
     if (!r.ok) return;
     pipelineStates = await r.json();
     applyPipelineStatesToDOM();
-    // Seed the center header + breadcrumb on page load (mid-run case —
-    // SSE missed the original ticket_start). Picks the first ticket with
-    // status 'in_progress'; populates id+title; fetches its step detail
-    // to recover the currently-running step (the first step whose status
-    // isn't `done` or `not_applicable`).
-    if (!state.runningTicket) {
+    // Reconcile the center header + breadcrumb against real pipeline
+    // state on EVERY poll — not just a cold page load. The breadcrumb was
+    // previously forward-only: it advanced solely on live `step_start`
+    // SSE events, and the recovery-from-/api/pipeline path was gated
+    // behind `!state.runningTicket`. But `ticket_start` sets
+    // runningTicket then calls loadPipelineStates(), so that gate was
+    // closed for the entire rest of the ticket — any missed `step_start`
+    // (rate-limit stall, server restart-arm, SSE reconnect, or simply
+    // being *between* steps) left the breadcrumb stuck or blank with no
+    // way to self-heal. Reconciling unconditionally makes it converge to
+    // the truth within one poll regardless of which events were missed.
+    {
+      let inProgressId = null;
       for (const [id, s] of Object.entries(pipelineStates)) {
-        if (s.status === 'in_progress') {
-          const t = (allTickets || []).find(x => x.id === id);
-          setActiveTicket(id, t?.title || '');
-          state.runningTicket = id;
-          updateNowRunning();
-          fetch(`/api/pipeline/${encodeURIComponent(id)}`).then(r=>r.json()).then(p => {
-            const steps = p?.steps || {};
-            for (const [name, ss] of Object.entries(steps)) {
-              if (ss.status !== 'done' && ss.status !== 'not_applicable') {
-                state.runningStep = name;
-                updateNowRunning();
-                break;
-              }
-            }
-          }).catch(()=>{});
-          break;
+        if (s.status === 'in_progress') { inProgressId = id; break; }
+      }
+      if (inProgressId) {
+        const t = (allTickets || []).find(x => x.id === inProgressId);
+        if (state.runningTicket !== inProgressId) {
+          setActiveTicket(inProgressId, t?.title || '');
+          state.runningTicket = inProgressId;
         }
+        updateNowRunning();
+        fetch(`/api/pipeline/${encodeURIComponent(inProgressId)}`).then(r=>r.json()).then(p => {
+          const steps = p?.steps || {};
+          // Current step = first step not yet done/skipped. This is
+          // resilient to missed step_start events: it re-derives from
+          // the persisted per-step status the orchestrator writes.
+          let cur = null;
+          for (const [name, ss] of Object.entries(steps)) {
+            if (ss.status !== 'done' && ss.status !== 'not_applicable') { cur = name; break; }
+          }
+          if (cur && state.runningStep !== cur) {
+            state.runningStep = cur;
+            updateNowRunning();
+          }
+          // Repaint the step-chip trail from persisted per-step status.
+          // The chips were forward-only too: renderStepPipeline() draws
+          // them all blank and only live step_start/step_done events
+          // marked them done/active, so a mid-ticket refresh (or any
+          // missed event) showed an empty trail with no "where am I".
+          // Reconcile every poll: done/not_applicable → done, the
+          // current step → active, everything else → pending.
+          for (const s of STEPS) {
+            const st = steps[s]?.status;
+            if (st === 'done' || st === 'not_applicable') setStepStatus(s, 'done');
+            else if (s === cur) setStepStatus(s, 'active');
+            else setStepStatus(s, '');
+          }
+        }).catch(()=>{});
       }
     }
   } catch { /* best-effort */ }
@@ -1184,7 +1210,13 @@ function updateNowRunning() {
   const el = document.getElementById('nowRunning');
   if (!el) return;
   const t = state.runningTicket, s = state.runningStep;
-  el.textContent = (t && state.running) ? (s ? `${t} · ${s}` : t) : '';
+  // Show whenever a running ticket is known, even if `state.running`
+  // momentarily flipped false (rate-limit stall / SSE reconnect / Idle
+  // pill flicker). The loadPipelineStates reconcile keeps runningTicket
+  // truthful — it's set only while a ticket is genuinely in_progress and
+  // cleared on ticket_done/stop — so this no longer needs state.running
+  // as a guard, which is exactly what blanked the breadcrumb mid-stall.
+  el.textContent = t ? (s ? `${t} · ${s}` : t) : '';
 }
 
 function setRunning(v) {
