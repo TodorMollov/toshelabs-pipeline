@@ -89,8 +89,24 @@ export function autoCommitPaths(cwd, paths) {
 //
 // Idempotent: rerunning replaces the tag at HEAD.
 //
+// PIPE-026: `absorbPaths` is an allow-list of declared non-code pinned paths
+// (project `context_files` — pinned API/reference docs). These are an
+// intended, common setup and are frequently untracked. isDirty() counts
+// untracked files, so without this an untracked pinned doc makes EVERY
+// ticket fail at startup with DIRTY_TREE and freezes the whole queue with
+// no obvious cause. We auto-commit ONLY those declared paths before the
+// dirty check; genuine uncommitted CODE/WIP still hard-blocks as before.
+//
 // Returns { baselineTag, baselineSha }.
-export function setupTicketBaseline(ticketId, cwd) {
+export function setupTicketBaseline(ticketId, cwd, absorbPaths = []) {
+  if (Array.isArray(absorbPaths) && absorbPaths.length > 0) {
+    try {
+      autoCommitPaths(cwd, absorbPaths);
+    } catch {
+      // Best-effort: a failed absorption must not be more fatal than the
+      // DIRTY_TREE it was trying to prevent. Fall through to isDirty.
+    }
+  }
   if (isDirty(cwd)) {
     throw new CheckpointError(
       `working tree has uncommitted changes — refusing to start pipeline. ` +

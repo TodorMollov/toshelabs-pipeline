@@ -68,6 +68,34 @@ describe('setupTicketBaseline', () => {
     );
   });
 
+  // PIPE-026 regression: an untracked declared context_file must NOT
+  // freeze the queue, but stray uncommitted code still must.
+  test('PIPE-026: untracked declared context_file is absorbed → run starts', () => {
+    writeFileSync(join(repoDir, 'PINNED_API.md'), '# pinned reference\n');
+    const res = setupTicketBaseline('T-CTX', repoDir, ['PINNED_API.md']);
+    assert.equal(res.baselineTag, 'pipeline/T-CTX/baseline');
+    // The doc was committed (absorbed), not left dirty.
+    assert.equal(git('status --porcelain'), '');
+    assert.match(git('log -1 --format=%s'), /\[human\] backlog edits at /);
+  });
+
+  test('PIPE-026: stray uncommitted CODE still hard-blocks even with absorb list', () => {
+    writeFileSync(join(repoDir, 'PINNED_API.md'), '# pinned\n');
+    writeFileSync(join(repoDir, 'src.js'), 'console.log("WIP")\n'); // not in absorb list
+    assert.throws(
+      () => setupTicketBaseline('T-CTX2', repoDir, ['PINNED_API.md']),
+      (err) => err instanceof CheckpointError && err.code === 'DIRTY_TREE',
+    );
+  });
+
+  test('PIPE-026: empty/absent absorb list = unchanged legacy behaviour', () => {
+    writeFileSync(join(repoDir, 'new.txt'), 'untracked\n');
+    assert.throws(
+      () => setupTicketBaseline('T-CTX3', repoDir, []),
+      (err) => err instanceof CheckpointError && err.code === 'DIRTY_TREE',
+    );
+  });
+
   test('idempotent: rerunning replaces the baseline tag at current HEAD', () => {
     setupTicketBaseline('T-X', repoDir);
     // Make a new commit, advancing HEAD.

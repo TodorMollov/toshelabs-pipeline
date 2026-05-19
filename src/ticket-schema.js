@@ -53,6 +53,10 @@ export const DEFAULT_SCHEMA_V1 = {
     files_likely_affected: { type: 'array' },
     out_of_scope: { type: 'array' },
     blocked_by: { type: 'array' },
+    // PIPE-020: hard dependency ordering. Optional list of ticket ids that
+    // must be done-with-landed-commit before this ticket runs. Backward
+    // compatible — tickets without it behave exactly as before.
+    depends_on: { type: 'array' },
     tags: { type: 'array' },
     defer_until: { type: 'string' },
     subsumed_by: { type: 'string' },
@@ -62,7 +66,7 @@ export const DEFAULT_SCHEMA_V1 = {
   },
   // Pipeline-managed fields — present in tickets the pipeline has touched.
   // Recognised so they don't trip the unknown-field check.
-  pipeline_managed: ['archived_at', 'landed_commit', 'merge_status', 'pipeline_state_ref'],
+  pipeline_managed: ['archived_at', 'landed_commit', 'merge_status', 'pipeline_state_ref', 'blocked_reason', 'blocked_at', 'completed', 'completed_at'],
 };
 
 /**

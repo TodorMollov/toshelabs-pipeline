@@ -177,6 +177,25 @@ export async function archiveTicket(ticketId, config, opts = {}) {
 }
 
 /**
+ * PIPE-021 bounded cherry-pick retry: park a ticket the pipeline cannot land
+ * after N attempts so it stops re-queuing and burning tokens forever. Sets
+ * status (use one in the project's exclude_status, e.g. 'manual') + a
+ * machine-readable blocked reason. Idempotent; no-op if ticket absent.
+ */
+export async function setBacklogTicketStatus(ticketId, config, status, reason) {
+  const raw = await readFile(config._resolved.backlog, 'utf-8');
+  const backlog = JSON.parse(raw);
+  const t = (backlog.tickets || []).find((x) => x.id === ticketId);
+  if (!t) return null;
+  t.status = status;
+  if (reason) t.blocked_reason = reason;
+  t.blocked_at = new Date().toISOString();
+  backlog.updated_at = new Date().toISOString().split('T')[0];
+  await writeFile(config._resolved.backlog, JSON.stringify(backlog, null, 2));
+  return t;
+}
+
+/**
  * Move a ticket up or down in execution order.
  * Assigns explicit `order` values to all actionable tickets, then swaps the target.
  */

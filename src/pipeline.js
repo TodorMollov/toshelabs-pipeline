@@ -3,7 +3,7 @@ import { existsSync, statSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 import { execSync } from 'child_process';
 import { randomUUID } from 'crypto';
-import { loadBacklog, filterAndSort, archiveTicket } from './backlog.js';
+import { loadBacklog, filterAndSort, archiveTicket, setBacklogTicketStatus } from './backlog.js';
 import { spawnClaude } from './runner.js';
 import { thinkLoop } from './think-loop.js';
 import { validateStep, isTestPath } from './validator.js';
@@ -213,6 +213,12 @@ export class Pipeline {
       // unrelated stranded tickets ahead of the user's choice.
       const resumed = this.ticketId ? [] : await this.checkCrashedPipelines();
 
+      // PIPE-021: reconcile the archive invariant before processing —
+      // surfaces any false-done strands loudly without blocking the queue.
+      try { await this.reconcileArchiveInvariant(); } catch (err) {
+        console.warn(`[reconcile] skipped: ${err.message}`);
+      }
+
       // Load and filter backlog
       const allTickets = await loadBacklog(this.config);
       const queue = resumed.concat(
@@ -252,6 +258,29 @@ export class Pipeline {
           const match = fresh.find((t) => t.id === queuedTicket.id);
           if (match) ticket = match;
         } catch { /* keep queuedTicket */ }
+
+        // PIPE-020: hard dependency-ordering gate. A ticket whose declared
+        // depends_on prerequisites have not landed must NOT run — running it
+        // produces code whose stated premise has no foundation and merges
+        // green, hiding the cascade. Skip + mark blocked with a reason
+        // naming the unsatisfied dependency and its status.
+        const depCheck = await this.dependenciesSatisfied(ticket);
+        if (!depCheck.ok) {
+          const reason = `dependency not satisfied: ${depCheck.unsatisfied
+            .map((d) => `${d.id} (status=${d.status})`).join(', ')}`;
+          this.emit('ticket_blocked_on_dependency', {
+            ticket: ticket.id, unsatisfied: depCheck.unsatisfied, reason,
+          });
+          console.error(`[depends_on] ${ticket.id}: SKIPPED — ${reason}`);
+          try {
+            const st = await this.loadOrCreatePipelineJson(ticket);
+            st.status = 'blocked';
+            st.blocked_reason = `[PIPE-020] ${reason}`;
+            st.blocked_at = new Date().toISOString();
+            await this.savePipelineJson(ticket.id, st);
+          } catch { /* best-effort: the event + log already surfaced it */ }
+          continue;
+        }
 
         this.emit('ticket_start', { ticket: ticket.id, title: ticket.title, index: i, total: queue.length });
 
@@ -425,8 +454,10 @@ export class Pipeline {
               hint: `cd ${this.config.project_dir} && git cherry-pick ${tag}`,
             });
             console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); NOT archived — will re-queue; commit ${sha.slice(0, 7)} anchored at tag ${tag}`);
-            finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag };
+            const attempts = (finalState.merge?.non_landing_attempts || 0) + 1;
+            finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag, non_landing_attempts: attempts };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+            await this.parkIfNonLandingExhausted(ticket, attempts, `cherry-pick keeps failing (code=${result.code}) after %N% attempts; tag ${tag}`);
           }
         } else {
           // Checkpoint/non-worktree path (or worktree ticket with no
@@ -472,8 +503,10 @@ export class Pipeline {
             });
             console.error(`[archive-gate] ${ticket.id}: implement changed ${changedFiles} file(s) but no landed commit on ${branchName}; NOT archived — will re-queue (PIPE-021 invariant)`);
             if (finalState) {
-              finalState.merge = { status: 'pending', at: new Date().toISOString(), code: 'NOT_ON_MASTER' };
+              const attempts = (finalState.merge?.non_landing_attempts || 0) + 1;
+              finalState.merge = { status: 'pending', at: new Date().toISOString(), code: 'NOT_ON_MASTER', non_landing_attempts: attempts };
               try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+              await this.parkIfNonLandingExhausted(ticket, attempts, `produced no landed commit on ${branchName} after %N% attempts (NOT_ON_MASTER)`);
             }
           }
         }
@@ -615,7 +648,11 @@ export class Pipeline {
       // default run path doesn't call it anymore.
 
       try {
-        const res = setupTicketBaseline(ticket.id, this.cwd);
+        // PIPE-026: absorb declared pinned context_files (relative to repo
+        // root = cwd) so an untracked pinned doc doesn't DIRTY_TREE-freeze
+        // the queue. Genuine code WIP still hard-blocks inside setup.
+        const absorb = this.config.context_files || [];
+        const res = setupTicketBaseline(ticket.id, this.cwd, absorb);
         this.emit('checkpoint_baseline_set', { ticket: ticket.id, baselineTag: res.baselineTag, baselineSha: res.baselineSha });
         console.log(`[checkpoint] ${ticket.id}: baseline ${res.baselineTag} at ${res.baselineSha.slice(0, 7)}`);
       } catch (err) {
@@ -1143,6 +1180,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             ticket,
             emitter: this.emitter,
             reviseTarget,
+            risk, // PIPE-024: non-high risk caps the loop once a round is only non-blocking
           });
           thinkLoopResult = tlResult;
 
@@ -1557,6 +1595,98 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
 
   // --- Pipeline JSON management ---
 
+  // PIPE-020: a dependency is "satisfied" only when it has shipped — i.e.
+  // it is in the archive as done WITH a landed_commit (the same
+  // done-implies-shipped bar PIPE-021 enforces), or its backlog entry is
+  // status done. A ticket with no depends_on is always satisfied (zero
+  // regression for the common case). Backward compatible: depends_on may be
+  // absent, [], or a list of ids.
+  async dependenciesSatisfied(ticket) {
+    const deps = Array.isArray(ticket.depends_on) ? ticket.depends_on.filter(Boolean) : [];
+    if (deps.length === 0) return { ok: true, unsatisfied: [] };
+
+    let archived = [];
+    try {
+      const a = JSON.parse(await readFile(this.config._resolved.archive, 'utf-8'));
+      archived = Array.isArray(a?.tickets) ? a.tickets : [];
+    } catch { /* no archive yet */ }
+    let backlog = [];
+    try { backlog = await loadBacklog(this.config); } catch { /* ignore */ }
+
+    const unsatisfied = [];
+    for (const id of deps) {
+      const arch = archived.find((t) => t.id === id);
+      if (arch && arch.status === 'done' && arch.landed_commit) continue;
+      const bl = backlog.find((t) => t.id === id);
+      if (bl && bl.status === 'done') continue;
+      unsatisfied.push({ id, status: arch?.status || bl?.status || 'absent' });
+    }
+    return { ok: unsatisfied.length === 0, unsatisfied };
+  }
+
+  // PIPE-021 bounded cherry-pick retry: a ticket whose merge keeps
+  // hard-conflicting re-runs the FULL pipeline every cycle forever (every
+  // step's tokens, indefinitely). After N consecutive non-landing attempts,
+  // park it (status → an excluded one, default 'manual' = needs operator)
+  // with a reason naming the conflict, so token cost is bounded and the
+  // operator sees it instead of an invisible infinite loop.
+  async parkIfNonLandingExhausted(ticket, attempts, reasonTemplate) {
+    const max = this.config.merge?.max_non_landing_attempts ?? 3;
+    if (attempts < max) return false;
+    const parkStatus = this.config.merge?.park_status || 'manual';
+    const reason = `[PIPE-021] ${reasonTemplate.replace('%N%', String(attempts))}`;
+    try {
+      await setBacklogTicketStatus(ticket.id, this.config, parkStatus, reason);
+      this.emit('pipeline_merge_blocked', {
+        ticket: ticket.id, attempts, max, parked_status: parkStatus, reason,
+      });
+      console.error(`[merge-bound] ${ticket.id}: parked status=${parkStatus} after ${attempts} non-landing attempts — ${reason}`);
+      return true;
+    } catch (err) {
+      console.warn(`[merge-bound] ${ticket.id}: park failed — ${err.message}`);
+      return false;
+    }
+  }
+
+  // PIPE-021 reconciliation invariant: every archived `done` ticket that
+  // recorded a landed_commit MUST have that commit as an ancestor of the
+  // project's current HEAD. A violation = a false-done (recorded shipped,
+  // not actually on master) — the automated form of the manual audit that
+  // found the 11 strands. Runs at run start, before the queue. Loud but
+  // non-fatal: crashing the queue here would itself be a freeze; the
+  // operator needs the queue running to re-queue the strand.
+  async reconcileArchiveInvariant() {
+    let archive;
+    try {
+      archive = JSON.parse(await readFile(this.config._resolved.archive, 'utf-8'));
+    } catch { return; } // no archive yet — nothing to reconcile
+    const tickets = Array.isArray(archive?.tickets) ? archive.tickets : [];
+    const dir = this.config.project_dir;
+    const violations = [];
+    for (const t of tickets) {
+      if (t.status !== 'done' || !t.landed_commit) continue;
+      try {
+        execSync(
+          `git -C "${dir}" merge-base --is-ancestor ${t.landed_commit} HEAD`,
+          { encoding: 'utf-8', timeout: 10000 },
+        );
+      } catch {
+        violations.push({ id: t.id, landed_commit: t.landed_commit });
+      }
+    }
+    if (violations.length > 0) {
+      this.emit('archive_invariant_violation', { count: violations.length, violations });
+      console.error(
+        `[reconcile] ARCHIVE INVARIANT VIOLATED — ${violations.length} archived done ticket(s) whose landed_commit is NOT an ancestor of HEAD (false-done):\n` +
+        violations.map((v) => `  • ${v.id} @ ${String(v.landed_commit).slice(0, 12)}`).join('\n') +
+        `\n  These shipped nothing. Re-queue them (set status back to actionable) or investigate the strand.`,
+      );
+    } else {
+      this.emit('archive_invariant_ok', { checked: tickets.filter((t) => t.landed_commit).length });
+    }
+    return violations;
+  }
+
   async loadOrCreatePipelineJson(ticket) {
     const existing = await this.loadPipelineJson(ticket.id);
     if (existing) {
@@ -1586,6 +1716,15 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       created_by: 'pipeline',
       steps: {},
     };
+
+    // PIPE-021 bounded retry: the stale state is reset every run, but the
+    // count of consecutive non-landing (cherry-pick conflict) attempts must
+    // survive so we can park a permanently-conflicting ticket instead of
+    // re-running the full pipeline on it forever.
+    const priorNonLanding = existing?.merge?.non_landing_attempts;
+    if (Number.isInteger(priorNonLanding) && priorNonLanding > 0) {
+      state.merge = { non_landing_attempts: priorNonLanding };
+    }
 
     for (const step of this.config.steps) {
       state.steps[step.name] = { status: 'pending', completed_at: null };
@@ -1786,6 +1925,78 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // the parent dir. Removing the gate fixes the false positive without
   // weakening atomicity — the worktree lifecycle enforces it instead.
   // --- Dependency-declaration gate ---
+
+  // PIPE-025: deterministic review gate. T-018 false-passed because a
+  // feature added a large pure-logic module with ZERO tests, yet
+  // covers_plan_criteria only WARNED (shortfall under threshold) and review
+  // marked done. This is a hard gate, not a prompt vibe: a feature/
+  // enhancement ticket whose implement added a net-new, non-trivial
+  // pure-logic source file with no test referencing it fails review,
+  // bypassing the covers_plan_criteria ≤2/≤20% escape valve. Conservative
+  // by construction so it never blocks plumbing/[no-test]/refactors:
+  // requires BOTH a real logic signature (lines + branch constructs) AND
+  // zero test reference AND a behavioural ticket type.
+  checkBehaviouralTestCoverage(pipelineState, ticket) {
+    const type = (ticket.type || 'feature').toLowerCase();
+    if (type !== 'feature' && type !== 'enhancement') return [];
+
+    const implFiles = (pipelineState.steps?.implement?.files_changed || [])
+      .map((f) => (typeof f === 'object' ? f.path : f)).filter(Boolean);
+    const testFiles = (pipelineState.steps?.tests_red?.test_files || [])
+      .map((f) => (typeof f === 'object' ? f.path : f)).filter(Boolean);
+    const criteria = (pipelineState.steps?.tests_red?.criteria_to_test_map || []);
+    const planList = (pipelineState.steps?.plan?.files_to_change || []);
+
+    // [no-test]-bulleted plan paths are explicitly exempt.
+    const noTestPaths = new Set(
+      planList
+        .filter((p) => /^\s*\[no-test\]/i.test((typeof p === 'object' ? p.what_to_do : '') || ''))
+        .map((p) => (typeof p === 'object' ? p.path : p)),
+    );
+    // Pure plumbing — never behavioural logic worth a dedicated test.
+    const PLUMBING = /(^|\/)(index|exports?|barrel|constants?|theme|colors?|strings?|l10n|generated)\.[a-z]+$|\.(g|freezed|gen|pb)\.[a-z]+$/i;
+
+    const testRefs = [
+      ...testFiles.map((t) => t.toLowerCase()),
+      ...criteria.map((c) => `${c.criterion || ''} ${c.path || ''}`.toLowerCase()),
+    ].join('\n');
+
+    const offenders = [];
+    for (const f of implFiles) {
+      if (isTestPath(f)) continue;
+      if (noTestPaths.has(f)) continue;
+      if (PLUMBING.test(f)) continue;
+      const base = f.split('/').pop().replace(/\.[a-z0-9]+$/i, '').toLowerCase();
+      if (base.length < 3) continue;
+      // "covered" = some test file or criterion references the module name.
+      if (testRefs.includes(base)) continue;
+      // Net-new + non-trivial pure logic check: read from the worktree.
+      const abs = resolve(this.cwd, f);
+      if (!existsSync(abs)) continue;
+      let src = '';
+      try { src = readFileSync(abs, 'utf-8'); } catch { continue; }
+      const codeLines = src.split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('//') && !l.startsWith('*') && !l.startsWith('/*')).length;
+      // Real control-flow keywords only — `=>`/`?`/`&&` are too noisy in
+      // Dart (arrow bodies, nullable types) and would over-flag DTOs.
+      const branches = (src.match(/\b(if|else|for|while|switch|case|catch)\b/g) || []).length;
+      // Net-new heuristic: the file was added by this ticket (not present
+      // at the per-ticket baseline tag).
+      let netNew = true;
+      try {
+        execSync(`git -C "${this.cwd}" cat-file -e pipeline/${ticket.id}/baseline:"${f}"`,
+          { encoding: 'utf-8', timeout: 8000 });
+        netNew = false; // existed at baseline → modification, not net-new
+      } catch { netNew = true; }
+      // Conservative non-trivial-logic signature: real branching AND not a
+      // one-liner. Trivial getters/DTOs/constants have ~0 control keywords.
+      if (netNew && codeLines >= 8 && branches >= 3) {
+        offenders.push(f);
+      }
+    }
+    return offenders;
+  }
 
   checkDepsDeclared(stepArtifacts, planArtifacts) {
     const projectDir = this.cwd;
@@ -2273,6 +2484,21 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           }
         } catch (err) {
           console.warn(`[deps-check] skipped for ${ticket.id}: ${err.message}`);
+        }
+      }
+
+      // PIPE-025: hard review gate — net-new behavioural logic with no test.
+      if (stepConfig.name === 'review') {
+        try {
+          const uncovered = this.checkBehaviouralTestCoverage(pipelineState, ticket);
+          if (uncovered.length > 0) {
+            validation.pass = false;
+            validation.failures.push(
+              `[PIPE-025] net-new non-trivial pure-logic file(s) shipped with zero test coverage (hard fail, not subject to coverage shortfall escape valve): ${uncovered.join(', ')}`,
+            );
+          }
+        } catch (err) {
+          console.warn(`[pipe025] coverage check skipped for ${ticket.id}: ${err.message}`);
         }
       }
 

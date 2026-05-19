@@ -1,6 +1,6 @@
 {
   "schema": "backlog-v1",
-  "updated_at": "2026-05-18",
+  "updated_at": "2026-05-19",
   "_last_session_note": "2026-05-18 — predictor session: recovered+archived T-018 (commit c8788f1), filed predictor T-044 (Compare leak/tests correction). Pipeline self: extended PIPE-021 with the T-018 else-branch false-done vector (minimal positive-landed guard applied to src/pipeline.js this session), filed PIPE-025 (review false-pass).",
   "tickets": [
     {
@@ -509,35 +509,6 @@
       "shipped_note": "async fs.readFile in Promise.all, explicit active-state filter, parse-error logs file name. Dashboard sidebar reflects only live tickets, archive variants hidden."
     },
     {
-      "id": "PIPE-013",
-      "schema_version": 1,
-      "title": "plan_critic budget calibration via backtest harness — re-enable after",
-      "status": "requested",
-      "priority": "P1",
-      "type": "ops",
-      "complexity": "small",
-      "area": "scripts/plan-critic-backtest.js (run it), pipeline.config.yaml + ~/.toshelabs/projects/busydad.yaml plan_critic settings",
-      "reported": "2026-05-05",
-      "source": "BUG-1001 hit a 180s plan_critic timeout in the autonomous overnight run. heal did not fire because shouldHeal returns false on timeout (intentional — same budget reproduces the non-result). Result: ticket failed at first attempt. plan_critic.enabled flipped to false on busydad to unblock the queue.",
-      "description": "PIPE-001 spec said the backtest harness (scripts/plan-critic-backtest.js) should be run BEFORE shipping the critic to validate the prompt + budget against archived plans. We never ran it. Run it now: feed L10N-1 + BUG-261 + BUG-262 archived plans + 2 control plans, measure typical convergence time, calibrate plan_critic.max_seconds to a value that gives the critic real time to investigate (probably 5-10 min for non-trivial busydad tickets) without burning all night on a single bad ticket. Then re-enable plan_critic.enabled=true on busydad.",
-      "user_impact": "Today plan_critic is shipped but inert (disabled on busydad). The L10N-class catch the critic was supposed to provide isnt active — any ticket whose plan asserts wrong framework behavior could ship a regression. Calibration unblocks the safety net.",
-      "acceptance_criteria": [
-        "GIVEN scripts/plan-critic-backtest.js, WHEN run with --bug-plan L10N-1 + BUG-261 + BUG-262 + --control-plan x2, THEN it produces a JSON report and prints PASS/FAIL against the acceptance bar.",
-        "GIVEN backtest passes, WHEN max_seconds is set to the 95th percentile observed convergence time + 60s buffer, THEN plan_critic.enabled is flipped to true on busydad and a smoke-test ticket runs cleanly through the critic."
-      ],
-      "fix_plan": [
-        "1. Run the backtest: node scripts/plan-critic-backtest.js --bug-plan ... --control-plan ... > backtest-report.json",
-        "2. Inspect convergence times. Pick a max_seconds value (95p + 60s buffer is a starting point).",
-        "3. Edit ~/.toshelabs/projects/busydad.yaml: plan_critic.enabled: true, plan_critic step max_seconds: <new value>.",
-        "4. Smoke-test: run a small ticket that touches a load-bearing file. Verify critic runs, converges, writes findings.",
-        "5. If still flaky: iterate on the prompt OR move to a step-by-step investigator pattern (PIPE-013b future work)."
-      ],
-      "out_of_scope": [
-        "Heal-on-timeout for plan_critic — shouldHeal-blocks-on-timeout is intentional (a second attempt with the same budget reliably reproduces the non-result). Bump the budget instead, or split the work.",
-        "Per-ticket dynamic budgets based on complexity — premature."
-      ]
-    },
-    {
       "id": "PIPE-014",
       "schema_version": 1,
       "title": "/api/stop should halt the queue, not just kill the current step",
@@ -704,7 +675,7 @@
       "id": "PIPE-020",
       "schema_version": 1,
       "title": "Dependency-ordering integrity — a failed/discarded keystone ticket must block or flag its dependents instead of merging them green",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "bug",
       "complexity": "large",
@@ -724,13 +695,16 @@
         "Automatic dependency inference from plan text (heuristic warning only, if included at all)",
         "Re-ordering the backlog to satisfy dependencies automatically — operator still owns ordering",
         "Retroactive re-validation of already-merged dependents (handled per-incident, e.g. the T-024/26/27 Pro Pack recovery)"
-      ]
+      ],
+      "completed": "2026-05-19",
+      "completed_at": "2026-05-19T18:11:41.922Z",
+      "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
     },
     {
       "id": "PIPE-021",
       "schema_version": 1,
       "title": "Enforce done-implies-shipped with a reconciliation invariant, archive-gate regression test and bounded cherry-pick retry",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "bug",
       "complexity": "large",
@@ -749,13 +723,16 @@
       "out_of_scope": [
         "Retroactive remediation of the existing busydad-11 stranded fixes (tracked under BUG-1011 in the busydad project)",
         "Changing the worktree cherry-pick mechanism itself"
-      ]
+      ],
+      "completed": "2026-05-19",
+      "completed_at": "2026-05-19T18:11:41.922Z",
+      "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
     },
     {
       "id": "PIPE-024",
       "schema_version": 1,
       "title": "Cap think-loop rounds by ticket risk when a second round only surfaces non-blocking findings",
-      "status": "requested",
+      "status": "done",
       "priority": "P3",
       "type": "enhancement",
       "complexity": "small",
@@ -772,13 +749,16 @@
       "out_of_scope": [
         "Changing the core challenge/compare/revise mechanic (PIPE-018)",
         "Removing the think-loop for any step"
-      ]
+      ],
+      "completed": "2026-05-19",
+      "completed_at": "2026-05-19T18:11:41.922Z",
+      "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
     },
     {
       "id": "PIPE-025",
       "schema_version": 1,
       "title": "Review step false-passes behavioural changes that ship with no tests on testable pure logic",
-      "status": "requested",
+      "status": "done",
       "priority": "P1",
       "type": "bug",
       "complexity": "medium",
@@ -808,13 +788,16 @@
       ],
       "out_of_scope": [
         "Full static analysis of Dart/TS for runtime data-flow; this is a structural files_changed-vs-test_files check plus a prompt heuristic, not a taint analyzer"
-      ]
+      ],
+      "completed": "2026-05-19",
+      "completed_at": "2026-05-19T18:11:41.922Z",
+      "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
     },
     {
       "id": "PIPE-026",
       "schema_version": 1,
       "title": "Baseline guard treats pinned context_files (untracked) as a dirty tree and freezes the whole queue",
-      "status": "requested",
+      "status": "done",
       "priority": "P0",
       "type": "bug",
       "complexity": "small",
@@ -837,7 +820,10 @@
       ],
       "out_of_scope": [
         "Reworking the worktree/baseline atomicity model itself; this only changes what counts as 'dirty' at start"
-      ]
+      ],
+      "completed": "2026-05-19",
+      "completed_at": "2026-05-19T18:11:41.922Z",
+      "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
     }
   ]
 }

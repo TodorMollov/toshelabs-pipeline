@@ -4,22 +4,42 @@ import { spawnClaude } from './runner.js';
 // Normalize a challenge's findings into a stable set of issue signatures so
 // we can detect the loop re-raising the SAME structural problem every round
 // (non-convergence) instead of burning the full round budget on it.
-function parseFindingSignatures(text) {
+function parseFindings(text) {
   if (!text) return [];
   const m = text.match(/\[\s*\{[\s\S]*\}\s*\]/);
   if (!m) return [];
   try {
     const arr = JSON.parse(m[0]);
-    if (!Array.isArray(arr)) return [];
-    return [...new Set(
-      arr
-        .map((f) => (f && typeof f.issue === 'string' ? f.issue : ''))
-        .filter(Boolean)
-        .map((s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80))
-    )];
+    return Array.isArray(arr) ? arr.filter((x) => x && typeof x === 'object') : [];
   } catch {
     return [];
   }
+}
+
+function parseFindingSignatures(text) {
+  return [...new Set(
+    parseFindings(text)
+      .map((f) => (typeof f.issue === 'string' ? f.issue : ''))
+      .filter(Boolean)
+      .map((s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().slice(0, 80))
+  )];
+}
+
+// PIPE-024: a round is "blocking" if ANY finding is explicitly high/blocking
+// severity, OR a finding carries no recognised severity at all (unknown =
+// treat as blocking — never cap on ambiguity). The loop only caps early
+// when the challenger explicitly graded EVERY finding non-blocking.
+const BLOCKING_SEV = /^(high|blocking|critical|severe|major|p0|p1)$/i;
+const NONBLOCKING_SEV = /^(low|minor|nit|nitpick|cosmetic|trivial|info|style|non.?blocking|p3|p4)$/i;
+function roundHasBlockingFindings(text) {
+  const fs = parseFindings(text);
+  if (fs.length === 0) return false; // no findings → not a blocking round
+  for (const f of fs) {
+    const sev = String(f.severity || f.sev || '').trim();
+    if (BLOCKING_SEV.test(sev)) return true;
+    if (!NONBLOCKING_SEV.test(sev)) return true; // unknown/absent = blocking
+  }
+  return false;
 }
 
 /**
@@ -58,12 +78,18 @@ export async function thinkLoop({
   //   { kind: 'none' } (default)     → legacy: bestResult = findings text,
   //                                    nothing is applied (e.g. review step)
   reviseTarget = { kind: 'none' },
+  // PIPE-024: ticket risk. When not 'high', the loop stops after a round
+  // whose findings are all explicitly non-blocking — no point spending
+  // another full challenge/revise cycle on cosmetic issues. High-risk
+  // tickets always run the full round budget.
+  risk = 'medium',
   // DI seam for tests — defaults to the real CLI spawn. Production callers
   // never pass this; the regression suite injects a deterministic fake.
   spawn = spawnClaude,
 }) {
   const maxRounds = config.think_loop.max_rounds;
   const maxDiscards = config.think_loop.max_discards;
+  const riskCapEnabled = String(risk || '').toLowerCase() !== 'high';
 
   let bestResult = initialResult;
   let discards = 0;
@@ -99,8 +125,10 @@ ${challengeQuestion}
 
 Read the actual files in the working directory to verify the implementation. Do NOT rewrite code — only report issues.
 
-If you find problems, output ONLY a JSON array of findings:
-[{"file": "path", "line": N, "issue": "one sentence", "fix": "one sentence"}]
+If you find problems, output ONLY a JSON array of findings. Grade each
+finding's severity honestly — "high" for a correctness/security/data bug or
+a missing requirement; "low" for cosmetic/style/naming/nitpick:
+[{"file": "path", "line": N, "issue": "one sentence", "fix": "one sentence", "severity": "high|low"}]
 
 If no problems found, output exactly: NO_IMPROVEMENT
 
@@ -364,6 +392,22 @@ Make the minimal edits the findings prescribe (Read/Edit/Write). Do NOT run test
         reason,
         discards,
       });
+    }
+
+    // PIPE-024: this round produced findings (we got past the
+    // NO_IMPROVEMENT/blocked/nonconvergence guards above). If risk is not
+    // high and every finding was explicitly graded non-blocking, another
+    // full challenge+revise cycle isn't worth the latency — converge now.
+    // A blocking finding (or any unknown severity) keeps the loop running,
+    // so correctness is never sacrificed.
+    if (riskCapEnabled && parseFindings(challengeResult).length > 0
+        && !roundHasBlockingFindings(challengeResult)) {
+      history.push({ round: rounds, outcome: 'risk_capped', reason: 'round only non-blocking findings; risk != high' });
+      emitter?.emit('think_round_end', {
+        ticket: ticket.id, step: stepName, round: rounds,
+        outcome: 'risk_capped', reason: 'only non-blocking findings (risk-capped)', discards,
+      });
+      break;
     }
   }
 
