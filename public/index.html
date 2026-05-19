@@ -981,7 +981,13 @@
 
 <script>
 const STEPS = ['plan','plan_critic','tests_red','implement','tests_green','review','root_cause','docs_update'];
-const state = { running: false, activeTicket: null, startTime: null, completed: 0, thinkRounds: 0 };
+// pinnedTicket: set when the operator clicks a ticket in the sidebar. While
+// set, the loadPipelineStates reconcile must NOT yank the breadcrumb back to
+// the in_progress ticket — otherwise clicking any other ticket appears to do
+// nothing (the next 10s poll overwrites it). Cleared on a new ticket_start so
+// the breadcrumb resumes following live, and naturally a no-op when the
+// pinned ticket IS the running one.
+const state = { running: false, activeTicket: null, pinnedTicket: null, startTime: null, completed: 0, thinkRounds: 0 };
 let allTickets = [];
 let currentActionable = [];
 let ticketQuery = ''; // lowercased search text; empty = no filter
@@ -1014,8 +1020,13 @@ async function loadPipelineStates() {
       }
       if (inProgressId) {
         const t = (allTickets || []).find(x => x.id === inProgressId);
+        // Follow live only when the operator hasn't pinned a different
+        // ticket by clicking it. runningTicket / runningStep / the "now
+        // running" indicator still track live regardless — only the
+        // breadcrumb + its step chips defer to the pinned selection.
+        const followLive = !state.pinnedTicket || state.pinnedTicket === inProgressId;
         if (state.runningTicket !== inProgressId) {
-          setActiveTicket(inProgressId, t?.title || '');
+          if (followLive) setActiveTicket(inProgressId, t?.title || '');
           state.runningTicket = inProgressId;
         }
         updateNowRunning();
@@ -1032,19 +1043,13 @@ async function loadPipelineStates() {
             state.runningStep = cur;
             updateNowRunning();
           }
-          // Repaint the step-chip trail from persisted per-step status.
-          // The chips were forward-only too: renderStepPipeline() draws
-          // them all blank and only live step_start/step_done events
-          // marked them done/active, so a mid-ticket refresh (or any
-          // missed event) showed an empty trail with no "where am I".
-          // Reconcile every poll: done/not_applicable → done, the
-          // current step → active, everything else → pending.
-          for (const s of STEPS) {
-            const st = steps[s]?.status;
-            if (st === 'done' || st === 'not_applicable') setStepStatus(s, 'done');
-            else if (s === cur) setStepStatus(s, 'active');
-            else setStepStatus(s, '');
-          }
+          // Repaint the step-chip trail from persisted per-step status,
+          // but only while following live — if a ticket is pinned, its
+          // chips are owned by setActiveTicket→paintStepChips and must not
+          // be clobbered every poll by the running ticket's state.
+          // (renderStepPipeline draws them all blank; without this repaint
+          // a mid-ticket refresh or missed event showed an empty trail.)
+          if (followLive) paintChipsFromSteps(steps);
         }).catch(()=>{});
       }
     }
@@ -1345,10 +1350,44 @@ function setActiveTicket(id, title) {
     <span class="ticket-id ${isBug?'bug':'feature'}" style="font-size:16px">${id}</span>
     <span class="title">${title||''}</span>`;
   renderStepPipeline();
+  // renderStepPipeline drew the chips blank; paint them from THIS ticket's
+  // persisted per-step state so the trail matches the breadcrumb whether
+  // it's the live running ticket or a pinned (clicked) one.
+  paintStepChips(id);
   // Highlight in sidebar
   document.querySelectorAll('.ticket-item').forEach(el => {
     el.classList.toggle('active', el.dataset.id === id);
   });
+}
+
+// Paint the step-chip trail from a steps map: done/not_applicable → done,
+// the first not-yet-done step → active, the rest → pending.
+function paintChipsFromSteps(steps) {
+  let cur = null;
+  for (const [name, ss] of Object.entries(steps || {})) {
+    if (ss?.status !== 'done' && ss?.status !== 'not_applicable') { cur = name; break; }
+  }
+  for (const s of STEPS) {
+    const st = steps?.[s]?.status;
+    if (st === 'done' || st === 'not_applicable') setStepStatus(s, 'done');
+    else if (s === cur) setStepStatus(s, 'active');
+    else setStepStatus(s, '');
+  }
+}
+
+// Fetch a ticket's persisted pipeline state and paint its chip trail. A
+// ticket that never ran has no state → blank trail, which is accurate.
+async function paintStepChips(ticketId) {
+  if (!ticketId) { paintChipsFromSteps({}); return; }
+  const want = ticketId;
+  let steps = {};
+  try {
+    const r = await fetch(`/api/pipeline/${encodeURIComponent(ticketId)}`);
+    if (r.ok) steps = (await r.json())?.steps || {};
+  } catch { /* not-yet-run / offline → blank trail */ }
+  // Bail if the breadcrumb moved on while we were fetching (pin↔live race).
+  if (state.activeTicket !== want) return;
+  paintChipsFromSteps(steps);
 }
 
 function setStepStatus(step, status) {
@@ -1522,7 +1561,7 @@ function handleEvent(ev, d, serverTs) {
   }
   switch (ev) {
     case 'run_requested': setRunning(true); break;
-    case 'ticket_start': setActiveTicket(d.ticket, d.title); state.runningTicket = d.ticket; updateNowRunning(); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
+    case 'ticket_start': state.pinnedTicket = null; setActiveTicket(d.ticket, d.title); state.runningTicket = d.ticket; updateNowRunning(); appendTerminal(`── ticket: ${d.ticket} — ${d.title} ──`, 'divider'); document.getElementById('thinkLoopBar').classList.remove('visible'); loadPipelineStates(); break;
     case 'ticket_done': state.completed++; document.getElementById('statCompleted').textContent = state.completed; state.runningTicket = null; state.runningStep = null; updateNowRunning(); loadPipelineStates(); break;
     case 'ticket_stop_observed': appendTerminal(`[stop] ${d.ticket}${d.step ? '/' + d.step : ''}: halted by operator (status → blocked)`, 'system'); state.runningTicket = null; state.runningStep = null; updateNowRunning(); loadPipelineStates(); break;
     case 'pipeline_stop_observed': appendTerminal(`[stop] supervisor exited cleanly — ${d.remaining} ticket(s) left in queue`, 'system'); loadPipelineStates(); break;
@@ -1827,6 +1866,13 @@ function showTicketDetail(id) {
   if (!t) return;
 
   document.getElementById('detailHeader').textContent = `${t.id} — ${t.title}`;
+
+  // Drive the center breadcrumb to the clicked ticket and pin it so the
+  // 10s reconcile poll doesn't snap it back to the in_progress ticket.
+  // Clicking the running ticket pins to it too — harmless, and the pin
+  // clears on the next ticket_start so live view resumes automatically.
+  state.pinnedTicket = id;
+  setActiveTicket(t.id, t.title || '');
 
   // Highlight in sidebar
   document.querySelectorAll('.ticket-item').forEach(el => {

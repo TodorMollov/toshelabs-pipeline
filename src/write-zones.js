@@ -32,6 +32,8 @@
  *       - app/**
  *       - backend/**
  *       - docs/**
+ *     deny:                               # globs that override allow
+ *       - (test-tree globs)               # e.g. implement must not write tests
  *
  * When mode is strict, a violation throws so the step fails and the
  * orchestrator's normal failure-handling kicks in.
@@ -112,6 +114,13 @@ function dirtyFilesSince(cwd, snapshotBefore) {
  *                     canonical is expected to be clean during pipeline runs.
  * allowGlobs:         array of globs the step is allowed to write into,
  *                     relative to the worktree root.
+ * denyGlobs:          array of globs the step must NEVER write into, even if
+ *                     they also match an allow glob. Deny wins over allow.
+ *                     Used to keep `implement` out of test trees (test files
+ *                     are tests_red's domain): prevents implement silently
+ *                     editing a red test to make it pass — a TDD-integrity
+ *                     hole. Enforced (strict mode fails the step), not
+ *                     detected after the fact.
  */
 export function checkWriteZones({
   worktreeCwd,
@@ -119,13 +128,17 @@ export function checkWriteZones({
   worktreeSnapshotBefore,
   canonicalSnapshotBefore,
   allowGlobs,
+  denyGlobs = [],
 }) {
   const violations = [];
 
-  // Worktree-internal violations: dirty files outside allowed globs.
+  // Worktree-internal violations: dirty files outside allowed globs, OR
+  // inside an explicit deny glob (deny overrides allow).
   const worktreeDirty = dirtyFilesSince(worktreeCwd, worktreeSnapshotBefore);
   for (const path of worktreeDirty) {
-    if (!allowGlobs.some((g) => globMatch(g, path))) {
+    if (denyGlobs.some((g) => globMatch(g, path))) {
+      violations.push({ path, kind: 'denied_zone', location: 'worktree' });
+    } else if (!allowGlobs.some((g) => globMatch(g, path))) {
       violations.push({ path, kind: 'outside_zones', location: 'worktree' });
     }
   }
@@ -153,6 +166,9 @@ export function formatViolations(violations, maxLines = 20) {
   const lines = violations.slice(0, maxLines).map((v) => {
     if (v.kind === 'canonical_leak') {
       return `  • LEAK to canonical: ${v.path}`;
+    }
+    if (v.kind === 'denied_zone') {
+      return `  • DENIED zone (forbidden for this step): ${v.path}`;
     }
     return `  • OUTSIDE write_zones: ${v.path}`;
   });

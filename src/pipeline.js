@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { loadBacklog, filterAndSort, archiveTicket } from './backlog.js';
 import { spawnClaude } from './runner.js';
 import { thinkLoop } from './think-loop.js';
-import { validateStep } from './validator.js';
+import { validateStep, isTestPath } from './validator.js';
 import { buildPrompt } from './prompts.js';
 import { acquireLock, releaseLock } from './lock.js';
 import {
@@ -430,10 +430,52 @@ export class Pipeline {
           }
         } else {
           // Checkpoint/non-worktree path (or worktree ticket with no
-          // commit): nothing to cherry-pick, the work — if any — is already
-          // on master. Backlog files are gitignored so this is a file-only
-          // operation that doesn't touch git history.
-          await archiveTicket(ticket.id, this.config);
+          // checkpoint.ticket_sha). The OLD code archived unconditionally
+          // on the assumption "the work, if any, is already on master."
+          // That silently failed for T-018 (2026-05-18): its commit was
+          // orphaned by the shared-worktree baseline reset + restart, so
+          // ticket_sha was absent, this branch ran, and the ticket was
+          // recorded `done` while the code never reached master — a
+          // false-done (PIPE-021 invariant gap, PIPE-020 class). Gate the
+          // archive on a positive landed signal whenever the ticket
+          // actually produced code changes; otherwise re-queue rather
+          // than mis-ship. Failure bias is recoverable (re-run) not lossy
+          // (false done). "done in the archive" MUST mean shipped.
+          const changedFiles = (finalState?.steps?.implement?.files_changed || []).length;
+          let landed = changedFiles === 0; // no code change → nothing to ship → archivable
+          if (!landed) {
+            if (finalState?.merge?.status === 'merged') {
+              landed = true;
+            } else {
+              const dir = this.config.project_dir;
+              const br = worktreeCtx?.defaultBranch || 'HEAD';
+              try {
+                const hit = execSync(
+                  `git -C "${dir}" log ${br} --grep="\\[${ticket.id}\\]" -1 --format=%H`,
+                  { encoding: 'utf-8', timeout: 10000 },
+                ).trim();
+                landed = hit.length > 0;
+              } catch {
+                landed = false; // cannot prove it shipped → treat as not landed
+              }
+            }
+          }
+          if (landed) {
+            await archiveTicket(ticket.id, this.config);
+          } else {
+            // Do NOT archive — keep the ticket actionable so it re-queues
+            // and re-runs instead of being recorded as a false `done`.
+            const branchName = worktreeCtx?.defaultBranch || 'master';
+            this.emit('pipeline_merge_pending', {
+              ticket: ticket.id, archived: false, code: 'NOT_ON_MASTER',
+              hint: `ticket ${ticket.id} reached done but no commit on ${branchName}; re-queued (PIPE-021 invariant)`,
+            });
+            console.error(`[archive-gate] ${ticket.id}: implement changed ${changedFiles} file(s) but no landed commit on ${branchName}; NOT archived — will re-queue (PIPE-021 invariant)`);
+            if (finalState) {
+              finalState.merge = { status: 'pending', at: new Date().toISOString(), code: 'NOT_ON_MASTER' };
+              try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+            }
+          }
         }
 
         // Pause between tickets if requested
@@ -660,20 +702,24 @@ export class Pipeline {
         const matchesLoadBearing = planFiles.some((p) =>
           loadBearing.some((g) => globMatchSimple(g, p))
         );
-        // Operator decision 2026-05-04: critic runs on medium/large
-        // complexity only — small and trivial tickets skip the complexity
-        // arm because the cost (~$0.70 Opus + ~3 min wall-clock) isn't
-        // justified for contained changes. Load-bearing-arm overrides
-        // regardless: if a small/trivial plan touches a load-bearing
-        // file, the critic still runs (and the planner SHOULD reconsider
-        // whether the complexity grade was honest).
-        const SKIP_COMPLEXITIES = new Set(['trivial', 'small']);
-        const complexityArm = ticket.complexity && !SKIP_COMPLEXITIES.has(ticket.complexity);
-        const shouldRun = enabled && (complexityArm || matchesLoadBearing);
+        // PIPE: critic gating re-keyed from ticket.complexity → plan.risk
+        // (2026-05-19). ticket.complexity was NEVER populated (unset on 32/32
+        // predictor tickets), so the complexity arm was always falsy and the
+        // critic ran on NOTHING — it has been dormant the entire project.
+        // Meanwhile `plan.risk` IS graded every ticket (low/medium/high).
+        // Policy matches operator intent "depth for big tickets, fast for
+        // small ones": critic runs only on HIGH-risk plans (the genuinely
+        // hard tickets) or when a load-bearing file is touched. low/medium
+        // skip — the critic's Opus + ~3min cost isn't justified for contained
+        // changes, and we measured it doesn't prevent implement gate-fails
+        // (those were a covers_plan accounting bug, fixed separately).
+        const planRisk = String(pipelineState.steps?.plan?.risk || '').toLowerCase();
+        const riskArm = planRisk === 'high';
+        const shouldRun = enabled && (riskArm || matchesLoadBearing);
         if (!shouldRun) {
           const reason = !enabled
             ? 'plan_critic disabled in config'
-            : `complexity=${ticket.complexity || 'unset'} (trivial/small-class) AND no load-bearing file in plan.files_to_change`;
+            : `plan.risk=${planRisk || 'unset'} (not high) AND no load-bearing file in plan.files_to_change`;
           pipelineState.steps[stepConfig.name] = { status: 'not_applicable', reason };
           await this.savePipelineJson(ticket.id, pipelineState);
           this.emit('step_skipped', { ticket: ticket.id, step: stepConfig.name, reason });
@@ -2158,6 +2204,15 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       await this.autoPopulateFiles(stepConfig, pipelineState, ticket, gitSnapshotBefore, stepStartTime);
       pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
 
+      // tests_red native verification: the LLM only authored the tests; the
+      // orchestrator deterministically runs a scoped red-run (execSync) and
+      // is the sole authority for outcome/failure_output. Runs before the
+      // gate so validateStep sees the orchestrator-set fields.
+      if (stepConfig.name === 'tests_red') {
+        await this.verifyTestsRed(ticket, pipelineState);
+        pipelineState = await this.reloadStepFromDisk(ticket.id, stepConfig.name, pipelineState);
+      }
+
       // PIPE-004: write-zone enforcement. Catches two failure classes:
       //   1. Worktree-internal misroute (file inside worktree but outside
       //      step's allowed globs — e.g. docs_update touched app/lib/foo.dart).
@@ -2174,12 +2229,14 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       if (stepConfig.write_zones && stepConfig.write_zones.mode && stepConfig.write_zones.mode !== 'off') {
         const wzMode = stepConfig.write_zones.mode;
         const allow = stepConfig.write_zones.allow || [];
+        const deny = stepConfig.write_zones.deny || [];
         const violations = checkWriteZones({
           worktreeCwd: this.cwd,
           canonicalProjectDir: this.config.project_dir,
           worktreeSnapshotBefore: gitSnapshotBefore,
           canonicalSnapshotBefore,
           allowGlobs: allow,
+          denyGlobs: deny,
         });
         if (violations.length > 0) {
           this.emit('write_zone_violation', {
@@ -2711,6 +2768,145 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       testOutput,
       skippedDueToCompileErrors: false,
     };
+  }
+
+  // --- tests_red native verification (PIPE 2026-05-19) ---
+  //
+  // tests_red used to be an LLM worker with Bash(flutter*)/Bash(npm*): it
+  // wrote the tests AND ran the whole suite itself, reasoning over raw
+  // output to self-report `outcome`/`failure_output`. Measured: 52% of its
+  // tool calls were re-exploring the codebase, only 19% writing tests, and
+  // it ran the FULL (O(n)-growing) suite — incl. 25% that re-ran + healed,
+  // one ticket 40min. tests_green/captureBaseline already run natively via
+  // execSync; tests_red was the lone LLM-runs-tests outlier.
+  //
+  // New split (operator directive): the LLM only AUTHORS tests (no Bash);
+  // the orchestrator deterministically runs a FOCUSED command — scoped to
+  // just the test files the step wrote — to prove they're red, and is the
+  // sole authority for outcome/failure_output. All test EXECUTION is a
+  // tool (execSync), never an LLM. Whole-suite stays tests_green's job.
+  //
+  // Requires per-command `scoped_cmd` in project_profile.test_commands with
+  // a {files} placeholder. Absent → fall back to the legacy LLM-reported
+  // outcome (no behaviour change for unconfigured projects).
+  async verifyTestsRed(ticket, pipelineState) {
+    const step = pipelineState.steps.tests_red || {};
+    const projectDir = this.cwd;
+    const profile = this.config.project_profile || {};
+    const tc = profile.test_commands || {};
+    const env = { ...process.env };
+    for (const [k, v] of Object.entries(this.config.environment || {})) {
+      env[k] = String(v).replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] || '');
+    }
+
+    // Source of truth for "what tests_red wrote" = test-path files dirty in
+    // the worktree (not the LLM self-report, which can drift). Fall back to
+    // the LLM's test_files only if git inspection finds nothing.
+    let writtenTests = [];
+    try {
+      const tracked = execSync('git diff --name-only HEAD', { cwd: projectDir, encoding: 'utf-8' }).trim();
+      const untracked = execSync('git ls-files --others --exclude-standard', { cwd: projectDir, encoding: 'utf-8' }).trim();
+      writtenTests = [tracked, untracked].filter(Boolean).join('\n').split('\n')
+        .filter(Boolean).filter((p) => isTestPath(p));
+    } catch { /* not a git repo — fall through */ }
+    if (writtenTests.length === 0) {
+      writtenTests = (step.test_files || [])
+        .map((f) => (typeof f === 'object' ? f.path : f))
+        .filter((p) => p && isTestPath(p));
+    }
+
+    if (writtenTests.length === 0) {
+      step.outcome = 'tests_red_no_tests_written';
+      step.failure_output = 'tests_red wrote no test files (no test-path changes in the worktree).';
+      pipelineState.steps.tests_red = step;
+      await this.savePipelineJson(ticket.id, pipelineState);
+      this.emit('tests_red_verified', { ticket: ticket.id, outcome: step.outcome, scopedFiles: 0 });
+      return;
+    }
+
+    // Route each written test to the test_command whose cwd contains it,
+    // then build a scoped command via that command's scoped_cmd template.
+    const commands = [];
+    if (tc.unit) commands.push({ name: 'unit', spec: tc.unit });
+    for (const [phase, spec] of Object.entries(tc.extras || {})) commands.push({ name: phase, spec });
+
+    const groups = new Map(); // cmdName -> { spec, relFiles[] }
+    for (const tf of writtenTests) {
+      let chosen = null;
+      for (const c of commands) {
+        const prefix = c.spec.trigger_file_prefix || (c.spec.cwd ? `${c.spec.cwd}/` : '');
+        if (prefix && tf.startsWith(prefix)) { chosen = c; break; }
+      }
+      if (!chosen) chosen = commands.find((c) => c.name === 'unit') || commands[0];
+      if (!chosen) continue;
+      const cwdAbs = chosen.spec.cwd ? resolve(projectDir, chosen.spec.cwd) : projectDir;
+      const rel = chosen.spec.cwd && tf.startsWith(`${chosen.spec.cwd}/`)
+        ? tf.slice(chosen.spec.cwd.length + 1)
+        : tf;
+      if (!groups.has(chosen.name)) groups.set(chosen.name, { spec: chosen.spec, cwdAbs, relFiles: [] });
+      groups.get(chosen.name).relFiles.push(rel);
+    }
+
+    let anyFailed = false;
+    let anyRan = false;
+    const outputs = [];
+    let usedScoped = false;
+
+    for (const [name, g] of groups) {
+      if (!g.spec.scoped_cmd) {
+        outputs.push(`--- ${name}: no scoped_cmd configured; skipped (configure project_profile.test_commands.${name}.scoped_cmd) ---`);
+        continue;
+      }
+      usedScoped = true;
+      const cmd = g.spec.scoped_cmd.replace('{files}', g.relFiles.join(' '));
+      const timeout = (g.spec.timeout_sec || 300) * 1000;
+      console.log(`[tests-red] ${ticket.id}: scoped red-run (${name}): ${cmd}`);
+      let out = '', exitCode = 0;
+      try {
+        out = execSync(`${cmd} 2>&1`, { cwd: g.cwdAbs, encoding: 'utf-8', env, timeout, maxBuffer: 50 * 1024 * 1024 });
+      } catch (err) {
+        out = err.stdout || err.message || '';
+        exitCode = err.status || 1;
+      }
+      anyRan = true;
+      // Parse pass/fail with the SAME patterns runTestSuite uses so a
+      // failing assertion is distinguished from a clean pass.
+      const statsRe = g.spec.stats_pattern ? new RegExp(g.spec.stats_pattern, 'g') : /\+(\d+)\s+-(\d+):\s/g;
+      const m = [...out.matchAll(statsRe)];
+      let failed = 0;
+      if (m.length) failed = parseInt(m[m.length - 1][2] || '0');
+      const groupFailed = failed > 0 || exitCode !== 0;
+      if (groupFailed) anyFailed = true;
+      outputs.push(`--- ${name} (exit ${exitCode}, parsed failures ${failed}) ---\n${out.split('\n').slice(-25).join('\n')}`);
+    }
+
+    if (!usedScoped) {
+      // No scoped_cmd anywhere → keep the LLM-reported outcome (legacy
+      // behaviour for unconfigured projects). Don't overwrite.
+      this.emit('tests_red_verified', { ticket: ticket.id, outcome: step.outcome || '(llm)', scopedFiles: writtenTests.length, scoped: false });
+      return;
+    }
+
+    if (anyFailed) {
+      step.outcome = 'new_test_fails';
+      step.failure_output = outputs.join('\n').slice(0, 8000);
+    } else if (anyRan) {
+      // Tests ran and ALL passed with no implementation present — they are
+      // not actually red (vacuous, or assert already-implemented behaviour).
+      // Not in the gate's accepted one_of → step fails → heal rewrites them.
+      step.outcome = 'tests_red_did_not_fail';
+      step.failure_output = `Scoped red-run: written tests PASSED with no implementation — not a valid RED.\n${outputs.join('\n').slice(0, 6000)}`;
+    } else {
+      step.outcome = 'tests_red_run_broken';
+      step.failure_output = `Scoped red-run produced no parseable result.\n${outputs.join('\n').slice(0, 6000)}`;
+    }
+    step.tests_red_native_verified = true;
+    pipelineState.steps.tests_red = step;
+    await this.savePipelineJson(ticket.id, pipelineState);
+    this.emit('tests_red_verified', {
+      ticket: ticket.id, outcome: step.outcome,
+      scopedFiles: writtenTests.length, groups: [...groups.keys()], scoped: true,
+    });
   }
 
   // --- Baseline capture: runs at ticket start, records preexisting failures ---

@@ -157,8 +157,14 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
           const skippedPaths = (artifacts.files_skipped || []).map((f) =>
             typeof f === 'object' ? f.path : f
           );
+          // Test paths are owned by tests_red, not implement — exclude them
+          // from implement's accountability (see isTestPath rationale).
+          const sourcePlanned = planArtifacts.files_to_change.filter((planned) => {
+            const pp = typeof planned === 'object' ? planned.path : planned;
+            return !isTestPath(pp);
+          });
           const unaccounted = [];
-          for (const planned of planArtifacts.files_to_change) {
+          for (const planned of sourcePlanned) {
             const plannedPath = typeof planned === 'object' ? planned.path : planned;
             const changed = changedPaths.some((c) => c.includes(plannedPath) || plannedPath.includes(c));
             const skipped = skippedPaths.some((s) => s.includes(plannedPath) || plannedPath.includes(s));
@@ -167,7 +173,7 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
             }
           }
           if (unaccounted.length > 0) {
-            failures.push(`${unaccounted.length}/${planArtifacts.files_to_change.length} planned files unaccounted for (not changed, not skipped with reason): ${unaccounted.join(', ')}`);
+            failures.push(`${unaccounted.length}/${sourcePlanned.length} planned source files unaccounted for (not changed, not skipped with reason): ${unaccounted.join(', ')}`);
           }
         }
         break;
@@ -182,6 +188,30 @@ export function validateStep(artifacts, stepConfig, planArtifacts = null) {
 
 function getNestedField(obj, path) {
   return path.split('.').reduce((o, k) => (o ? o[k] : undefined), obj);
+}
+
+// PIPE: a planned path is a TEST file when it lives in a test tree or carries
+// a test-file suffix. The `covers_plan` gate uses this to exclude test paths
+// from implement's accountability: the plan's files_to_change legitimately
+// bundles the tests, but those are written by the `tests_red` step, not
+// `implement`. Before this, implement's covers_plan diffed its self-reported
+// files_changed manifest against the WHOLE plan list (incl. test files it
+// correctly never touched) → "N/M unaccounted" → full re-run of the most
+// expensive step. Measured 66% false-fail rate on predictor (21/32 done
+// tickets), every failure a test-file phantom. Test files remain gated — by
+// tests_red's own validations (outcome/covers_plan_criteria) — just not
+// double-gated under the wrong owner. Keep this conservative: only paths that
+// clearly belong to a test tree/suffix, never a heuristic on filename alone.
+export function isTestPath(p) {
+  if (!p || typeof p !== 'string') return false;
+  const s = p.replace(/\\/g, '/').toLowerCase();
+  return (
+    /(^|\/)tests?\//.test(s) ||      // .../test/ or .../tests/ segment
+    /(^|\/)__tests__\//.test(s) ||   // jest __tests__ dir
+    /_test\.[a-z0-9]+$/.test(s) ||   // foo_test.dart, foo_test.ts
+    /\.test\.[a-z0-9]+$/.test(s) ||  // foo.test.ts, foo.test.js
+    /\.spec\.[a-z0-9]+$/.test(s)     // foo.spec.ts
+  );
 }
 
 // Stopwords deliberately excluded from coverage matching — they'd produce
