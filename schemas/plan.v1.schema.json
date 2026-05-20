@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://toshelabs.dev/schemas/plan.v1.schema.json",
+  "title": "Plan",
+  "description": "Output of the worker's plan phase. Becomes the contract that tests_red and implement work against. Static plan-checker (scripts/plan-static-check.js) gates on size metrics derived from this.",
+  "type": "object",
+  "required": ["ticket", "files_to_change", "test_strategy"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "ticket": { "type": "string", "pattern": "^[A-Z]+-[0-9]+$" },
+    "title": { "type": "string", "minLength": 1 },
+    "files_to_change": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "what_to_do"],
+        "additionalProperties": true,
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string" },
+          "what_to_do": {
+            "type": "string",
+            "description": "One coherent intent. Prefix with [no-test] when this file's change is structurally untestable (pure plumbing, doc comment, type alias). The [no-test] marker is honoured by tests_red — it does not require a corresponding test."
+          }
+        }
+      },
+      "minItems": 1
+    },
+    "callers_traced": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["function", "callers"],
+        "properties": {
+          "function": { "type": "string" },
+          "callers": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "edge_cases": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "test_strategy": {
+      "type": "string",
+      "minLength": 10,
+      "description": "Which test files will be touched, what real-vs-mock strategy, any test infrastructure deltas"
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
+    },
+    "revision": {
+      "type": "object",
+      "description": "Set by the worker if it revises the plan mid-session (e.g. tests_red surfaced an infeasibility). Records the original plan and the why.",
+      "required": ["reason", "revised_at"],
+      "properties": {
+        "reason": { "type": "string", "minLength": 10 },
+        "revised_at": { "type": "string", "format": "date-time" },
+        "previous_files_to_change": { "type": "array" }
+      }
+    },
+    "static_check_verdict": {
+      "type": "object",
+      "description": "Set by orchestrator after plan-static-check runs. Worker should not write this field.",
+      "properties": {
+        "verdict": { "type": "string", "enum": ["pass", "flag", "reject"] },
+        "checks": { "type": "array" },
+        "checked_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://toshelabs.dev/schemas/review.v1.schema.json",
+  "title": "Review",
+  "description": "Output of the reviewer session. Validated by orchestrator before being fed to the apply-feedback session. Malformed/missing → reviewer is retried once, then ship with empty findings + emit review_skipped telemetry.",
+  "type": "object",
+  "required": ["ticket", "diff_sha_before", "findings"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "ticket": { "type": "string", "pattern": "^[A-Z]+-[0-9]+$" },
+    "diff_sha_before": {
+      "type": "string",
+      "description": "SHA of the worktree HEAD when the reviewer started — used to detect if the diff changed underneath the reviewer."
+    },
+    "files_reviewed": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of files the reviewer actually examined. Used by orchestrator to detect 'reviewer skipped half the diff' regressions."
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "finding.v1.schema.json" }
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["clean", "findings", "blocked"],
+      "description": "clean: no findings worth raising. findings: 1+ findings, ticket should proceed to apply phase. blocked: reviewer claims the diff is fundamentally broken (e.g. obviously off-plan). 'blocked' requires operator review; use sparingly."
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Self-reported reviewer metadata. Orchestrator may override.",
+      "properties": {
+        "model": { "type": "string" },
+        "wallMs": { "type": "number" },
+        "inputTokens": { "type": "number" },
+        "outputTokens": { "type": "number" },
+        "promptVersion": { "type": "string" }
+      }
+    }
+  }
+}

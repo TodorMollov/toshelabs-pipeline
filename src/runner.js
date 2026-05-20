@@ -267,10 +267,17 @@ export async function spawnClaude({
         });
         return;
       }
-      // Detect rate limit / usage limit
+      // Detect rate limit / usage limit / session limit.
+      // Wording has drifted over time ("hit your limit" → "hit your session
+      // limit" → "hit your usage limit") so we match any "hit your … limit"
+      // shape and rely on the "resets <time>" tail to bind the reset clock.
+      // If the "hit your … limit" phrase appears without a parseable reset,
+      // we still flag it as rate-limited so the pipeline pauses instead of
+      // burning the queue (the waiter falls back to a default delay).
       const allOutput = stdoutTail + stderr + result;
-      const limitMatch = allOutput.match(/(?:hit your limit|rate.?limit|usage.?limit).*?resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:\(([^)]+)\))?/i);
-      if (limitMatch || allOutput.includes('hit your limit')) {
+      const limitMatch = allOutput.match(/(?:hit your (?:\w+\s+)?limit|rate.?limit|usage.?limit).*?resets?\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:\(([^)]+)\))?/i);
+      const hitLimitPhrase = /hit your (?:\w+\s+)?limit/i.test(allOutput);
+      if (limitMatch || hitLimitPhrase) {
         const err = new Error(`claude rate limited: ${result || stderr}`);
         err.rateLimited = true;
         err.resetTime = limitMatch?.[1] || null;

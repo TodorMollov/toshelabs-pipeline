@@ -847,7 +847,7 @@
 <body>
 
 <!-- PROJECT SETTINGS MODAL (PIPE-003) -->
-<div id="projectSettingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center">
+<div id="projectSettingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:min(900px,90vw);max-height:85vh;overflow:auto;display:flex;flex-direction:column">
     <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)">
       <h2 style="margin:0;font-size:14px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text)" id="projectSettingsTitle">Project Settings</h2>
@@ -862,12 +862,43 @@
   </div>
 </div>
 
+<!-- DISPUTES MODAL (soft pipeline) -->
+<div id="disputesModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:min(1100px,92vw);max-height:88vh;overflow:auto;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <h2 style="margin:0;font-size:14px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text)">Disputed Findings — Operator Audit</h2>
+      <button onclick="closeDisputes()" style="background:transparent;color:var(--text-dim);border:none;font-size:20px;cursor:pointer;padding:0 4px">×</button>
+    </div>
+    <div id="disputesBody" style="padding:18px;font-size:12px;color:var(--text)">
+      <div style="color:var(--text-muted)">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- PIPELINE STATS MODAL (soft vs classic comparison) -->
+<div id="pipelineStatsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:8px;width:min(1100px,92vw);max-height:88vh;overflow:auto;display:flex;flex-direction:column">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid var(--border)">
+      <h2 style="margin:0;font-size:14px;font-weight:600;letter-spacing:0.5px;text-transform:uppercase;color:var(--text)">Pipeline Architecture Comparison</h2>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button onclick="refreshPipelineStats()" style="background:var(--bg);color:var(--text-dim);border:1px solid var(--border);padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer">Refresh</button>
+        <button onclick="closePipelineStats()" style="background:transparent;color:var(--text-dim);border:none;font-size:20px;cursor:pointer;padding:0 4px">×</button>
+      </div>
+    </div>
+    <div id="pipelineStatsBody" style="padding:18px;font-size:12px;color:var(--text)">
+      <div style="color:var(--text-muted)">Loading…</div>
+    </div>
+  </div>
+</div>
+
 <!-- HEADER -->
 <div class="header">
   <div class="logo">TOSHELABS <span>PIPELINE</span></div>
   <div class="status-pill idle" id="statusPill">Idle</div>
   <span id="nowRunning" style="margin-left:10px;color:var(--text-dim);font-size:12px;font-family:var(--mono,monospace)"></span>
   <a href="/reports.html" style="margin-left:14px;color:var(--text-dim);font-size:12px;text-decoration:none;border:1px solid var(--border);padding:4px 10px;border-radius:4px">Reports &rarr;</a>
+  <button id="btnPipelineStats" onclick="openPipelineStats()" title="Soft vs classic pipeline comparison" style="margin-left:6px;color:var(--text-dim);font-size:12px;background:transparent;border:1px solid var(--border);padding:3px 10px;border-radius:4px;cursor:pointer">📊 Stats</button>
+  <button id="btnDisputes" onclick="openDisputes()" title="Operator audit of disputed reviewer findings" style="margin-left:6px;color:var(--text-dim);font-size:12px;background:transparent;border:1px solid var(--border);padding:3px 10px;border-radius:4px;cursor:pointer;display:none">⚖ Disputes <span id="disputesBadge" style="background:var(--red);color:#fff;border-radius:9px;padding:1px 6px;margin-left:4px;font-size:10px;font-weight:600">0</span></button>
   <!-- PIPE-003: project picker. Populated from /api/projects. Switching is
        refused server-side while a run is in flight (server returns 409). -->
   <div style="display:flex;align-items:center;gap:6px;margin-left:14px">
@@ -1608,6 +1639,34 @@ function handleEvent(ev, d, serverTs) {
       const cs = document.getElementById('convergeStatus');
       cs.textContent = 'converged'; cs.className = 'converge-status converging';
       break;
+    // ── Soft pipeline events ──
+    case 'soft_ticket_start':
+      appendTerminal(`▶ soft pipeline starting for ${d.ticket}`, 'system');
+      break;
+    case 'soft_spawn_start':
+      appendTerminal(`▶ spawn: ${d.spawn}${d.resumeFrom ? ` (resume from ${d.resumeFrom})` : ''}`, 'system');
+      break;
+    case 'soft_phase_marker':
+      appendTerminal(`◆ ${d.spawn}: ${d.marker}`, 'system');
+      break;
+    case 'soft_spawn_done':
+      appendTerminal(`✓ ${d.spawn} done (${Math.round((d.wallMs||0)/1000)}s, ${d.outputTokens||0}t out)`, 'system');
+      break;
+    case 'soft_plan_static_check':
+      appendTerminal(`📋 plan static check: ${d.verdict} (${(d.checks||[]).length} signals)`, d.verdict === 'reject' ? 'failure' : d.verdict === 'flag' ? 'system' : 'success');
+      break;
+    case 'soft_plan_rejected':
+      appendTerminal(`✗ PLAN REJECTED — operator review required: ${(d.checks||[]).filter(c=>c.level==='reject').map(c=>c.id).join(', ')}`, 'failure');
+      break;
+    case 'soft_review_skipped':
+      appendTerminal(`⚠ review skipped (${d.reason}) — shipping with empty findings`, 'system');
+      break;
+    case 'soft_resume_halted':
+      appendTerminal(`✗ resume halted — operator review required: ${(d.divergences||[]).map(x=>x.phase).join(', ')}`, 'failure');
+      break;
+    case 'soft_ticket_done':
+      appendTerminal(`✓ ${d.ticket} complete (${Math.round((d.duration_ms||0)/60000)}m)`, 'success');
+      break;
     case 'claude_event': {
       const rawModel = d.event?.message?.model || '';
       const style = rawModel.includes('opus') ? 'opus'
@@ -2262,6 +2321,23 @@ function renderProjectSettings(payload) {
     });
   }
 
+  // ─ Pipeline mode ─ (soft = 3-spawn worker/reviewer/apply; classic = 7-step legacy)
+  // Always shown — default 'soft' if absent from yaml. Editable toggle uses the
+  // same .settings-toggle infrastructure as the other PIPE-005 toggles.
+  {
+    const currentMode = cfg.pipeline_mode || 'soft';
+    const PIPELINE_MODE_OPTIONS = ['soft', 'classic'];
+    const opts = PIPELINE_MODE_OPTIONS
+      .map((m) => `<option value="${m}"${m === currentMode ? ' selected' : ''}>${m === 'soft' ? 'soft (default — 3-spawn)' : 'classic (legacy 7-step)'}</option>`)
+      .join('');
+    const select = `<select data-setting-path="pipeline_mode" data-project-id="${escapeHtml(projectId)}" data-value-type="string" class="settings-toggle" style="background:var(--bg);color:var(--text);border:1px solid var(--border);padding:2px 6px;border-radius:3px;font-size:11px;cursor:pointer">${opts}</select>`;
+    const modeRow = `<tr><td style="padding:4px 12px 4px 0;color:var(--text-dim);vertical-align:top;white-space:nowrap">mode <span style="color:var(--text-muted);font-size:10px">[editable]</span></td><td style="padding:4px 0;vertical-align:top">${select}</td></tr>`;
+    sections.push({
+      title: 'Pipeline architecture',
+      body: `<table style="width:100%;border-collapse:collapse">${modeRow}</table><div style="margin-top:6px;font-size:11px;color:var(--text-muted)">Soft: one worker session (plan→tests_red→implement→tests_green→docs) → reviewer session → apply-feedback session. No walk-backs, ~3-4× lower token cost. Classic: legacy 7-step state machine with per-step gates and heal cycles. Soft dispatcher is pending refactor — flag is honoured by config, falls back to classic execution until soft path lands.</div>`,
+    });
+  }
+
   // ─ Plan critic ─ (enabled is editable via toggle; rest is read-only)
   if (cfg.plan_critic) {
     const editable = { ...cfg.plan_critic };
@@ -2497,15 +2573,258 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && document.getElementById('projectSettingsModal').style.display === 'flex') closeProjectSettings();
 });
 
+// ─── Disputes UI (soft pipeline) ───
+async function loadDisputesBadge() {
+  try {
+    const r = await fetch('/api/disputes');
+    const d = await r.json();
+    const btn = document.getElementById('btnDisputes');
+    const badge = document.getElementById('disputesBadge');
+    if (!btn || !badge) return;
+    if (d.count > 0) {
+      btn.style.display = '';
+      badge.textContent = d.count;
+    } else {
+      btn.style.display = 'none';
+    }
+  } catch {}
+}
+async function openDisputes() {
+  const modal = document.getElementById('disputesModal');
+  const body = document.getElementById('disputesBody');
+  modal.style.display = 'flex';
+  body.innerHTML = '<div style="color:var(--text-muted)">Loading…</div>';
+  try {
+    const r = await fetch('/api/disputes');
+    const d = await r.json();
+    if (d.count === 0) {
+      body.innerHTML = '<div style="color:var(--text-muted);padding:40px;text-align:center">No pending disputes. All reviewer findings have been resolved or applied directly.</div>';
+      return;
+    }
+    const sevColor = { blocker: 'var(--red)', major: 'var(--yellow)', minor: 'var(--text-dim)', nit: 'var(--text-muted)' };
+    body.innerHTML = `
+      <div style="margin-bottom:14px;color:var(--text-dim);font-size:11px">
+        ${d.count} unresolved dispute${d.count===1?'':'s'}. Each dispute is a reviewer finding the worker argued or deferred. Accept = worker's argument was right; Reject = spawn a CORR-* correction ticket.
+      </div>
+      ${d.disputes.map((f, i) => `
+        <div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:12px;background:var(--bg)">
+          <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+            <div>
+              <div style="font-size:12px;font-weight:600;color:var(--text)">${escapeHtml(f.project)}/${escapeHtml(f.ticket)} — ${escapeHtml(f.finding_id)}</div>
+              <div style="font-size:13px;color:var(--text);margin-top:4px">${escapeHtml(f.title)}</div>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span style="background:${sevColor[f.severity]||'var(--text-dim)'};color:#fff;padding:2px 8px;border-radius:3px;font-size:10px;text-transform:uppercase;font-weight:600">${escapeHtml(f.severity)}</span>
+              <span style="background:var(--surface2);color:var(--text-dim);padding:2px 8px;border-radius:3px;font-size:10px;text-transform:uppercase">${escapeHtml(f.scope)}</span>
+              <span style="background:var(--surface2);color:var(--text-muted);padding:2px 8px;border-radius:3px;font-size:10px">${escapeHtml(f.status)}</span>
+            </div>
+          </div>
+          <table style="width:100%;font-size:11px;color:var(--text-dim);margin-bottom:10px">
+            <tr><td style="padding:2px 12px 2px 0;vertical-align:top;width:120px">Where</td><td style="vertical-align:top"><code style="font-size:11px">${escapeHtml(f.where?.file || '?')}${f.where?.line ? ':' + f.where.line : ''}</code></td></tr>
+            <tr><td style="padding:2px 12px 2px 0;vertical-align:top">Rule</td><td style="vertical-align:top">${escapeHtml(f.rule?.name || '?')} <span style="color:var(--text-muted)">(${escapeHtml(f.rule?.kind || '?')})</span></td></tr>
+            <tr><td style="padding:2px 12px 2px 0;vertical-align:top">Evidence</td><td style="vertical-align:top;color:var(--text)">${escapeHtml(f.evidence)}</td></tr>
+            <tr><td style="padding:2px 12px 2px 0;vertical-align:top">Fix suggestion</td><td style="vertical-align:top">${escapeHtml(f.fix_suggestion)}</td></tr>
+            ${f.response?.argued_reason ? `<tr><td style="padding:6px 12px 2px 0;vertical-align:top;color:var(--yellow)">Worker argued</td><td style="vertical-align:top;padding-top:6px;color:var(--text);background:var(--surface2);padding:8px;border-radius:4px;border-left:3px solid var(--yellow)">${escapeHtml(f.response.argued_reason)}</td></tr>` : ''}
+            ${f.response?.deferred_to_ticket ? `<tr><td style="padding:6px 12px 2px 0;vertical-align:top">Deferred to</td><td style="vertical-align:top;padding-top:6px"><code>${escapeHtml(f.response.deferred_to_ticket)}</code></td></tr>` : ''}
+          </table>
+          <div style="display:flex;gap:8px;align-items:center;padding-top:8px;border-top:1px solid var(--border)">
+            <input type="text" id="dispute-note-${i}" placeholder="Optional note for audit log" style="flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 8px;border-radius:4px;font-size:12px;font-family:inherit">
+            <button onclick="resolveDispute('${escapeHtml(f.project)}','${escapeHtml(f.ticket)}','${escapeHtml(f.finding_id)}','accept',${i})" style="background:var(--green-dim);border:1px solid var(--green);color:var(--green);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600">Accept argument</button>
+            <button onclick="resolveDispute('${escapeHtml(f.project)}','${escapeHtml(f.ticket)}','${escapeHtml(f.finding_id)}','reject',${i})" style="background:var(--red-dim);border:1px solid var(--red);color:var(--red);padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600">Reject → CORR ticket</button>
+          </div>
+        </div>
+      `).join('')}
+    `;
+  } catch (err) {
+    body.innerHTML = `<div style="color:var(--red)">Failed to load: ${escapeHtml(err.message)}</div>`;
+  }
+}
+function closeDisputes() { document.getElementById('disputesModal').style.display = 'none'; }
+async function resolveDispute(project, ticket, findingId, action, idx) {
+  const note = (document.getElementById(`dispute-note-${idx}`)?.value || '').trim();
+  try {
+    const r = await fetch(`/api/disputes/${encodeURIComponent(project)}/${encodeURIComponent(ticket)}/${encodeURIComponent(findingId)}/resolve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, note: note || null }),
+    });
+    const body = await r.json();
+    if (!r.ok) {
+      alert(`Resolution failed: ${body.error || r.status}`);
+      return;
+    }
+    if (action === 'reject' && body.correction_ticket) {
+      alert(`Spawned correction ticket: ${body.correction_ticket.id}`);
+    }
+    await loadDisputesBadge();
+    await openDisputes(); // refresh
+  } catch (err) {
+    alert(`Network error: ${err.message}`);
+  }
+}
+document.getElementById('disputesModal').addEventListener('click', (e) => {
+  if (e.target.id === 'disputesModal') closeDisputes();
+});
+
+// ─── Pipeline stats UI ───
+async function openPipelineStats() {
+  const modal = document.getElementById('pipelineStatsModal');
+  modal.style.display = 'flex';
+  await refreshPipelineStats();
+}
+function closePipelineStats() { document.getElementById('pipelineStatsModal').style.display = 'none'; }
+async function refreshPipelineStats() {
+  const body = document.getElementById('pipelineStatsBody');
+  body.innerHTML = '<div style="color:var(--text-muted)">Loading…</div>';
+  try {
+    const r = await fetch('/api/dashboard/pipeline-stats');
+    const d = await r.json();
+    const modeCard = (label, m, color) => {
+      if (!m || !m.count) return `
+        <div style="flex:1;border:1px solid var(--border);border-radius:6px;padding:14px;background:var(--bg)">
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:${color};font-weight:600;margin-bottom:8px">${label}</div>
+          <div style="color:var(--text-muted);font-size:12px">No tickets yet on this mode.</div>
+        </div>`;
+      return `
+        <div style="flex:1;border:1px solid var(--border);border-radius:6px;padding:14px;background:var(--bg)">
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.5px;color:${color};font-weight:600;margin-bottom:8px">${label} <span style="color:var(--text-muted);font-weight:400">(${m.count} tickets)</span></div>
+          <table style="width:100%;font-size:12px">
+            <tr><td style="color:var(--text-dim);padding:3px 12px 3px 0">wall mean</td><td style="text-align:right;font-weight:600">${m.wall_mean_min} min</td></tr>
+            <tr><td style="color:var(--text-dim);padding:3px 12px 3px 0">wall median</td><td style="text-align:right;font-weight:600">${m.wall_median_min} min</td></tr>
+            <tr><td style="color:var(--text-dim);padding:3px 12px 3px 0">wall max</td><td style="text-align:right">${m.wall_max_min} min</td></tr>
+            <tr><td style="color:var(--text-dim);padding:3px 12px 3px 0">output tokens (mean)</td><td style="text-align:right">${m.output_tokens_mean.toLocaleString()}</td></tr>
+          </table>
+        </div>`;
+    };
+
+    let comparison = '';
+    if (d.soft && d.classic && d.soft.count > 0 && d.classic.count > 0) {
+      const wallDelta = Math.round(((d.classic.wall_mean_min - d.soft.wall_mean_min) / d.classic.wall_mean_min) * 100);
+      const tokDelta = Math.round(((d.classic.output_tokens_mean - d.soft.output_tokens_mean) / d.classic.output_tokens_mean) * 100);
+      comparison = `
+        <div style="background:var(--surface2);border-radius:6px;padding:12px;margin:14px 0;font-size:12px">
+          <div style="color:var(--text-dim);font-size:11px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Soft vs Classic delta</div>
+          <div style="color:${wallDelta>=0?'var(--green)':'var(--red)'}">Wall-clock: ${wallDelta>=0?'-':'+'}${Math.abs(wallDelta)}% (${d.soft.wall_mean_min}m vs ${d.classic.wall_mean_min}m mean)</div>
+          <div style="color:${tokDelta>=0?'var(--green)':'var(--red)'}">Output tokens: ${tokDelta>=0?'-':'+'}${Math.abs(tokDelta)}% (${d.soft.output_tokens_mean.toLocaleString()} vs ${d.classic.output_tokens_mean.toLocaleString()} mean)</div>
+        </div>`;
+    } else if (!d.soft?.count) {
+      comparison = `<div style="background:var(--surface2);border-radius:6px;padding:12px;margin:14px 0;font-size:12px;color:var(--text-dim)">No soft-pipeline tickets shipped yet. Run a ticket with <code>pipeline_mode: soft</code> to populate this comparison.</div>`;
+    }
+
+    const recentRows = (d.recent || []).slice(0, 15).map((t) => `
+      <tr style="border-top:1px solid var(--border)">
+        <td style="padding:6px 12px 6px 0;font-family:var(--mono);font-size:11px">${escapeHtml(t.ticket)}</td>
+        <td style="padding:6px 12px 6px 0;color:var(--text-dim)">${escapeHtml(t.project)}</td>
+        <td style="padding:6px 12px 6px 0"><span style="background:${t.mode==='soft'?'var(--green-dim)':'var(--surface2)'};color:${t.mode==='soft'?'var(--green)':'var(--text-dim)'};padding:2px 8px;border-radius:3px;font-size:10px;text-transform:uppercase;font-weight:600">${escapeHtml(t.mode)}</span></td>
+        <td style="padding:6px 12px 6px 0;color:var(--text-dim);text-align:right">${Math.round(t.wallMs/60000)} min</td>
+        <td style="padding:6px 12px 6px 0;color:var(--text-dim);text-align:right">${(t.outputTokens || 0).toLocaleString()}</td>
+        <td style="padding:6px 0;color:var(--text-muted);font-size:11px">${escapeHtml((t.completed_at||'').slice(0,16))}</td>
+      </tr>`).join('');
+
+    body.innerHTML = `
+      <div style="display:flex;gap:14px;margin-bottom:14px">
+        ${modeCard('Soft (3-spawn)', d.soft, 'var(--green)')}
+        ${modeCard('Classic (7-step)', d.classic, 'var(--text-dim)')}
+      </div>
+      ${comparison}
+      <h3 style="margin:18px 0 10px 0;font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">Recent tickets (most recent first)</h3>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <thead><tr style="color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:0.5px">
+          <th style="text-align:left;padding:4px 12px 4px 0">Ticket</th>
+          <th style="text-align:left;padding:4px 12px 4px 0">Project</th>
+          <th style="text-align:left;padding:4px 12px 4px 0">Mode</th>
+          <th style="text-align:right;padding:4px 12px 4px 0">Wall</th>
+          <th style="text-align:right;padding:4px 12px 4px 0">Out tokens</th>
+          <th style="text-align:left;padding:4px 0">Completed</th>
+        </tr></thead>
+        <tbody>${recentRows || '<tr><td colspan="6" style="padding:20px;text-align:center;color:var(--text-muted)">No tickets yet.</td></tr>'}</tbody>
+      </table>
+    `;
+  } catch (err) {
+    body.innerHTML = `<div style="color:var(--red)">Failed to load: ${escapeHtml(err.message)}</div>`;
+  }
+}
+document.getElementById('pipelineStatsModal').addEventListener('click', (e) => {
+  if (e.target.id === 'pipelineStatsModal') closePipelineStats();
+});
+
 // ─── Init ───
 connectSSE();
+loadDisputesBadge();
+setInterval(loadDisputesBadge, 30000); // re-check disputes every 30s
 updateUsageWidget();
 loadProjects();
 // Seed running state from /api/status so a mid-run reload reflects
 // reality immediately, instead of showing "Idle" until the next SSE event.
 fetch('/api/status').then(r=>r.json()).then(s => {
   if (s.activeProjectRunning) setRunning(true);
+  // Refresh continuity: if a ticket is currently running, fetch its full
+  // history (pipeline-state + every checkpoint + every log line that
+  // mentions the ticket id) and paint the terminal with it. Without this,
+  // a page refresh wipes everything that happened pre-refresh and the
+  // operator stares at an empty console while SSE catches up to the live
+  // stream.
+  if (s.activeProjectId && s.lastEvent?.data?.ticket) {
+    const tid = s.lastEvent.data.ticket;
+    rehydrateTicketHistory(s.activeProjectId, tid);
+  } else if (s.activeProjectId) {
+    // No ticket in the last event — try to find the most recent in-progress
+    // ticket from pipeline-states.
+    fetch('/api/pipeline-states').then(r => r.json()).then(states => {
+      const inProgress = Object.entries(states || {}).find(([k,v]) => v?.status === 'in_progress');
+      if (inProgress) rehydrateTicketHistory(s.activeProjectId, inProgress[0]);
+    }).catch(()=>{});
+  }
 }).catch(()=>{});
+
+// Rehydrate the terminal + breadcrumb from the full ticket dump.
+// Called once on page load when there's an in-progress ticket.
+async function rehydrateTicketHistory(project, ticket) {
+  try {
+    const r = await fetch(`/api/ticket/${encodeURIComponent(project)}/${encodeURIComponent(ticket)}/full`);
+    if (!r.ok) return;
+    const data = await r.json();
+    appendTerminal(`─── refresh: rehydrating ${ticket} (${data.log_line_count} log lines, ${Object.keys(data.checkpoints||{}).length} checkpoints) ───`, 'system');
+
+    // Replay phase markers as soft events for the breadcrumb.
+    for (const pm of data.phase_markers || []) {
+      if (pm.marker) {
+        appendTerminal(`◆ marker: ${pm.marker}`, 'system');
+      } else if (pm.message) {
+        appendTerminal(`▶ ${pm.message}`, 'system');
+      }
+    }
+
+    // Print checkpoint summary so operator can see what landed pre-refresh.
+    const cpEntries = Object.entries(data.checkpoints || {});
+    if (cpEntries.length) {
+      appendTerminal(`─── checkpoints on disk ───`, 'system');
+      for (const [phase, body] of cpEntries) {
+        let summary = '';
+        if (body?._parse_error) summary = `(parse error: ${body._parse_error})`;
+        else if (phase === 'plan') summary = `${(body.files_to_change||[]).length} files, test_strategy="${(body.test_strategy||'').slice(0,60)}…"`;
+        else if (phase === 'tests_red') summary = `${(body.tests_added||[]).length} tests added`;
+        else if (phase === 'implement') summary = `${(body.files_changed||[]).length} files changed`;
+        else if (phase === 'tests_green') summary = `all_pass=${body.all_pass}, ${body.unit_tests?.passed||0} passed`;
+        else if (phase === 'docs_update') summary = `${(body.files_changed||[]).length} files`;
+        else if (phase === 'review') summary = `verdict=${body.verdict}, ${(body.findings||[]).length} findings`;
+        else if (phase === 'disputed-findings') summary = `${(body.findings||body||[]).length} entries`;
+        else if (phase === 'root_cause') summary = body.bug_class || '(no class)';
+        appendTerminal(`  ✓ ${phase}: ${summary}`, 'system');
+      }
+    }
+
+    // Replay the relevant pipeline.log lines so terminal text matches what
+    // operator would have seen live. Skip very noisy lines (HTTP polling).
+    const lines = (data.log_lines || []).filter((l) => !/GET \/api\/pipeline\/|GET \/api\/usage|GET \/api\/pipeline-states/.test(l));
+    if (lines.length) {
+      appendTerminal(`─── log replay (${lines.length} relevant lines) ───`, 'system');
+      for (const line of lines) appendTerminal(line, 'system');
+    }
+    appendTerminal(`─── end of rehydration · live stream resumes ───`, 'system');
+  } catch (err) {
+    appendTerminal(`rehydration failed: ${err.message}`, 'failure');
+  }
+}
 fetch('/api/backlog').then(r=>r.json()).then(data => {
   allTickets = data.all || [];
   currentActionable = data.actionable || [];

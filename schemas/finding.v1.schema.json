@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://toshelabs.dev/schemas/finding.v1.schema.json",
+  "title": "Finding",
+  "description": "A single review finding. Per the soft-pipeline triage rules: scope determines blocking behaviour; severity downgrades automatically when test_to_catch is judgement-only.",
+  "type": "object",
+  "required": ["id", "title", "scope", "severity", "where", "rule", "evidence", "test_to_catch", "fix_suggestion"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^F-[0-9]+$",
+      "description": "Unique within the review.json file. Sequential."
+    },
+    "title": { "type": "string", "minLength": 5, "maxLength": 200 },
+    "scope": {
+      "type": "string",
+      "enum": ["in_ticket", "adjacent", "unrelated"],
+      "description": "in_ticket: file is in plan.files_to_change. adjacent: file is imported by or imports something in_ticket. unrelated: anywhere else. Routing: in_ticket → must apply/argue/defer. adjacent → file as P2 follow-up, never blocks. unrelated → file as P3 follow-up, never blocks."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["blocker", "major", "minor", "nit"],
+      "description": "blocker/major: in_ticket scope must address. minor/nit: log only. Auto-downgrade one tier if test_to_catch.verifiability == 'judgement_only'."
+    },
+    "where": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "type": "string", "minLength": 1 },
+        "line": { "type": ["integer", "null"] },
+        "symbol": { "type": ["string", "null"] }
+      }
+    },
+    "rule": {
+      "type": "object",
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["validation_rule", "contract", "empirical"] },
+        "name": { "type": "string", "minLength": 1, "description": "Rule name (e.g. 'rule_38_app_check'), contract identifier (e.g. 'FirebaseFunctionsException must have code'), or empirical assertion (e.g. 'when input is whitespace, output should match regex')." }
+      }
+    },
+    "evidence": {
+      "type": "string",
+      "minLength": 10,
+      "description": "Concrete failure mode. Specific input → wrong output, or specific code path → broken invariant. Vague evidence ('this seems wrong') is not evidence."
+    },
+    "test_to_catch": {
+      "type": "object",
+      "required": ["verifiability"],
+      "properties": {
+        "verifiability": {
+          "type": "string",
+          "enum": ["tested", "reviewable", "judgement_only"],
+          "description": "tested: there's a concrete test that would fail. reviewable: deterministic static check (grep, schema, build) would catch. judgement_only: no automatic check — pure human judgement. Findings with judgement_only auto-downgrade severity one tier."
+        },
+        "test_snippet": {
+          "type": ["string", "null"],
+          "description": "If verifiability == 'tested', a minimal failing-test code snippet that would catch this. Required to claim 'tested'."
+        },
+        "static_check": {
+          "type": ["string", "null"],
+          "description": "If verifiability == 'reviewable', the exact static check (e.g. 'grep -q enforceAppCheck lib/league/joinLeagueByCode.js')."
+        }
+      }
+    },
+    "fix_suggestion": { "type": "string", "minLength": 5, "description": "One-line direction, not implementation." },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "applied", "argued", "deferred"],
+      "description": "Set by the apply-feedback worker as it processes each finding. Initial: pending."
+    },
+    "response": {
+      "type": "object",
+      "description": "Set by apply-feedback worker if status != applied. Records what was done and why.",
+      "properties": {
+        "argued_reason": { "type": "string", "description": "Why the worker rejected this finding. Required when status == argued." },
+        "deferred_to_ticket": { "type": "string", "description": "Ticket ID created as follow-up. Required when status == deferred." },
+        "applied_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}

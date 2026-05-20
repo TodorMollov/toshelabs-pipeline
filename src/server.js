@@ -548,6 +548,7 @@ export async function startServer(config) {
 
     // Whitelist + validate the path. A regex-ish match keeps this readable.
     const ALLOWED_MODES = new Set(['off', 'warn', 'strict']);
+    const ALLOWED_PIPELINE_MODES = new Set(['soft', 'classic']);
     let yamlEditDescriptor;
     if (settingPath === 'ticket_schema.mode') {
       if (!ALLOWED_MODES.has(value)) return res.status(400).json({ error: `value must be one of [${[...ALLOWED_MODES].join(', ')}]` });
@@ -555,13 +556,22 @@ export async function startServer(config) {
     } else if (settingPath === 'plan_critic.enabled') {
       if (typeof value !== 'boolean') return res.status(400).json({ error: 'value must be boolean' });
       yamlEditDescriptor = { kind: 'simple', keys: ['plan_critic', 'enabled'], value };
+    } else if (settingPath === 'pipeline_mode') {
+      // Soft vs classic pipeline architecture. Soft = 3-spawn (worker/reviewer/apply),
+      // classic = legacy 7-step state machine. Default is soft for new projects.
+      // The dispatcher in pipeline.js reads this at run start; mid-run changes
+      // are blocked by the 409 above so a project can't switch mid-ticket.
+      if (!ALLOWED_PIPELINE_MODES.has(value)) {
+        return res.status(400).json({ error: `value must be one of [${[...ALLOWED_PIPELINE_MODES].join(', ')}]` });
+      }
+      yamlEditDescriptor = { kind: 'simple', keys: ['pipeline_mode'], value };
     } else {
       const stepMatch = settingPath.match(/^steps\.([A-Za-z_]+)\.write_zones\.mode$/);
       if (stepMatch) {
         if (!ALLOWED_MODES.has(value)) return res.status(400).json({ error: `value must be one of [${[...ALLOWED_MODES].join(', ')}]` });
         yamlEditDescriptor = { kind: 'step', stepName: stepMatch[1], keys: ['write_zones', 'mode'], value };
       } else {
-        return res.status(400).json({ error: `path "${settingPath}" not in the toggle-only whitelist. Allowed: ticket_schema.mode, plan_critic.enabled, steps.<name>.write_zones.mode. Full editing pending PIPE-005.` });
+        return res.status(400).json({ error: `path "${settingPath}" not in the toggle-only whitelist. Allowed: ticket_schema.mode, plan_critic.enabled, pipeline_mode, steps.<name>.write_zones.mode. Full editing pending PIPE-005.` });
       }
     }
 
@@ -1299,6 +1309,317 @@ export async function startServer(config) {
   });
 
   // API: get 5h/7d usage from statusline file
+  // ──────────────────────────────────────────────────────────────────────
+  // Soft pipeline: disputed-findings audit endpoints.
+  //
+  // GET  /api/disputes
+  //   Scans every project's worker-output/<ticket>/disputed-findings.json
+  //   plus the sibling .audit.json (operator decisions). Returns unresolved
+  //   disputes only. Resolved ones move into the audit file with a verdict.
+  //
+  // POST /api/disputes/:project/:ticket/:findingId/resolve
+  //   Body: { action: "accept" | "reject", note?: string }
+  //   accept: worker's argument was right → mark cleared, no follow-up
+  //   reject: worker's argument was wrong → append a correction ticket
+  //           skeleton to the project's backlog, mark cleared
+  // ──────────────────────────────────────────────────────────────────────
+  app.get('/api/disputes', async (req, res) => {
+    try {
+      const { readdirSync: rdirS, existsSync: existS, readFileSync: rfileS } = await import('node:fs');
+      const path = await import('node:path');
+      const projects = config._projects || new Map();
+      if (projects.size === 0) {
+        const fallbackId = config._activeProjectId || config.name || 'default';
+        projects.set(fallbackId, config);
+      }
+      const disputes = [];
+      for (const [pid, projectCfg] of projects.entries()) {
+        const woDir = projectCfg._resolved?.workerOutputDir;
+        if (!woDir || !existS(woDir)) continue;
+        for (const ticketId of rdirS(woDir)) {
+          const dPath = path.resolve(woDir, ticketId, 'disputed-findings.json');
+          const aPath = path.resolve(woDir, ticketId, 'disputed-findings.audit.json');
+          if (!existS(dPath)) continue;
+          let body, audit = { resolved: [] };
+          try { body = JSON.parse(rfileS(dPath, 'utf-8')); }
+          catch { continue; }
+          if (existS(aPath)) {
+            try { audit = JSON.parse(rfileS(aPath, 'utf-8')); } catch {}
+          }
+          const resolvedIds = new Set((audit.resolved || []).map((r) => r.finding_id));
+          const findings = Array.isArray(body.findings) ? body.findings : Array.isArray(body) ? body : [];
+          for (const f of findings) {
+            if (resolvedIds.has(f.id)) continue;
+            disputes.push({
+              project: pid,
+              ticket: ticketId,
+              ticket_title: body.ticket_title || '',
+              finding_id: f.id,
+              title: f.title,
+              severity: f.severity,
+              scope: f.scope,
+              status: f.status,
+              where: f.where,
+              rule: f.rule,
+              evidence: f.evidence,
+              fix_suggestion: f.fix_suggestion,
+              response: f.response || {},
+              file: dPath,
+            });
+          }
+        }
+      }
+      // Sort: blockers + most recent first
+      const sevWeight = { blocker: 4, major: 3, minor: 2, nit: 1 };
+      disputes.sort((a, b) => (sevWeight[b.severity] || 0) - (sevWeight[a.severity] || 0));
+      res.json({ count: disputes.length, disputes });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/disputes/:project/:ticket/:findingId/resolve', async (req, res) => {
+    try {
+      const { project, ticket, findingId } = req.params;
+      const { action, note } = req.body || {};
+      if (!['accept', 'reject'].includes(action)) {
+        return res.status(400).json({ error: 'action must be accept|reject' });
+      }
+      const { existsSync: existS, readFileSync: rfS, writeFileSync: wfS } = await import('node:fs');
+      const path = await import('node:path');
+      const projects = config._projects || new Map();
+      const projectCfg = projects.get(project) || (project === (config._activeProjectId || config.name || 'default') ? config : null);
+      if (!projectCfg) return res.status(404).json({ error: `project ${project} not loaded` });
+
+      const woDir = projectCfg._resolved?.workerOutputDir;
+      if (!woDir) return res.status(500).json({ error: 'workerOutputDir not resolved' });
+
+      const dPath = path.resolve(woDir, ticket, 'disputed-findings.json');
+      if (!existS(dPath)) return res.status(404).json({ error: 'no disputed-findings.json for ticket' });
+      const body = JSON.parse(rfS(dPath, 'utf-8'));
+      const findings = Array.isArray(body.findings) ? body.findings : Array.isArray(body) ? body : [];
+      const finding = findings.find((f) => f.id === findingId);
+      if (!finding) return res.status(404).json({ error: `finding ${findingId} not in disputed-findings.json` });
+
+      // Append to audit file.
+      const aPath = path.resolve(woDir, ticket, 'disputed-findings.audit.json');
+      const audit = existS(aPath) ? JSON.parse(rfS(aPath, 'utf-8')) : { resolved: [] };
+      audit.resolved.push({
+        finding_id: findingId,
+        action,
+        note: note || null,
+        resolved_at: new Date().toISOString(),
+      });
+      wfS(aPath, JSON.stringify(audit, null, 2));
+
+      // On reject: create a correction-ticket skeleton in the project's backlog.
+      let correctionTicket = null;
+      if (action === 'reject') {
+        const backlogPath = projectCfg._resolved?.backlog;
+        if (backlogPath && existS(backlogPath)) {
+          const backlog = JSON.parse(rfS(backlogPath, 'utf-8'));
+          // Generate a fresh ID — find highest existing T-N + 1, or use a CORR-
+          // prefix to make these auditable. CORR avoids collision.
+          const existingIds = new Set((backlog.tickets || []).map((t) => t.id));
+          let n = 1;
+          while (existingIds.has(`CORR-${ticket}-${n}`)) n++;
+          const newId = `CORR-${ticket}-${n}`;
+          correctionTicket = {
+            id: newId,
+            schema_version: 1,
+            title: `[${ticket}] ${finding.title}`.slice(0, 200),
+            status: 'requested',
+            priority: finding.severity === 'blocker' ? 'P1' : finding.severity === 'major' ? 'P2' : 'P3',
+            type: 'bug',
+            complexity: 'unknown',
+            description: [
+              `Correction ticket from operator rejection of disputed finding ${findingId} on ${ticket}.`,
+              '',
+              `**Reviewer raised**: ${finding.title}`,
+              `**Where**: ${JSON.stringify(finding.where)}`,
+              `**Evidence**: ${finding.evidence}`,
+              `**Fix suggestion**: ${finding.fix_suggestion}`,
+              '',
+              `**Worker argued**: ${finding.response?.argued_reason || '(no rebuttal recorded)'}`,
+              '',
+              `**Operator note**: ${note || '(none)'}`,
+            ].join('\n'),
+            created_at: new Date().toISOString(),
+          };
+          backlog.tickets = backlog.tickets || [];
+          backlog.tickets.push(correctionTicket);
+          backlog.updated_at = new Date().toISOString();
+          wfS(backlogPath, JSON.stringify(backlog, null, 2));
+        }
+      }
+      emitter.emit('dispute_resolved', { project, ticket, finding_id: findingId, action, correction_ticket: correctionTicket?.id });
+      res.json({ ok: true, action, correction_ticket: correctionTicket });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Soft-vs-classic comparison dashboard.
+  // Aggregates pipeline-state JSON files across all projects, groups by
+  // pipeline_mode (soft | classic | legacy=null), reports mean/median
+  // wallMs and output tokens per ticket + recent ticket list.
+  // ──────────────────────────────────────────────────────────────────────
+  app.get('/api/dashboard/pipeline-stats', async (req, res) => {
+    try {
+      const { readdirSync: rdirS, existsSync: existS, readFileSync: rfS } = await import('node:fs');
+      const path = await import('node:path');
+      const projects = config._projects || new Map();
+      if (projects.size === 0) {
+        const fallbackId = config._activeProjectId || config.name || 'default';
+        projects.set(fallbackId, config);
+      }
+      const tickets = [];
+      for (const [pid, projectCfg] of projects.entries()) {
+        const psDir = projectCfg._resolved?.pipelineDir;
+        if (!psDir || !existS(psDir)) continue;
+        for (const f of rdirS(psDir)) {
+          if (!/^T-\d+\.json$/.test(f) && !/^[A-Z]+-\d+(\.\w+)?\.json$/.test(f)) continue;
+          if (!/^[A-Z]+-\d+\.json$/.test(f)) continue;
+          try {
+            const d = JSON.parse(rfS(path.resolve(psDir, f), 'utf-8'));
+            if (d.status !== 'done') continue;
+            const mode = d.pipeline_mode || 'classic'; // legacy tickets pre-soft are classic
+            let wall = 0, outTok = 0, inTok = 0;
+            for (const step of Object.values(d.steps || {})) {
+              if (!step || typeof step !== 'object') continue;
+              const m = step.metrics || {};
+              wall += m.wallMs || m.durationMs || 0;
+              outTok += m.outputTokens || 0;
+              inTok += m.inputTokens || 0;
+            }
+            // Soft pipeline writes duration_ms at the top level too.
+            if (mode === 'soft' && d.duration_ms) wall = d.duration_ms;
+            tickets.push({
+              project: pid,
+              ticket: d.ticket,
+              mode,
+              status: d.status,
+              completed_at: d.completed_at,
+              wallMs: wall,
+              outputTokens: outTok,
+              inputTokens: inTok,
+              title: d.title || '',
+            });
+          } catch {}
+        }
+      }
+
+      const stats = (mode) => {
+        const ms = tickets.filter((t) => t.mode === mode);
+        if (ms.length === 0) return { count: 0 };
+        const walls = ms.map((t) => t.wallMs).sort((a, b) => a - b);
+        const outs = ms.map((t) => t.outputTokens);
+        const mean = (a) => Math.round(a.reduce((x, y) => x + y, 0) / a.length);
+        const median = walls[Math.floor(walls.length / 2)];
+        return {
+          count: ms.length,
+          wall_mean_min: Math.round(mean(walls) / 60000),
+          wall_median_min: Math.round(median / 60000),
+          wall_max_min: Math.round(Math.max(...walls) / 60000),
+          output_tokens_mean: mean(outs),
+        };
+      };
+
+      tickets.sort((a, b) => (b.completed_at || '').localeCompare(a.completed_at || ''));
+      res.json({
+        total: tickets.length,
+        soft: stats('soft'),
+        classic: stats('classic'),
+        recent: tickets.slice(0, 30),
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Full ticket dump for refresh continuity.
+  //
+  // Returns everything the UI needs to repaint the terminal + breadcrumb
+  // after a page reload, for a specific ticket:
+  //   - pipeline-state JSON (status, mode, started_at, steps with metrics)
+  //   - all worker-output checkpoint files (plan.json, tests_red.json, …,
+  //     review.json, disputed-findings.json, root_cause.json)
+  //   - all pipeline.log lines mentioning the ticket id, in order
+  //
+  // The log scan is bounded to ~5 MB of input which is enough for several
+  // days of ticket activity. For very old archived tickets the entries may
+  // have been rotated out (pipeline.log.1).
+  // ──────────────────────────────────────────────────────────────────────
+  app.get('/api/ticket/:project/:ticketId/full', async (req, res) => {
+    try {
+      const { project, ticketId } = req.params;
+      const { existsSync: existS, readFileSync: rfS, readdirSync: rdirS, statSync: stS } = await import('node:fs');
+      const path = await import('node:path');
+      const projects = config._projects || new Map();
+      const projectCfg = projects.get(project) || (project === (config._activeProjectId || config.name || 'default') ? config : null);
+      if (!projectCfg) return res.status(404).json({ error: `project ${project} not loaded` });
+
+      // 1. pipeline state
+      const psPath = path.resolve(projectCfg._resolved.pipelineDir, `${ticketId}.json`);
+      const state = existS(psPath) ? JSON.parse(rfS(psPath, 'utf-8')) : null;
+
+      // 2. all checkpoint files
+      const woDir = path.resolve(projectCfg._resolved.workerOutputDir, ticketId);
+      const checkpoints = {};
+      if (existS(woDir)) {
+        for (const f of rdirS(woDir)) {
+          if (!f.endsWith('.json')) continue;
+          if (f.includes('.tmp')) continue;
+          const phase = f.replace(/\.json$/, '');
+          try { checkpoints[phase] = JSON.parse(rfS(path.resolve(woDir, f), 'utf-8')); }
+          catch (err) { checkpoints[phase] = { _parse_error: err.message }; }
+        }
+      }
+
+      // 3. all log lines mentioning this ticket — read pipeline.log,
+      //    filter for ticketId, bound to ~5MB input.
+      const logPath = path.resolve(__dirname, '..', 'pipeline.log');
+      let logLines = [];
+      if (existS(logPath)) {
+        const sz = stS(logPath).size;
+        const maxRead = 5 * 1024 * 1024;
+        const start = Math.max(0, sz - maxRead);
+        const fd = (await import('node:fs')).openSync(logPath, 'r');
+        const buf = Buffer.alloc(sz - start);
+        try { (await import('node:fs')).readSync(fd, buf, 0, buf.length, start); }
+        finally { (await import('node:fs')).closeSync(fd); }
+        const slice = buf.toString('utf-8');
+        // If we sliced mid-line, drop the first partial line.
+        const lines = (start > 0 ? slice.slice(slice.indexOf('\n') + 1) : slice).split('\n');
+        const re = new RegExp(`\\b${ticketId}\\b`);
+        logLines = lines.filter((l) => re.test(l));
+      }
+
+      // 4. phase markers extracted from the log (best-effort)
+      const phaseMarkers = [];
+      for (const line of logLines) {
+        const m = line.match(/<<<PHASE:\s*([a-z_]+)\s*>>>/);
+        if (m) phaseMarkers.push({ marker: m[1], line: line.trim() });
+        const sm = line.match(/\[soft\]\s+\w+-\d+:\s+(.*)/);
+        if (sm) phaseMarkers.push({ event: 'soft', message: sm[1].trim() });
+      }
+
+      res.json({
+        ticket: ticketId,
+        project,
+        state,
+        checkpoints,
+        log_lines: logLines,
+        log_line_count: logLines.length,
+        phase_markers: phaseMarkers,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.get('/api/usage', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     try {

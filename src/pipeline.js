@@ -1,5 +1,5 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
-import { existsSync, statSync, readFileSync } from 'fs';
+import { readFile, writeFile, mkdir, readdir, copyFile } from 'fs/promises';
+import { existsSync, statSync, readFileSync, writeFileSync, readdirSync, unlinkSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { execSync } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -193,7 +193,15 @@ export class Pipeline {
   }
 
   async run() {
-    this.emit('pipeline_start', {});
+    // Pipeline mode dispatch. `soft` (3-spawn worker/reviewer/apply architecture)
+    // is the default; `classic` is the legacy 7-step state machine kept as
+    // opt-in for projects that haven't been A/B-validated yet. The soft path
+    // is not yet implemented at the dispatcher level — when wired, it will
+    // route to a separate run-loop. For now, both modes execute the classic
+    // path and the flag is informational only (emitted for UI + telemetry).
+    const pipelineMode = this.config.pipeline_mode || 'soft';
+    this.emit('pipeline_start', { mode: pipelineMode });
+    console.log(`[pipeline] mode=${pipelineMode} — ${pipelineMode === 'soft' ? '3-spawn worker/reviewer/apply dispatch' : 'classic 7-step state machine'}`);
 
     // Phase 0: Setup
     const lockResult = await acquireLock(
@@ -311,7 +319,16 @@ export class Pipeline {
           }
         }
         try {
-          await this.processTicket(ticket);
+          // Dispatch to soft pipeline (3-spawn) or classic (7-step) based
+          // on the project's pipeline_mode flag. Default is soft. Classic
+          // remains the proven fallback for projects not yet validated on
+          // the soft path.
+          const mode = this.config.pipeline_mode || 'soft';
+          if (mode === 'soft') {
+            await this.processTicketSoft(ticket, worktreeCtx);
+          } else {
+            await this.processTicket(ticket);
+          }
         } catch (err) {
           if (err.rateLimited) throw err; // bubble up — runWithRateLimitRetry handles the wait
           console.error(`[pipeline] ${ticket.id} failed: ${err.message}`);
@@ -554,6 +571,499 @@ export class Pipeline {
         // Give the SSE flush a tick so the dashboard sees the event.
         setTimeout(() => process.exit(RESTART_EXIT_CODE), 250);
       }
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Soft pipeline dispatcher (3-spawn architecture).
+  //
+  // Triggered when this.config.pipeline_mode === 'soft'. Branches off
+  // run()'s for-loop instead of calling the classic processTicket.
+  //
+  // Phases (per prompts/worker.md):
+  //   Spawn 1 (worker): plan → tests_red → implement → tests_green
+  //                     → docs_update (if feature)
+  //   Spawn 2 (reviewer): adversarial diff review → review.json
+  //   Spawn 3 (worker-apply): apply_review_feedback → root_cause (if bug)
+  //
+  // Between spawns the orchestrator runs phase verification against
+  // checkpoint files and the worktree. Static plan check runs after
+  // spawn 1's plan phase completes. After spawn 3 the orchestrator
+  // commits + cherry-picks + archives (same machinery as classic).
+  // ──────────────────────────────────────────────────────────────────────
+  async processTicketSoft(ticket, worktreeCtx) {
+    const { verifyCheckpoint, determineResumePoint, buildResumePrompt, SOFT_PHASE_ORDER } = await import('./phase-verify.js');
+    const { readFile: rfile, writeFile: wfile, readdir: rdir } = await import('node:fs/promises');
+    const { existsSync: exist } = await import('node:fs');
+    const path = await import('node:path');
+
+    let pipelineState = await this.loadOrCreatePipelineJson(ticket);
+    const ticketStartTime = Date.now();
+    // Detect "fresh start" vs "genuine resume". A genuine resume is when the
+    // pipeline-state's pipeline_mode is already 'soft' AND status was
+    // 'in_progress' AND started_at is recent (within last hour) — i.e. the
+    // server restarted mid-soft-run and we're resuming via checkpoints.
+    // Anything else (no prior state, classic-mode state, blocked from prior
+    // run, ancient started_at) is a FRESH start; stale worker-output from a
+    // different pipeline mode would create false divergences in phase
+    // verification (see T-029 incident 2026-05-20).
+    const priorStartIso = pipelineState.started_at;
+    const priorMode = pipelineState.pipeline_mode;
+    const priorStatus = pipelineState.status;
+    const oneHourMs = 3600 * 1000;
+    const isGenuineResume = priorMode === 'soft'
+      && priorStatus === 'in_progress'
+      && priorStartIso
+      && (Date.now() - new Date(priorStartIso).getTime() < oneHourMs);
+
+    const workerOutDir = path.resolve(this.config._resolved.workerOutputDir, ticket.id);
+
+    if (!isGenuineResume) {
+      // Move any stale worker-output aside (forensic record) and start fresh.
+      const { existsSync: existS2 } = await import('node:fs');
+      const fsP = await import('node:fs/promises');
+      if (existS2(workerOutDir)) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const aside = `${workerOutDir}.stale-${stamp}`;
+        try {
+          await fsP.rename(workerOutDir, aside);
+          this.emit('soft_stale_archived', { ticket: ticket.id, archived_to: aside });
+          console.log(`[soft] ${ticket.id}: stale worker-output archived → ${aside}`);
+        } catch (err) {
+          console.warn(`[soft] ${ticket.id}: stale archive failed (${err.message}) — continuing`);
+        }
+      }
+      // Reset pipeline-state to a clean fresh-start shape.
+      pipelineState = {
+        ...pipelineState,
+        status: 'in_progress',
+        started_at: new Date().toISOString(),
+        completed_at: null,
+        pipeline_mode: 'soft',
+        steps: {},
+        blocked_reason: undefined,
+        blocked_step: undefined,
+        blocked_at: undefined,
+      };
+      console.log(`[soft] ${ticket.id}: fresh start (prior_mode=${priorMode || 'none'}, prior_status=${priorStatus || 'none'})`);
+    } else {
+      // Genuine resume — keep existing checkpoints and state; just refresh status.
+      pipelineState.status = 'in_progress';
+      pipelineState.pipeline_mode = 'soft';
+      // Strip legacy step keys, keep only soft ones.
+      const SOFT_STEP_KEYS = new Set(['worker', 'reviewer', 'worker-apply']);
+      const cleanedSteps = {};
+      for (const [k, v] of Object.entries(pipelineState.steps || {})) {
+        if (SOFT_STEP_KEYS.has(k)) cleanedSteps[k] = v;
+      }
+      pipelineState.steps = cleanedSteps;
+      console.log(`[soft] ${ticket.id}: resuming from in-flight soft run`);
+    }
+    await this.savePipelineJson(ticket.id, pipelineState);
+    await (await import('node:fs/promises')).mkdir(workerOutDir, { recursive: true });
+
+    const worktree = this.cwd; // soft mode runs in the worktree like classic
+    const ticketCtx = { id: ticket.id, type: ticket.type, title: ticket.title };
+
+    this.emit('soft_ticket_start', { ticket: ticket.id });
+    console.log(`[soft] ${ticket.id}: starting 3-spawn dispatch`);
+
+    // ─────────────── SPAWN 1: worker (plan → tests_green) ───────────────
+    const resumeBefore = determineResumePoint({
+      ticketDir: workerOutDir, worktree, ticket: ticketCtx,
+      phases: ['plan', 'tests_red', 'implement', 'tests_green', 'docs_update'],
+    });
+    if (resumeBefore.requiresOperator) {
+      pipelineState.status = 'blocked';
+      pipelineState.blocked_reason = `soft pipeline resume divergence: ${JSON.stringify(resumeBefore.divergences)}`;
+      pipelineState.blocked_at = new Date().toISOString();
+      await this.savePipelineJson(ticket.id, pipelineState);
+      this.emit('soft_resume_halted', { ticket: ticket.id, divergences: resumeBefore.divergences });
+      console.error(`[soft] ${ticket.id}: resume requires operator review — divergence in ${resumeBefore.divergences.map(d => d.phase).join(', ')}`);
+      return;
+    }
+    if (resumeBefore.resumeFrom !== null) {
+      const workerPrompt = await this._renderPromptTemplate('worker.md', {
+        TICKET_ID: ticket.id,
+        TICKET_SPEC: JSON.stringify(ticket, null, 2),
+        WORKTREE_DIR: worktree,
+        WORKER_OUTPUT_DIR: workerOutDir,
+        VALIDATION_RULES: this.config._resolved.validationRules || '(none configured)',
+        RESUME_INFO: buildResumePrompt({ completed: resumeBefore.completed, resumeFrom: resumeBefore.resumeFrom, ticketDir: workerOutDir }),
+      });
+      this.emit('soft_spawn_start', { ticket: ticket.id, spawn: 'worker', resumeFrom: resumeBefore.resumeFrom });
+      console.log(`[soft] ${ticket.id}: spawn 1 (worker) → resume from ${resumeBefore.resumeFrom}`);
+      const result = await this._runSoftSpawn({
+        spawnName: 'worker',
+        prompt: workerPrompt,
+        model: 'opus',
+        tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash'],
+        ticket,
+        workerOutDir,
+        terminalMarker: 'worker_ready_for_review',
+      });
+      if (result.error) {
+        pipelineState.status = 'failed';
+        pipelineState.blocked_reason = `worker spawn failed: ${result.error}`;
+        await this.savePipelineJson(ticket.id, pipelineState);
+        return;
+      }
+    } else {
+      console.log(`[soft] ${ticket.id}: worker phases already complete on disk — skipping spawn 1`);
+    }
+
+    // Static plan check (runs once after plan.json exists).
+    try {
+      const planPath = path.resolve(workerOutDir, 'plan.json');
+      if (exist(planPath)) {
+        const planRaw = await rfile(planPath, 'utf-8');
+        const plan = JSON.parse(planRaw);
+        const { execSync } = await import('node:child_process');
+        const verdict = JSON.parse(execSync(
+          `node ${path.resolve(this.config._resolved.pipelineDir || '.', '..', '..', 'scripts', 'plan-static-check.js')} ${JSON.stringify(planPath)} --title ${JSON.stringify(ticket.title || '')}`,
+          { encoding: 'utf-8' },
+        ));
+        plan.static_check_verdict = { ...verdict, checked_at: new Date().toISOString() };
+        await wfile(planPath, JSON.stringify(plan, null, 2));
+        this.emit('soft_plan_static_check', { ticket: ticket.id, verdict: verdict.verdict, checks: verdict.checks });
+        console.log(`[soft] ${ticket.id}: plan static check → ${verdict.verdict} (${verdict.checks.length} signals)`);
+        if (verdict.verdict === 'reject') {
+          pipelineState.status = 'blocked';
+          pipelineState.blocked_reason = `plan-static-check verdict=reject: ${verdict.checks.filter(c => c.level === 'reject').map(c => c.id + ' ' + c.msg).join(' | ')}`;
+          pipelineState.blocked_at = new Date().toISOString();
+          await this.savePipelineJson(ticket.id, pipelineState);
+          this.emit('soft_plan_rejected', { ticket: ticket.id, checks: verdict.checks });
+          console.error(`[soft] ${ticket.id}: PLAN REJECTED — operator review required`);
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn(`[soft] ${ticket.id}: plan static check skipped — ${err.message}`);
+    }
+
+    // Verify all worker phases landed.
+    const workerCheck = determineResumePoint({
+      ticketDir: workerOutDir, worktree, ticket: ticketCtx,
+      phases: ['plan', 'tests_red', 'implement', 'tests_green', 'docs_update'],
+    });
+    if (workerCheck.resumeFrom !== null || workerCheck.requiresOperator) {
+      pipelineState.status = 'failed';
+      pipelineState.blocked_reason = `worker did not complete all phases (stuck at ${workerCheck.resumeFrom || 'divergence'})`;
+      await this.savePipelineJson(ticket.id, pipelineState);
+      this.emit('soft_worker_incomplete', { ticket: ticket.id, ...workerCheck });
+      return;
+    }
+    console.log(`[soft] ${ticket.id}: worker phases verified (${workerCheck.completed.length} done)`);
+
+    // ─────────────── SPAWN 2: reviewer ───────────────
+    // Capture the diff for the reviewer.
+    const { execSync: exec2 } = await import('node:child_process');
+    let diff = '';
+    let baselineSha = '';
+    try {
+      exec2('git add -N .', { cwd: worktree, encoding: 'utf-8' });
+      diff = exec2('git diff HEAD', { cwd: worktree, encoding: 'utf-8' });
+      exec2('git reset', { cwd: worktree, encoding: 'utf-8' }); // undo intent-to-add
+      baselineSha = exec2('git rev-parse HEAD', { cwd: worktree, encoding: 'utf-8' }).trim();
+    } catch (err) {
+      console.warn(`[soft] ${ticket.id}: diff capture failed — ${err.message}`);
+    }
+
+    const reviewerPrompt = await this._renderPromptTemplate('reviewer.md', {
+      TICKET_SPEC: JSON.stringify(ticket, null, 2),
+      PLAN_JSON: exist(path.resolve(workerOutDir, 'plan.json')) ? await rfile(path.resolve(workerOutDir, 'plan.json'), 'utf-8') : '{}',
+      DIFF: diff || '(diff capture failed — work in worktree only)',
+      BASELINE_SHA: baselineSha,
+      DIFF_CLASSIFICATION: '(classifier not yet wired — treat as code_behavioural)',
+      WORKER_OUTPUT_DIR: workerOutDir,
+    });
+    this.emit('soft_spawn_start', { ticket: ticket.id, spawn: 'reviewer' });
+    console.log(`[soft] ${ticket.id}: spawn 2 (reviewer)`);
+    const reviewResult = await this._runSoftSpawn({
+      spawnName: 'reviewer',
+      prompt: reviewerPrompt,
+      model: 'opus',
+      tools: ['Read', 'Grep', 'Glob', 'Write'],
+      ticket,
+      workerOutDir,
+      retryOnce: true, // single retry on malformed/missing review.json
+    });
+
+    // Validate review.json or ship with empty findings (per decision #5).
+    const reviewVerify = verifyCheckpoint({ ticketDir: workerOutDir, phase: 'review', worktree, ticket: ticketCtx });
+    if (reviewVerify.status !== 'match') {
+      console.warn(`[soft] ${ticket.id}: review failed (${reviewVerify.reason}) — shipping with empty findings`);
+      this.emit('soft_review_skipped', { ticket: ticket.id, reason: reviewVerify.reason });
+      // Synthesise a stub review.json so apply phase has something to read.
+      await wfile(path.resolve(workerOutDir, 'review.json'), JSON.stringify({
+        schema_version: 1, ticket: ticket.id, diff_sha_before: baselineSha,
+        findings: [], verdict: 'clean',
+        skipped_reason: reviewVerify.reason,
+      }, null, 2));
+    } else {
+      console.log(`[soft] ${ticket.id}: review verdict=${reviewVerify.payload.verdict}, findings=${reviewVerify.payload.findings.length}`);
+    }
+
+    // ─────────────── SPAWN 3: worker-apply ───────────────
+    const applyResume = determineResumePoint({
+      ticketDir: workerOutDir, worktree, ticket: ticketCtx,
+      phases: ['apply_review_feedback', 'root_cause'],
+    });
+    if (applyResume.resumeFrom !== null) {
+      const applyPrompt = await this._renderPromptTemplate('worker-apply.md', {
+        TICKET_ID: ticket.id,
+        TICKET_SPEC: JSON.stringify(ticket, null, 2),
+        WORKTREE_DIR: worktree,
+        WORKER_OUTPUT_DIR: workerOutDir,
+      });
+      this.emit('soft_spawn_start', { ticket: ticket.id, spawn: 'worker-apply' });
+      console.log(`[soft] ${ticket.id}: spawn 3 (worker-apply) → resume from ${applyResume.resumeFrom}`);
+      const applyResult = await this._runSoftSpawn({
+        spawnName: 'worker-apply',
+        prompt: applyPrompt,
+        model: 'opus',
+        tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash'],
+        ticket,
+        workerOutDir,
+        terminalMarker: 'worker_apply_done',
+      });
+      if (applyResult.error) {
+        pipelineState.status = 'failed';
+        pipelineState.blocked_reason = `worker-apply spawn failed: ${applyResult.error}`;
+        await this.savePipelineJson(ticket.id, pipelineState);
+        return;
+      }
+    }
+
+    // ─────────────── COMMIT + ARCHIVE ───────────────
+    pipelineState.status = 'done';
+    pipelineState.completed_at = new Date().toISOString();
+    pipelineState.duration_ms = Date.now() - ticketStartTime;
+    await this.savePipelineJson(ticket.id, pipelineState);
+
+    // Reuse the classic checkpoint commit machinery — it's idempotent and
+    // the soft pipeline ends in the same "uncommitted worktree" state the
+    // classic flow does. The commit happens in run()'s post-processTicket
+    // logic at the worktree-merge step (line ~415), so we don't commit here.
+    // Instead we let processTicket's commit block run by setting pipelineState
+    // status correctly and letting the run-loop's commit/cherry-pick handle it.
+    //
+    // BUT: the classic commit block (line 1541 region) is INSIDE processTicket.
+    // For soft mode we replicate the inline commit logic here.
+    if (this.config.checkpoints?.enabled) {
+      try {
+        const ticketSha = commitTicketAsOne(ticket.id, ticket.title || '', this.cwd);
+        if (ticketSha) {
+          this.emit('ticket_committed', { ticket: ticket.id, sha: ticketSha });
+          console.log(`[soft] ${ticket.id}: committed (${ticketSha.slice(0, 7)})`);
+          // Cleanup transient tests_green attempt logs only.
+          try {
+            for (const f of (await rdir(workerOutDir))) {
+              if (/^tests_green-.+-attempt\d+\.log$/.test(f)) {
+                const { unlinkSync: unlinkS } = await import('node:fs');
+                unlinkS(path.resolve(workerOutDir, f));
+              }
+            }
+          } catch (err) {
+            console.warn(`[soft] ${ticket.id}: log cleanup failed — ${err.message}`);
+          }
+          pipelineState.checkpoint = pipelineState.checkpoint || {};
+          pipelineState.checkpoint.ticket_sha = ticketSha;
+          pipelineState.checkpoint.committed_at = new Date().toISOString();
+          await this.savePipelineJson(ticket.id, pipelineState);
+        } else {
+          pipelineState.status = 'blocked';
+          pipelineState.blocked_at = new Date().toISOString();
+          pipelineState.blocked_step = 'commit';
+          pipelineState.blocked_reason = 'soft pipeline produced no diff — likely worker no-op';
+          await this.savePipelineJson(ticket.id, pipelineState);
+          this.emit('ticket_committed_empty', { ticket: ticket.id, reason: pipelineState.blocked_reason });
+          try { cleanupBaseline(ticket.id, this.cwd); } catch {}
+          return;
+        }
+      } catch (err) {
+        console.error(`[soft] ${ticket.id}: commit FAILED — ${err.message}`);
+        this.emit('ticket_commit_failed', { ticket: ticket.id, error: err.message });
+        return;
+      }
+
+      try { cleanupBaseline(ticket.id, this.cwd); } catch (err) {
+        console.warn(`[soft] ${ticket.id}: baseline cleanup failed — ${err.message}`);
+      }
+    }
+
+    this.emit('soft_ticket_done', { ticket: ticket.id, duration_ms: pipelineState.duration_ms });
+    console.log(`[soft] ${ticket.id}: complete (${Math.round(pipelineState.duration_ms / 60000)}m)`);
+  }
+
+  // Render a prompt template with {{KEY}} substitution.
+  async _renderPromptTemplate(templateName, vars) {
+    const { readFile: rf } = await import('node:fs/promises');
+    const path = await import('node:path');
+    const tmplPath = path.resolve(import.meta.dirname || '.', '..', 'prompts', templateName);
+    let tmpl = await rf(tmplPath, 'utf-8');
+    for (const [k, v] of Object.entries(vars)) {
+      tmpl = tmpl.split(`{{${k}}}`).join(typeof v === 'string' ? v : JSON.stringify(v));
+    }
+    return tmpl;
+  }
+
+  // Spawn a Claude session for a soft-pipeline phase. Wraps spawnClaude with
+  // phase-marker parsing + per-assistant-turn token accumulation + rate-limit
+  // retry + terminal-marker timeout (defends against Claude CLI hang-after-
+  // finish — see T-029 incident 2026-05-20).
+  //
+  // Returns {error|result, wallMs, inputTokens, outputTokens, cachedTokens}.
+  async _runSoftSpawn({ spawnName, prompt, model, tools, ticket, workerOutDir, retryOnce = false, terminalMarker = null, terminalGraceMs = 60_000 }) {
+    const startedAt = Date.now();
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cachedTokens = 0;
+    let toolCalls = 0;
+    let terminalMarkerSeenAt = null;
+    let killTimer = null;
+    // childProc is set when we receive the process_started event from the
+    // runner. spawnClaude doesn't expose the subprocess directly, so we
+    // rely on PID detection via `ps` — see killHungChild() below.
+    let knownChildPid = null;
+
+    const killHungChild = () => {
+      // The Claude CLI subprocess didn't exit within terminalGraceMs after
+      // emitting the terminal marker. The worker's actual work is done
+      // (checkpoints on disk, marker fired) — this is a CLI termination
+      // bug, not a worker failure. SIGTERM the subprocess so spawnClaude's
+      // promise resolves and the dispatcher proceeds to the next spawn.
+      try {
+        // Best-effort: find any claude -p subprocess of this Node process
+        // and SIGTERM it. Node's spawn doesn't give us the PID directly
+        // through the wrapped promise, so we scan children.
+        const { execSync: ex } = require('node:child_process');
+        const myPid = process.pid;
+        const children = ex(`pgrep -P ${myPid} -f 'claude -p'`, { encoding: 'utf-8' }).trim().split('\n').filter(Boolean);
+        for (const pid of children) {
+          try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
+        }
+        console.log(`[soft] ${ticket.id}/${spawnName}: terminal marker '${terminalMarker}' seen but CLI didn't exit in ${terminalGraceMs}ms — SIGTERM'd ${children.length} child(ren)`);
+        this.emit('soft_terminal_marker_timeout', { ticket: ticket.id, spawn: spawnName, marker: terminalMarker, killed_pids: children });
+      } catch (err) {
+        console.warn(`[soft] ${ticket.id}/${spawnName}: terminal-marker kill failed — ${err.message}`);
+      }
+    };
+
+    const dataHandler = (event) => {
+      // Phase markers (advisory; orchestrator verifies state separately).
+      // Watch for the spawn's terminal marker — once seen, start a kill
+      // timer in case Claude CLI hangs after final assistant message.
+      if (event?.text && /<<<PHASE:\s*([a-z_]+)\s*>>>/.test(event.text)) {
+        const m = event.text.match(/<<<PHASE:\s*([a-z_]+)\s*>>>/);
+        if (m) {
+          this.emit('soft_phase_marker', { ticket: ticket.id, spawn: spawnName, marker: m[1], at: new Date().toISOString() });
+          if (terminalMarker && m[1] === terminalMarker && !terminalMarkerSeenAt) {
+            terminalMarkerSeenAt = Date.now();
+            console.log(`[soft] ${ticket.id}/${spawnName}: terminal marker '${terminalMarker}' seen — ${terminalGraceMs}ms grace before forced exit`);
+            killTimer = setTimeout(killHungChild, terminalGraceMs);
+          }
+        }
+      }
+      // Token accounting: the runner's parsed JSON-stream emits assistant
+      // events with usage in event.message.usage. Accumulate across turns.
+      const u = event?.message?.usage;
+      if (u) {
+        inputTokens += u.input_tokens || 0;
+        outputTokens += u.output_tokens || 0;
+        cachedTokens += u.cache_read_input_tokens || 0;
+      }
+      // Tool-use count
+      if (event?.type === 'assistant' && Array.isArray(event.message?.content)) {
+        for (const block of event.message.content) {
+          if (block?.type === 'tool_use') toolCalls += 1;
+        }
+      }
+      this.emit('claude_event', { ticket: ticket.id, step: spawnName, event });
+    };
+
+    try {
+      const result = await this.runWithRateLimitRetry(
+        () => spawnClaude({
+          prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
+          env: this.config.environment || {},
+          onData: dataHandler,
+        }),
+        ticket.id,
+        spawnName,
+      );
+      if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      const wallMs = Date.now() - startedAt;
+      const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), terminalMarkerSeenAt: terminalMarkerSeenAt ? new Date(terminalMarkerSeenAt).toISOString() : null };
+      this.emit('soft_spawn_done', { ticket: ticket.id, spawn: spawnName, ...metrics });
+      // Persist metrics into the ticket's pipeline-state so the dashboard
+      // aggregator picks them up. The legacy step keys (plan, tests_red, …)
+      // are overwritten by the soft-mode step keys (worker, reviewer,
+      // worker_apply). The dashboard iterates Object.values(steps) and
+      // sums metrics — soft and classic both contribute to the same totals.
+      try {
+        const ps = await this.loadPipelineJson(ticket.id);
+        if (ps) {
+          ps.steps = ps.steps || {};
+          ps.steps[spawnName] = {
+            status: 'done',
+            completed_at: new Date().toISOString(),
+            metrics,
+          };
+          await this.savePipelineJson(ticket.id, ps);
+        }
+      } catch (err) {
+        console.warn(`[soft] ${ticket.id}/${spawnName}: metrics persist failed — ${err.message}`);
+      }
+      return { result, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls };
+    } catch (err) {
+      if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      // If the terminal marker was seen, the subprocess exit was the
+      // expected outcome (we may have SIGTERM'd it ourselves). Treat as
+      // success — the work is done, checkpoints are on disk.
+      if (terminalMarkerSeenAt) {
+        const wallMs = Date.now() - startedAt;
+        const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), terminalMarkerSeenAt: new Date(terminalMarkerSeenAt).toISOString(), exited_via: 'terminal_marker_timeout' };
+        this.emit('soft_spawn_done', { ticket: ticket.id, spawn: spawnName, ...metrics });
+        try {
+          const ps = await this.loadPipelineJson(ticket.id);
+          if (ps) {
+            ps.steps = ps.steps || {};
+            ps.steps[spawnName] = { status: 'done', completed_at: new Date().toISOString(), metrics };
+            await this.savePipelineJson(ticket.id, ps);
+          }
+        } catch {}
+        console.log(`[soft] ${ticket.id}/${spawnName}: subprocess exit after terminal marker — treating as success`);
+        return { result: null, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, terminalExit: true };
+      }
+      if (err.rateLimited) throw err;
+      if (retryOnce) {
+        console.warn(`[soft] ${ticket.id}/${spawnName}: first attempt failed (${err.message}) — retrying once`);
+        try {
+          const result = await this.runWithRateLimitRetry(
+            () => spawnClaude({
+              prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
+              env: this.config.environment || {},
+              onData: dataHandler,
+            }),
+            ticket.id, spawnName + '_retry',
+          );
+          const wallMs = Date.now() - startedAt;
+          const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), retried: true };
+          try {
+            const ps = await this.loadPipelineJson(ticket.id);
+            if (ps) {
+              ps.steps = ps.steps || {};
+              ps.steps[spawnName] = { status: 'done', completed_at: new Date().toISOString(), metrics };
+              await this.savePipelineJson(ticket.id, ps);
+            }
+          } catch {}
+          return { result, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls };
+        } catch (err2) {
+          return { error: err2.message, wallMs: Date.now() - startedAt, inputTokens, outputTokens };
+        }
+      }
+      return { error: err.message, wallMs: Date.now() - startedAt, inputTokens, outputTokens };
     }
   }
 
@@ -827,7 +1337,7 @@ export class Pipeline {
           + ((a.unit_crashed || a.unit_skipped_compile_errors || (a.unit_ran_nothing && !a.unit_no_tests)) ? 1 : 0);
 
         while (true) {
-          testsGreenResult = await this.runTestsGreen(ticket, pipelineState);
+          testsGreenResult = await this.runTestsGreen(ticket, pipelineState, healAttempt);
           pipelineState = await this.reloadStepFromDisk(ticket.id, 'tests_green', pipelineState);
           const stepArtifacts = pipelineState.steps.tests_green || {};
 
@@ -1096,7 +1606,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
             // pipeline-state layer.
             if (this.config.checkpoints?.enabled) {
               try {
-                revertToBaseline(ticket.id, this.cwd);
+                revertToBaseline(ticket.id, this.cwd, { workerOutputDir: `${this.config._resolved.workerOutputDir}/${ticket.id}` });
                 this.emit('checkpoint_reverted_for_restart', { ticket: ticket.id, from: stepConfig.name, to: prevStepName });
               } catch (revertErr) {
                 console.warn(`[restart] ${ticket.id}: git revert failed — ${revertErr.message}`);
@@ -1548,6 +2058,26 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           if (ticketSha) {
             this.emit('ticket_committed', { ticket: ticket.id, sha: ticketSha });
             console.log(`[checkpoint] ${ticket.id}: committed to master (${ticketSha.slice(0, 7)})`);
+            // 2026-05-20 (post-revert): the per-attempt tests_green-*.log files
+            // are noisy (multi-MB each × N attempts × every ticket); delete
+            // them on commit. Everything ELSE in worker-output (plan.json,
+            // implement.json, review.json, tests_red.json, .attempt-N.json
+            // snapshots, diff-*.patch) is forensic evidence — kept forever
+            // on disk. Disk is cheap, projects/ is gitignored, and these
+            // files let us backtest plan-static-check, inspect past review
+            // history, and debug defects discovered against shipped tickets.
+            try {
+              const woDir = resolve(this.config._resolved.workerOutputDir, ticket.id);
+              if (existsSync(woDir)) {
+                for (const f of readdirSync(woDir)) {
+                  if (/^tests_green-.+-attempt\d+\.log$/.test(f)) {
+                    unlinkSync(resolve(woDir, f));
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`[checkpoint] ${ticket.id}: tests_green log cleanup failed — ${err.message}`);
+            }
             // Persist the sha on pipelineState so run()'s post-archive
             // worktree merge step can find it.
             pipelineState.checkpoint = pipelineState.checkpoint || {};
@@ -1893,6 +2423,28 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
     pipelineState.steps[stepName] = merged;
     await this.savePipelineJson(ticketId, pipelineState);
     this.emit('worker_output_ingested', { ticket: ticketId, step: stepName, fields: accepted });
+
+    // Archive this attempt before the next worker run can clobber {step}.json.
+    // The review→implement→review loop and the self-heal loop both overwrite
+    // the same path; without an archive, the divergent findings/diffs from
+    // earlier cycles are lost — which is exactly why T-045's review history
+    // was unrecoverable on 2026-05-20 (each review cycle clobbered the prior
+    // one, and the final crash left zero record of what review had flagged).
+    //
+    // Filesystem-counted: list existing siblings to pick N, no extra state
+    // tracking. Append-only — costs ~few KB per ticket per step. Snapshot
+    // failure is non-fatal: it's diagnostic, not load-bearing.
+    try {
+      const dir = resolve(this.config._resolved.workerOutputDir, ticketId);
+      const prefix = `${stepName}.attempt-`;
+      const siblings = (await readdir(dir)).filter(f => f.startsWith(prefix) && f.endsWith('.json'));
+      const n = siblings.length;
+      const archivePath = resolve(dir, `${stepName}.attempt-${n}.json`);
+      await copyFile(path, archivePath);
+      this.emit('worker_output_archived', { ticket: ticketId, step: stepName, attempt: n, path: archivePath });
+    } catch (err) {
+      console.warn(`[ingest-worker] ${ticketId}/${stepName}: archive snapshot failed — ${err.message}`);
+    }
     return true;
   }
 
@@ -2574,7 +3126,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // Rewind to the previous snapshot so partial work doesn't leak.
         if (this.config.checkpoints?.enabled) {
           try {
-            revertToBaseline(ticket.id, this.cwd);
+            revertToBaseline(ticket.id, this.cwd, { workerOutputDir: `${this.config._resolved.workerOutputDir}/${ticket.id}` });
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
           } catch (err) {
             console.warn(`[checkpoint] ${ticket.id}/${stepConfig.name}: revert failed — ${err.message}`);
@@ -2605,7 +3157,7 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
         // base (= master tip at ticket start).
         if (this.config.checkpoints?.enabled) {
           try {
-            revertToBaseline(ticket.id, this.cwd);
+            revertToBaseline(ticket.id, this.cwd, { workerOutputDir: `${this.config._resolved.workerOutputDir}/${ticket.id}` });
             this.emit('checkpoint_reverted', { ticket: ticket.id, step: stepConfig.name });
             console.log(`[checkpoint] ${ticket.id}/${stepConfig.name}: working tree reverted to last snapshot`);
           } catch (err) {
@@ -2773,7 +3325,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       const result = await this.runWithRateLimitRetry(
         () => spawnClaude({
           prompt: healPrompt,
-          model: 'sonnet',
+          model: 'opus',
           tools: ['Read', 'Grep', 'Glob', 'Edit', 'Write', 'Bash(git *)'],
           maxTurns: 15,
           workingDir: this.cwd,
@@ -2866,7 +3418,12 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
   // (used for baseline, where we don't yet know which phases this ticket
   // will trigger). runAllExtras=false keeps the trigger_file_prefix filter
   // driven by the current implement files_changed.
-  async runTestSuite(pipelineState, { runAllExtras = false } = {}) {
+  // logContext: { ticketId, attempt } — when provided, the full per-phase
+  // output is persisted to worker-output/{ticketId}/tests_green-{phase}-attempt{N}.log.
+  // 2026-05-19: added after T-026 was undiagnosable post-mortem because only
+  // the last 5/8 lines per phase were retained. Files are cleaned up on
+  // successful ticket commit; failed tickets keep them for forensics.
+  async runTestSuite(pipelineState, { runAllExtras = false, logContext = null } = {}) {
     const projectDir = this.cwd;
     const env = { ...process.env };
     for (const [k, v] of Object.entries(this.config.environment || {})) {
@@ -2937,6 +3494,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       console.log(`[test-suite] Running unit tests (${tc.unit.cmd})...`);
     }
     const { output: testOutput, exitCode: unitExitCode, skipped: unitSkipped } = runPhase(tc.unit);
+    if (logContext && !unitSkipped) this._writePhaseLog(logContext, 'unit', testOutput);
 
     let passed = 0, failed = 0;
     const statsRe = tc.unit?.stats_pattern ? new RegExp(tc.unit.stats_pattern, 'g') : /\+(\d+)\s+-(\d+):\s/g;
@@ -2981,6 +3539,7 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
       if (!runAllExtras && prefix && !implPaths.some((p) => p.startsWith(prefix))) continue;
       console.log(`[test-suite] Running ${phase} (${spec.cmd})...`);
       const r = runPhase(spec);
+      if (logContext) this._writePhaseLog(logContext, phase, r.output);
       // Keep per-phase tail in the summary (don't truncate after concat).
       const phaseTail = r.output.split('\n').slice(-8).join('\n');
       extraOutput += `--- ${phase} (exit ${r.exitCode}) ---\n${phaseTail}\n`;
@@ -3169,7 +3728,24 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
 
   // --- tests_green: compare current failures against baseline ---
 
-  async runTestsGreen(ticket, pipelineState) {
+  // Helper: write the full per-phase test output to a per-attempt log file
+  // under worker-output/{ticketId}/. Per-attempt (not overwritten) so heal-N
+  // can be diffed against heal-0 — that's the T-027 self-heal-regression
+  // pattern. Files are cleaned up only on successful ticket commit.
+  _writePhaseLog({ ticketId, attempt }, phase, output) {
+    try {
+      const dir = resolve(this.config._resolved.workerOutputDir, ticketId);
+      if (!existsSync(dir)) return; // worker-output dir created elsewhere; don't compete
+      const file = resolve(dir, `tests_green-${phase}-attempt${attempt}.log`);
+      // synchronous: keep ordering deterministic and avoid drowning on parallel phases
+      // (small file, written once per phase per attempt)
+      writeFileSync(file, String(output ?? ''));
+    } catch (err) {
+      console.warn(`[tests_green] failed to persist log for ${phase} attempt${attempt}: ${err.message}`);
+    }
+  }
+
+  async runTestsGreen(ticket, pipelineState, healAttempt = 0) {
     // Prefer the deterministic baseline captured at ticket start. Fall back
     // to the legacy LLM-authored tests_red.baseline_failures for older
     // pipeline JSONs that predate baseline_capture.
@@ -3179,7 +3755,10 @@ IMPORTANT: Only fix what the gate requires. Do not re-run the entire step. Focus
     const baselineExtras = new Set(pipelineState.baseline_extra_failures || []);
 
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'unit_tests' });
-    const res = await this.runTestSuite(pipelineState, { runAllExtras: false });
+    const res = await this.runTestSuite(pipelineState, {
+      runAllExtras: false,
+      logContext: { ticketId: ticket.id, attempt: healAttempt },
+    });
     this.emit('tests_green_run', { ticket: ticket.id, phase: 'analyzer' });
 
     const baselineSet = new Set(baseline);

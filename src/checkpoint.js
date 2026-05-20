@@ -127,7 +127,14 @@ export function setupTicketBaseline(ticketId, cwd, absorbPaths = []) {
 //
 // `git clean -fd` removes untracked files but NOT ignored ones (no -x), so
 // the gitignored backlog files survive intact.
-export function revertToBaseline(ticketId, cwd) {
+//
+// 2026-05-20 (post-T-045 incident): before the destructive reset we tag the
+// pre-revert HEAD as `pipeline/{ticketId}/failed-{ts}` and dump a patch to
+// `worker-output/{ticketId}/diff-{ts}.patch`. Either survives the reset;
+// the operator can `git checkout pipeline/{ticketId}/failed-*` to inspect
+// the wiped work or `git apply` the patch into a fresh branch. Tag count
+// is bounded by the number of times revert fires (≤ a few per ticket).
+export function revertToBaseline(ticketId, cwd, { workerOutputDir } = {}) {
   const tag = baselineTagName(ticketId);
   const exists = git(`rev-parse --verify ${tag}`, cwd, { tolerateFailure: true }) !== null;
   if (!exists) {
@@ -135,6 +142,36 @@ export function revertToBaseline(ticketId, cwd) {
       `baseline tag ${tag} not found — cannot revert`,
       { code: 'NO_BASELINE' },
     );
+  }
+  // Preserve the diff before nuking it. Best-effort — failure to preserve
+  // is logged but does not block the revert (the revert is load-bearing,
+  // the preservation is diagnostic).
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const status = git('status --porcelain', cwd, { tolerateFailure: true }) || '';
+    if (status.length > 0) {
+      // 1. Lightweight tag of current HEAD (covers committed-but-not-merged
+      //    state, unusual for the pipeline but possible if a step committed).
+      git(`tag pipeline/${ticketId}/failed-${ts} HEAD`, cwd, { tolerateFailure: true });
+      // 2. Patch of the actual working-tree diff (incl. untracked files via
+      //    --no-prefix would be nice but git diff doesn't do untracked; we
+      //    cover untracked via `git add -N` so they show up as new files).
+      if (workerOutputDir) {
+        try {
+          execSync('git add -N .', { cwd, encoding: 'utf-8' });
+          const diff = execSync('git diff HEAD', { cwd, encoding: 'utf-8' });
+          if (diff && diff.length > 0) {
+            writeFileSync(`${workerOutputDir}/diff-${ts}.patch`, diff);
+          }
+          // Undo the -N intent-to-add so reset --hard is clean.
+          execSync('git reset', { cwd, encoding: 'utf-8' });
+        } catch {
+          // Patch preservation is best-effort.
+        }
+      }
+    }
+  } catch {
+    // Never let preservation failure block the revert.
   }
   git(`reset --hard ${tag}`, cwd);
   git('clean -fd', cwd);
