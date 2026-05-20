@@ -246,6 +246,16 @@ export class Pipeline {
         return;
       }
 
+      // 2026-05-20: first-DIRTY halt. If the merge gate refuses to land a
+      // ticket because the operator's master is dirty (or any equivalent
+      // pre-condition error — DIRTY/CONFLICT/WRONG_BRANCH/NOT_ON_MASTER),
+      // every subsequent ticket in this batch will hit the SAME wall —
+      // marching on burns hours of worker time producing commits that
+      // can't ship and stack up as `pipeline/pending-merge-*` tags. Halt
+      // immediately, surface the issue, and let the operator unblock.
+      // The just-failed ticket's pipeline-state already records
+      // merge.status=pending; on the next run the merge will be retried.
+      let mergeBlockedHalt = null;
       // Process tickets one at a time
       for (let i = 0; i < queue.length; i++) {
         if (this.stopRequested) {
@@ -475,6 +485,17 @@ export class Pipeline {
             finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag, non_landing_attempts: attempts };
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
             await this.parkIfNonLandingExhausted(ticket, attempts, `cherry-pick keeps failing (code=${result.code}) after %N% attempts; tag ${tag}`);
+            // Halt the batch (see comment near the for-loop). Capture context
+            // for the surfaced event; the actual break happens after the
+            // try/finally for worktree cleanup so we don't leak worktree state.
+            mergeBlockedHalt = {
+              ticket: ticket.id,
+              code: result.code,
+              files: result.files || [],
+              head: result.head,
+              tag,
+              hint: `cd ${this.config.project_dir} && git status   # then clean/commit, then re-run`,
+            };
           }
         } else {
           // Checkpoint/non-worktree path (or worktree ticket with no
@@ -525,6 +546,11 @@ export class Pipeline {
               try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
               await this.parkIfNonLandingExhausted(ticket, attempts, `produced no landed commit on ${branchName} after %N% attempts (NOT_ON_MASTER)`);
             }
+            mergeBlockedHalt = {
+              ticket: ticket.id,
+              code: 'NOT_ON_MASTER',
+              hint: `ticket ${ticket.id} reached done but no commit on ${branchName}; inspect worktree and re-run`,
+            };
           }
         }
 
@@ -554,6 +580,24 @@ export class Pipeline {
             completed: ticket.id,
             remaining: queue.length - i - 1,
           });
+          break;
+        }
+
+        // First-DIRTY halt. The merge gate above set this flag when the
+        // ticket couldn't land on master (dirty tree / conflict / wrong
+        // branch / no commit). Every subsequent ticket in the batch would
+        // hit the same wall — bail out and surface the precondition to the
+        // operator so they can fix master before more work piles up.
+        if (mergeBlockedHalt) {
+          this.emit('pipeline_halted_merge_blocked', {
+            ...mergeBlockedHalt,
+            remaining: queue.length - i - 1,
+            queued: queue.slice(i + 1).map((t) => t.id),
+          });
+          console.error(
+            `[pipeline] HALTED after ${mergeBlockedHalt.ticket}: merge refused (code=${mergeBlockedHalt.code}). ` +
+            `${queue.length - i - 1} ticket(s) skipped to avoid pile-up. ${mergeBlockedHalt.hint}`,
+          );
           break;
         }
       }
