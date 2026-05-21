@@ -24,6 +24,7 @@ import {
 } from './worktree.js';
 import { pickAttemptModel, decideRestart, shouldHeal } from './retry-policy.js';
 import { checkWriteZones, formatViolations, globMatch as globMatchSimple } from './write-zones.js';
+import { loadCodeValidationRubric, decideReviewGate } from './review-gate.js';
 
 // Module-scoped set of ticket ids already surfaced as stranded in this
 // server process. Without this, every `/api/run/all` re-scans the pipeline
@@ -820,6 +821,7 @@ export class Pipeline {
       BASELINE_SHA: baselineSha,
       DIFF_CLASSIFICATION: '(classifier not yet wired — treat as code_behavioural)',
       WORKER_OUTPUT_DIR: workerOutDir,
+      CODE_VALIDATION: loadCodeValidationRubric(worktree),
     });
     this.emit('soft_spawn_start', { ticket: ticket.id, spawn: 'reviewer' });
     console.log(`[soft] ${ticket.id}: spawn 2 (reviewer)`);
@@ -833,20 +835,23 @@ export class Pipeline {
       retryOnce: true, // single retry on malformed/missing review.json
     });
 
-    // Validate review.json or ship with empty findings (per decision #5).
+    // T-053: gate on the review. A review that could not be validated, or a
+    // 'blocked' verdict, must NOT ship — previously the pipeline synthesised
+    // `verdict: clean` here and shipped unreviewed code.
     const reviewVerify = verifyCheckpoint({ ticketDir: workerOutDir, phase: 'review', worktree, ticket: ticketCtx });
-    if (reviewVerify.status !== 'match') {
-      console.warn(`[soft] ${ticket.id}: review failed (${reviewVerify.reason}) — shipping with empty findings`);
-      this.emit('soft_review_skipped', { ticket: ticket.id, reason: reviewVerify.reason });
-      // Synthesise a stub review.json so apply phase has something to read.
-      await wfile(path.resolve(workerOutDir, 'review.json'), JSON.stringify({
-        schema_version: 1, ticket: ticket.id, diff_sha_before: baselineSha,
-        findings: [], verdict: 'clean',
-        skipped_reason: reviewVerify.reason,
-      }, null, 2));
-    } else {
-      console.log(`[soft] ${ticket.id}: review verdict=${reviewVerify.payload.verdict}, findings=${reviewVerify.payload.findings.length}`);
+    const reviewGate = decideReviewGate(reviewVerify);
+    if (reviewGate.block) {
+      console.warn(`[soft] ${ticket.id}: review gate BLOCK — ${reviewGate.reason}`);
+      pipelineState.status = 'blocked';
+      pipelineState.blocked_at = new Date().toISOString();
+      pipelineState.blocked_step = 'review';
+      pipelineState.blocked_reason = reviewGate.reason;
+      await this.savePipelineJson(ticket.id, pipelineState);
+      this.emit('soft_review_blocked', { ticket: ticket.id, reason: reviewGate.reason });
+      try { cleanupBaseline(ticket.id, this.cwd); } catch {}
+      return;
     }
+    console.log(`[soft] ${ticket.id}: review verdict=${reviewVerify.payload.verdict}, findings=${reviewVerify.payload.findings.length}`);
 
     // ─────────────── SPAWN 3: worker-apply ───────────────
     const applyResume = determineResumePoint({
