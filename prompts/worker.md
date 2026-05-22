@@ -65,7 +65,14 @@ Write `{{WORKER_OUTPUT_DIR}}/implement.json` with:
 Markers: `<<<PHASE: implement_started>>>` / `<<<PHASE: implement_done>>>`.
 
 ### 4. `tests_green`
-Run the FULL suite + analyzer. Both must be clean before this phase passes. If a test fails:
+Run the FULL suite + analyzer. Both must be clean before this phase passes.
+
+**How to run the suite — read this, it prevents a known deadlock:**
+- Run the test command (the project's `.claude/run-tests.sh` if present, else the configured test command) **in the FOREGROUND and wait for it to finish**. If you fear it exceeds the default Bash timeout, raise the Bash tool's timeout — do NOT background it.
+- **NEVER background-and-poll.** Do not write `until`/`while` loops that poll a process. In particular, NEVER poll with `pgrep -f "<pattern>"` where `<pattern>` can appear in the polling command's own command line — `pgrep -f` matches the poller itself, the condition never clears, and the session hangs forever (this froze a real run for 10.5h).
+- If a long suite genuinely must run in the background, the ONLY sanctioned pattern is bash job control on the job's own PID: `run-tests.sh & wait $!` — never a `pgrep`/`/proc` poll loop.
+
+If a test fails:
 - If it's a test you wrote in tests_red that now passes — that's the goal, keep going.
 - If it's a pre-existing test now failing — you've broken something. Fix the production code, re-run, until clean.
 - If multiple iterations fail to converge (>3 fix attempts on the same test) — halt with a `tests_green.json` whose `all_pass: false` and write the diagnostic into `failure_evidence`. The orchestrator surfaces this as a halt to the operator.

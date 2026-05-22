@@ -27,6 +27,8 @@ Read `review.json`. For each finding in `findings[]`:
 
 After processing every finding, re-run the test suite + analyzer. They must be clean before you proceed. If a fix you applied broke tests, fix the regression (recursive small loop, max 3 iterations; if you can't converge, halt).
 
+Run the suite **in the FOREGROUND and wait** — raise the Bash timeout if needed. NEVER background-and-poll, and NEVER poll with `pgrep -f "<pattern>"` where the pattern can match the polling command itself (`pgrep -f` matches the poller, the loop never exits, the session hangs). If a background run is unavoidable, the only sanctioned wait is `cmd & wait $!`.
+
 **Output**: `review.json` updated in place with every finding's `status` non-`pending`. **Also write** `{{WORKER_OUTPUT_DIR}}/disputed-findings.json` summarising only the `argued`/`deferred` findings with their responses — this is what the operator audits next morning.
 
 Markers: `<<<PHASE: apply_review_feedback_started>>>` / `<<<PHASE: apply_review_feedback_done>>>`.
