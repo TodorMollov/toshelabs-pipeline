@@ -18,6 +18,14 @@ You are the implementer for ticket {{TICKET_ID}}. You execute the plan-through-t
 
 You MUST do these in sequence. Each phase ends with a marker emit and an atomic checkpoint write.
 
+### Running tests — contract, applies to EVERY phase below
+
+Whenever any phase tells you to run tests, run them **only** through the project's test runner `.claude/run-tests.sh` (see CLAUDE.md "Test execution") as **ONE foreground, blocking Bash call**, and read its exit code (0 = green).
+- For fast, scoped feedback in `tests_red`/`implement`, pass the affected paths: `.claude/run-tests.sh test/widget/foo_test.dart`. With **no args** it runs the full suite + analyzer — that is the `tests_green` gate.
+- **NEVER** run `flutter test` (or the raw configured test command) directly. **NEVER** background a test run or write an `until`/`while` poll loop. If you fear the Bash timeout, raise the Bash tool's timeout instead. (A worker once improvised a `pgrep`/file poll loop whose condition never cleared and froze a run for 10.5h.)
+- If the runner is genuinely long-running, the ONLY sanctioned background form is `.claude/run-tests.sh & wait $!` — never a `pgrep`/`/proc`/file poll.
+- Do NOT improvise environment setup (library paths, `LD_PRELOAD`, `find /` for shared objects). The runner owns the environment; if a test needs special setup, it belongs in the runner, not in your shell.
+
 ### 1. `plan`
 Read existing code as needed (worktree files, docs). Then write `{{WORKER_OUTPUT_DIR}}/plan.json` per `schemas/plan.v1.schema.json`. Required: `ticket`, `files_to_change`, `test_strategy`. Each `files_to_change` entry has `path`, `reason`, `what_to_do`. Prefix `what_to_do` with `[no-test]` for files whose change is structurally untestable (pure plumbing, doc comment, type alias).
 
@@ -35,7 +43,7 @@ For each non-`[no-test]` deliverable in `files_to_change`, write a failing test 
 
 If the plan is ALL `[no-test]` bullets (pure docs/refactor/logging change), write `tests_red.json` with `{"no_test_reason": "<reason>", "tests_added": []}` and skip to next phase.
 
-Run tests to confirm they fail. Write `{{WORKER_OUTPUT_DIR}}/tests_red.json` with:
+Run the new tests to confirm they fail (via the runner — see *Running tests* above; scope it to the new test paths). Write `{{WORKER_OUTPUT_DIR}}/tests_red.json` with:
 - `tests_added`: array of `{path, deliverable}` mapping each test to a plan bullet
 - `failure_evidence`: object `{path: <one-line failure reason>}` per test
 - Or, for empty case: `no_test_reason: <string>`
@@ -55,7 +63,7 @@ Markers: `<<<PHASE: tests_red_started>>>` / `<<<PHASE: tests_red_done>>>`.
 ### 3. `implement`
 Write production code to make the failing tests pass. Edit ONLY files declared in `plan.files_to_change` (after revision if applicable). New tests written in tests_red are off-limits — do not touch them.
 
-Run tests as you go on affected paths (e.g. `flutter test test/unit/<file>_test.dart` rather than the full suite) for fast feedback.
+Run tests as you go for fast feedback — scope the runner to the affected paths (e.g. `.claude/run-tests.sh test/unit/<file>_test.dart`), per *Running tests* above. Do not invoke the raw test command directly.
 
 Write `{{WORKER_OUTPUT_DIR}}/implement.json` with:
 - `files_changed`: array of paths actually modified
@@ -65,7 +73,7 @@ Write `{{WORKER_OUTPUT_DIR}}/implement.json` with:
 Markers: `<<<PHASE: implement_started>>>` / `<<<PHASE: implement_done>>>`.
 
 ### 4. `tests_green`
-Run the FULL suite + analyzer via the project's test runner (`.claude/run-tests.sh`) — see CLAUDE.md "Test execution". It's ONE foreground, blocking call: read its exit code (0 = green) and its `RESULT: GREEN`/`RESULT: RED` summary. Do NOT background it, do NOT poll it, do NOT run `flutter test` directly. Both tests and analyzer must be clean before this phase passes.
+Run the FULL suite + analyzer: call `.claude/run-tests.sh` with **no args** (per *Running tests* above). Read its exit code (0 = green) and its `RESULT: GREEN`/`RESULT: RED` summary. Both tests and analyzer must be clean before this phase passes.
 
 If a test fails:
 - If it's a test you wrote in tests_red that now passes — that's the goal, keep going.
