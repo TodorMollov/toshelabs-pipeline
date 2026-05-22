@@ -27,7 +27,7 @@ import { readFile, writeFile } from 'fs/promises';
 import { resolve, dirname } from 'path';
 import { existsSync, mkdirSync } from 'fs';
 
-import { DEFAULT_SCHEMA_V1, applyOverrides, validateTicket } from '../ticket-schema.js';
+import { DEFAULT_SCHEMA_V1, applyOverrides, validateTicket, checkDoneTransition } from '../ticket-schema.js';
 
 /**
  * Build an McpServer wired to the live projects map. Caller is responsible
@@ -59,6 +59,10 @@ export function createMcpServer({ projects, getActiveId, emitter }) {
 
   function effectiveSchema(cfg) {
     return applyOverrides(DEFAULT_SCHEMA_V1, cfg?.ticket_schema?.overrides || {});
+  }
+
+  function requiresCriteria(cfg) {
+    return cfg?.ticket_schema?.require_acceptance_criteria === true;
   }
 
   // Tool wrapper: standard error-to-content shape so the MCP client sees
@@ -218,6 +222,14 @@ export function createMcpServer({ projects, getActiveId, emitter }) {
       if (!validation.ok) {
         return toolError('patched ticket would fail schema validation', { project: id, violations: validation.violations });
       }
+      // Done-transition gate: can't mark a behavioural ticket done without
+      // acceptance criteria (criteria-before-code).
+      if (requiresCriteria(cfg) && merged.status === 'done') {
+        const gate = checkDoneTransition(merged);
+        if (!gate.ok) {
+          return toolError('cannot mark ticket done without acceptance_criteria', { project: id, violations: [gate.violation] });
+        }
+      }
       data.tickets[idx] = merged;
       data.updated_at = new Date().toISOString().slice(0, 10);
       await writeFile(backlogPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
@@ -245,6 +257,14 @@ export function createMcpServer({ projects, getActiveId, emitter }) {
       const data = JSON.parse(await readFile(backlogPath, 'utf-8'));
       const idx = (data.tickets || []).findIndex((t) => t.id === ticketId);
       if (idx < 0) return toolError(`ticket ${ticketId} not found in ${id} backlog (already archived?)`);
+      // Done-transition gate: archiving sets status=done, so the same
+      // criteria-before-code rule applies.
+      if (requiresCriteria(cfg)) {
+        const gate = checkDoneTransition(data.tickets[idx]);
+        if (!gate.ok) {
+          return toolError('cannot archive (mark done) a ticket without acceptance_criteria', { project: id, violations: [gate.violation] });
+        }
+      }
       const ticket = { ...data.tickets[idx], status: 'done', archived_at: new Date().toISOString().slice(0, 10) };
       data.tickets.splice(idx, 1);
       data.updated_at = new Date().toISOString().slice(0, 10);

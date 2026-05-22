@@ -92,11 +92,66 @@ export function applyOverrides(schema, overrides = {}) {
   return next;
 }
 
+// ─── Acceptance-criteria gate (criteria-before-code) ──────────────────
+//
+// CLAUDE.md Rule 14: every behavioural change must carry testable
+// acceptance criteria BEFORE it is worked, and must still carry them to be
+// marked done. Tickets shipped "done" with no criteria (predictor T-004,
+// T-008, T-009, T-016, T-036) is the failure this gate prevents.
+//
+// Scope: behavioural ticket types whose deliverable a user can verify.
+// Plumbing/meta types (ops, chore, docs, manual, refactor, test) are
+// exempt — they're covered transitively or have no user-facing behaviour.
+export const BEHAVIOURAL_TYPES = ['bug', 'feature', 'enhancement', 'ux', 'performance'];
+
+// Statuses where a ticket is a candidate for active work. Parked/terminal
+// statuses (blocked, monitor, v2, done, ...) are not gated for actionability.
+const WORKABLE_STATUSES = ['requested', 'in_progress'];
+
+// True when the ticket carries at least one non-empty acceptance criterion.
+export function hasAcceptanceCriteria(ticket) {
+  return Array.isArray(ticket?.acceptance_criteria)
+    && ticket.acceptance_criteria.some((c) => (typeof c === 'string' ? c.trim() !== '' : c != null));
+}
+
+// True when this ticket must carry acceptance criteria before it may be
+// picked up for work (behavioural type, non-trivial, in a workable status).
+export function needsAcceptanceCriteria(ticket) {
+  if (!ticket) return false;
+  if (ticket.complexity === 'trivial') return false; // Rule 14 complexity gate
+  if (!BEHAVIOURAL_TYPES.includes(ticket.type)) return false;
+  return WORKABLE_STATUSES.includes(ticket.status);
+}
+
+function acceptanceCriteriaViolation(ticket) {
+  return {
+    field: 'acceptance_criteria',
+    rule: 'required_before_work',
+    message: `${ticket?.id || '<no-id>'}: a ${ticket?.type}/${ticket?.complexity} ticket must have non-empty acceptance_criteria before it can be worked or marked done (criteria-before-code)`,
+  };
+}
+
+// Gate for the done/archive transition: a behavioural, non-trivial ticket
+// cannot be marked done without acceptance criteria, regardless of its
+// current status. Returns { ok } or { ok:false, violation }.
+export function checkDoneTransition(ticket) {
+  if (!ticket) return { ok: true };
+  if (ticket.complexity === 'trivial') return { ok: true };
+  if (!BEHAVIOURAL_TYPES.includes(ticket.type)) return { ok: true };
+  if (hasAcceptanceCriteria(ticket)) return { ok: true };
+  return { ok: false, violation: acceptanceCriteriaViolation(ticket) };
+}
+
 /**
  * Validate a single ticket against a schema. Returns { ok, violations } where
  * violations is an array of { field, rule, expected, got, message }.
+ *
+ * opts.requireAcceptanceCriteria — when true, behavioural non-trivial tickets
+ *   in a workable status without acceptance_criteria are flagged. Off by
+ *   default so create/update capture stays permissive; turned on by the
+ *   actionable-queue path (loadBacklog) for projects that opt in.
  */
-export function validateTicket(ticket, schema = DEFAULT_SCHEMA_V1) {
+export function validateTicket(ticket, schema = DEFAULT_SCHEMA_V1, opts = {}) {
   const violations = [];
 
   if (!ticket || typeof ticket !== 'object' || Array.isArray(ticket)) {
@@ -116,6 +171,11 @@ export function validateTicket(ticket, schema = DEFAULT_SCHEMA_V1) {
     const v = ticket[field];
     if (v === undefined || v === null) continue; // optional, not present, fine
     violations.push(...checkField(field, v, def));
+  }
+
+  // Acceptance-criteria gate (opt-in via the caller).
+  if (opts.requireAcceptanceCriteria && needsAcceptanceCriteria(ticket) && !hasAcceptanceCriteria(ticket)) {
+    violations.push(acceptanceCriteriaViolation(ticket));
   }
 
   return { ok: violations.length === 0, violations };
@@ -207,6 +267,7 @@ export async function validateAndPartition(tickets, options = {}) {
     mode = 'off',
     sidecarPathFor = null, // (ticketId) => absolute path
     acceptedVersions = [1],
+    requireAcceptanceCriteria = false,
   } = options;
 
   const accepted = [];
@@ -219,7 +280,7 @@ export async function validateAndPartition(tickets, options = {}) {
   const effectiveSchema = applyOverrides(schema, overrides);
 
   for (const t of tickets) {
-    const result = validateTicket(t, effectiveSchema);
+    const result = validateTicket(t, effectiveSchema, { requireAcceptanceCriteria });
     // Schema-version gate: even if all fields pass, an unsupported
     // version is a hard reject regardless of mode (semantics undefined
     // for mismatched versions).

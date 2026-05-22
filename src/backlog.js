@@ -25,6 +25,7 @@ export async function loadBacklog(config) {
 
   const acceptedVersions = schemaCfg.accepts_schema_versions || [1];
   const overrides = schemaCfg.overrides || {};
+  const requireAcceptanceCriteria = schemaCfg.require_acceptance_criteria === true;
   const sidecarPathFor = (id) => resolve(config._resolved.pipelineDir, `${id}.rejected.json`);
 
   const { accepted, rejected } = await validateAndPartition(tickets, {
@@ -33,6 +34,7 @@ export async function loadBacklog(config) {
     mode,
     sidecarPathFor,
     acceptedVersions,
+    requireAcceptanceCriteria,
   });
 
   if (rejected.length > 0) {
@@ -62,10 +64,14 @@ export function filterAndSort(tickets, config, ticketId = null) {
     return match ? [match] : [];
   }
 
-  const { include_status = [], exclude_status = [], priority_order, type_order } =
+  const { include_status = [], exclude_status = [], exclude_type = [], priority_order, type_order } =
     config.ticket_filter;
 
   const actionable = tickets.filter((t) => {
+    // Type-level exclusion: keeps human-only work (e.g. type=manual — Play
+    // console submission, marketing uploads) out of the agent's actionable
+    // queue so the pipeline never spends tokens attempting what it can't finish.
+    if (exclude_type.includes(t.type)) return false;
     if (exclude_status.includes(t.status)) return false;
     if (include_status.length > 0 && !include_status.includes(t.status))
       return false;
