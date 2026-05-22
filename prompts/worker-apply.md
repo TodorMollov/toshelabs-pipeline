@@ -25,9 +25,7 @@ Read `review.json`. For each finding in `findings[]`:
   - **`deferred`**: only allowed for `severity` ≤ `major`. Create a follow-up ticket entry (the orchestrator will pick it up from `disputed-findings.json`) and set `response.deferred_to_ticket` to a placeholder ID like `"FOLLOWUP_<T-XXX>"` — orchestrator assigns the real ID.
 - If `scope == "adjacent"` or `scope == "unrelated"`: do NOT apply. The orchestrator files these as follow-up tickets automatically. Set status to `"deferred"` with `response.deferred_to_ticket = "AUTO_FOLLOWUP"`.
 
-After processing every finding, re-run the test suite + analyzer. They must be clean before you proceed. If a fix you applied broke tests, fix the regression (recursive small loop, max 3 iterations; if you can't converge, halt).
-
-Run the suite **in the FOREGROUND and wait** — raise the Bash timeout if needed. NEVER background-and-poll, and NEVER poll with `pgrep -f "<pattern>"` where the pattern can match the polling command itself (`pgrep -f` matches the poller, the loop never exits, the session hangs). If a background run is unavoidable, the only sanctioned wait is `cmd & wait $!`.
+After processing every finding, re-run the test suite + analyzer via the project's test runner (`.claude/run-tests.sh`) — see CLAUDE.md "Test execution". ONE foreground, blocking call; read its exit code. Do NOT background or poll it. They must be clean before you proceed. If a fix you applied broke tests, fix the regression (recursive small loop, max 3 iterations; if you can't converge, halt).
 
 **Output**: `review.json` updated in place with every finding's `status` non-`pending`. **Also write** `{{WORKER_OUTPUT_DIR}}/disputed-findings.json` summarising only the `argued`/`deferred` findings with their responses — this is what the operator audits next morning.
 
