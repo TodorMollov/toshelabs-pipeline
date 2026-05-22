@@ -981,43 +981,24 @@ export class Pipeline {
       || ((this.config.soft_spawn_hard_cap_min || 45) * 60_000);
     let hardCapped = false;
     let hardCapTimer = null;
-    // childProc is set when we receive the process_started event from the
-    // runner. spawnClaude doesn't expose the subprocess directly, so we
-    // rely on PID detection via `ps` — see killHungChild() below.
+    // The REAL claude child PID, captured from spawnClaude's onSpawn callback
+    // (wired below). Both killers target THIS pid and its descendant tree.
+    // The old approach — `pgrep -P <node> -f 'claude -p'` — found 0 procs
+    // because the claude process is NOT a direct child of the node server,
+    // which let T-062's reviewer run ~4h past the hard cap. proc.pid is
+    // authoritative; no guessing.
     let knownChildPid = null;
 
-    const killHungChild = () => {
-      // The Claude CLI subprocess didn't exit within terminalGraceMs after
-      // emitting the terminal marker. The worker's actual work is done
-      // (checkpoints on disk, marker fired) — this is a CLI termination
-      // bug, not a worker failure. SIGTERM the subprocess so spawnClaude's
-      // promise resolves and the dispatcher proceeds to the next spawn.
-      try {
-        // Best-effort: find any claude -p subprocess of this Node process
-        // and SIGTERM it. Node's spawn doesn't give us the PID directly
-        // through the wrapped promise, so we scan children.
-        const { execSync: ex } = require('node:child_process');
-        const myPid = process.pid;
-        const children = ex(`pgrep -P ${myPid} -f 'claude -p'`, { encoding: 'utf-8' }).trim().split('\n').filter(Boolean);
-        for (const pid of children) {
-          try { process.kill(parseInt(pid, 10), 'SIGTERM'); } catch {}
-        }
-        console.log(`[soft] ${ticket.id}/${spawnName}: terminal marker '${terminalMarker}' seen but CLI didn't exit in ${terminalGraceMs}ms — SIGTERM'd ${children.length} child(ren)`);
-        this.emit('soft_terminal_marker_timeout', { ticket: ticket.id, spawn: spawnName, marker: terminalMarker, killed_pids: children });
-      } catch (err) {
-        console.warn(`[soft] ${ticket.id}/${spawnName}: terminal-marker kill failed — ${err.message}`);
+    // Kill the worker process AND its whole descendant tree (so a wedged
+    // `find /` or poll loop is not orphaned), leaves-first, with `signal`.
+    // Returns the count of processes signalled.
+    const killWorkerTree = (signal) => {
+      if (!knownChildPid) {
+        console.warn(`[soft] ${ticket.id}/${spawnName}: no child pid captured — cannot ${signal} the worker`);
+        return 0;
       }
-    };
-
-    // Hard-cap killer: SIGKILL the claude -p child AND its whole descendant
-    // tree (so we don't orphan a wedged `find /` or poll loop, as happened on
-    // T-048). Walks ps once and kills leaves-first.
-    const killSpawnTreeHard = () => {
       try {
         const { execSync: ex } = require('node:child_process');
-        const roots = ex(`pgrep -P ${process.pid} -f 'claude -p'`, { encoding: 'utf-8' })
-          .trim().split('\n').filter(Boolean).map(Number);
-        if (!roots.length) return 0;
         const childrenOf = new Map();
         for (const line of ex('ps -eo pid=,ppid=', { encoding: 'utf-8' }).trim().split('\n')) {
           const [pid, ppid] = line.trim().split(/\s+/).map(Number);
@@ -1025,16 +1006,29 @@ export class Pipeline {
           childrenOf.get(ppid).push(pid);
         }
         const ordered = [];
-        const visit = (pid) => { for (const c of (childrenOf.get(pid) || [])) visit(c); ordered.push(pid); };
-        for (const r of roots) visit(r);
-        for (const pid of ordered) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+        const seen = new Set();
+        const visit = (pid) => { if (seen.has(pid)) return; seen.add(pid); for (const c of (childrenOf.get(pid) || [])) visit(c); ordered.push(pid); };
+        visit(knownChildPid);
+        for (const pid of ordered) { try { process.kill(pid, signal); } catch {} }
         return ordered.length;
-      } catch { return 0; }
+      } catch (err) {
+        // Last resort: signal just the tracked pid directly.
+        try { process.kill(knownChildPid, signal); return 1; } catch { return 0; }
+      }
+    };
+
+    const killHungChild = () => {
+      // The CLI subprocess didn't exit within terminalGraceMs after emitting
+      // the terminal marker. Work is done (checkpoints on disk) — SIGTERM the
+      // tree so spawnClaude's promise resolves and the dispatcher proceeds.
+      const n = killWorkerTree('SIGTERM');
+      console.log(`[soft] ${ticket.id}/${spawnName}: terminal marker '${terminalMarker}' seen but CLI didn't exit in ${terminalGraceMs}ms — SIGTERM'd ${n} proc(s)`);
+      this.emit('soft_terminal_marker_timeout', { ticket: ticket.id, spawn: spawnName, marker: terminalMarker, killed: n });
     };
 
     hardCapTimer = setTimeout(() => {
       hardCapped = true;
-      const n = killSpawnTreeHard();
+      const n = killWorkerTree('SIGKILL');
       console.error(`[soft] ${ticket.id}/${spawnName}: HARD CAP ${Math.round(effectiveHardCapMs / 60_000)}min exceeded — SIGKILL'd ${n} proc(s); spawn hung mid-execution`);
       this.emit('soft_spawn_hard_capped', { ticket: ticket.id, spawn: spawnName, capMs: effectiveHardCapMs, killedCount: n });
     }, effectiveHardCapMs);
@@ -1077,6 +1071,7 @@ export class Pipeline {
           prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
           env: this.config.environment || {},
           onData: dataHandler,
+          onSpawn: (proc) => { knownChildPid = proc.pid; },
         }),
         ticket.id,
         spawnName,
