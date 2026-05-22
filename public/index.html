@@ -1412,14 +1412,48 @@ function paintChipsFromSteps(steps) {
 async function paintStepChips(ticketId) {
   if (!ticketId) { paintChipsFromSteps({}); return; }
   const want = ticketId;
-  let steps = {};
+  const proj = state.activeProjectId;
+  let cps = null, tstatus = null, spawnSteps = {};
+  // Soft-pipeline tickets persist SPAWN-level steps (worker/reviewer/apply)
+  // that don't map to the phase chips — so /api/pipeline alone paints a clicked
+  // ticket blank. Prefer the phase-level CHECKPOINTS from /full, which DO match
+  // the chips; that's what makes clicking a ticket show its real phase progress.
   try {
-    const r = await fetch(`/api/pipeline/${encodeURIComponent(ticketId)}`);
-    if (r.ok) steps = (await r.json())?.steps || {};
-  } catch { /* not-yet-run / offline → blank trail */ }
+    if (proj) {
+      const rf = await fetch(`/api/ticket/${encodeURIComponent(proj)}/${encodeURIComponent(ticketId)}/full`);
+      if (rf.ok) {
+        const full = await rf.json();
+        cps = full.checkpoints || {};
+        tstatus = full.state?.status || null;
+        spawnSteps = full.state?.steps || {};
+      }
+    }
+  } catch { /* fall through to spawn-level / blank */ }
   // Bail if the breadcrumb moved on while we were fetching (pin↔live race).
   if (state.activeTicket !== want) return;
-  paintChipsFromSteps(steps);
+
+  if (!cps || Object.keys(cps).length === 0) {
+    // Not-yet-run, /full unavailable, or classic pipeline → best-effort.
+    paintChipsFromSteps(spawnSteps);
+    return;
+  }
+
+  // Each chip = its checkpoint's presence. Conditional phases that don't apply
+  // to this ticket are shown complete so the trail reads coherently; the active
+  // chip (first applicable phase still missing a checkpoint) is only lit while
+  // the ticket is actually running.
+  const tk = allTickets.find(x => x.id === ticketId);
+  const na = new Set(['plan_critic']);                 // soft pipeline runs no plan_critic
+  if (tk?.type !== 'bug') na.add('root_cause');        // root_cause only for bugs
+  if (tk?.type !== 'feature') na.add('docs_update');   // docs_update only for features
+  const running = tstatus === 'in_progress' || tstatus === 'running';
+  const activePhase = running ? STEPS.find(s => !cps[s] && !na.has(s)) : null;
+  for (const s of STEPS) {
+    if (cps[s]) setStepStatus(s, 'done');
+    else if (s === activePhase) setStepStatus(s, 'active');
+    else if (na.has(s)) setStepStatus(s, 'done');      // not-applicable → ✓ (matches paintChipsFromSteps)
+    else setStepStatus(s, '');
+  }
 }
 
 function setStepStatus(step, status) {
