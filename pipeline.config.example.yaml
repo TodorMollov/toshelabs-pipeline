@@ -144,6 +144,13 @@ session:
   context_new_session_pct: 90
   max_turns_per_step: 30
 
+# Absolute wall-clock cap (minutes) per soft-pipeline spawn (worker/reviewer/
+# apply). The spawn is SIGKILLed — together with its whole descendant tree —
+# and FAILED if it exceeds this, regardless of phase markers. This is the
+# catch-all for a spawn that hangs MID-execution and never emits its terminal
+# marker (the terminal-grace killer only arms after the marker). Default 45.
+soft_spawn_hard_cap_min: 45
+
 # Think loop
 think_loop:
   max_rounds: 2

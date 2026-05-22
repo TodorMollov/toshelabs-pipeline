@@ -20,11 +20,11 @@ You MUST do these in sequence. Each phase ends with a marker emit and an atomic 
 
 ### Running tests — contract, applies to EVERY phase below
 
-Whenever any phase tells you to run tests, run them **only** through the project's test runner `.claude/run-tests.sh` (see CLAUDE.md "Test execution") as **ONE foreground, blocking Bash call**, and read its exit code (0 = green).
-- For fast, scoped feedback in `tests_red`/`implement`, pass the affected paths: `.claude/run-tests.sh test/widget/foo_test.dart`. With **no args** it runs the full suite + analyzer — that is the `tests_green` gate.
-- **NEVER** run `flutter test` (or the raw configured test command) directly. **NEVER** background a test run or write an `until`/`while` poll loop. If you fear the Bash timeout, raise the Bash tool's timeout instead. (A worker once improvised a `pgrep`/file poll loop whose condition never cleared and froze a run for 10.5h.)
+Whenever any phase tells you to run tests, run them through the project's test runner `.claude/run-tests.sh` as **ONE foreground, blocking Bash call**, and read its exit code (0 = green). The exact invocation is per project — see CLAUDE.md "Test execution". Common convention (predictor, pension-ai): `.claude/run-tests.sh` with **no args** = the full green gate (suite + analyzer/typecheck/lint); `.claude/run-tests.sh <path>` = a fast scoped run for `tests_red`/`implement`. Some projects (busydad) use named targets instead — follow that project's CLAUDE.md.
+- **NEVER** run the raw test command (`flutter test`, `npm test`, `vitest`, …) directly. **NEVER** background a test run, write an `until`/`while` poll loop, or "wait for a background notification" — the headless worker gets NO such notification, and a self-matching `pgrep` poll loop once froze a run for 10.5h. If you fear the Bash timeout, raise the Bash tool's timeout instead.
 - If the runner is genuinely long-running, the ONLY sanctioned background form is `.claude/run-tests.sh & wait $!` — never a `pgrep`/`/proc`/file poll.
 - Do NOT improvise environment setup (library paths, `LD_PRELOAD`, `find /` for shared objects). The runner owns the environment; if a test needs special setup, it belongs in the runner, not in your shell.
+- If a project has no `.claude/run-tests.sh`, run its configured test command ONCE in the foreground (same rules: no background, no poll) — do not improvise around its absence.
 
 ### 1. `plan`
 Read existing code as needed (worktree files, docs). Then write `{{WORKER_OUTPUT_DIR}}/plan.json` per `schemas/plan.v1.schema.json`. Required: `ticket`, `files_to_change`, `test_strategy`. Each `files_to_change` entry has `path`, `reason`, `what_to_do`. Prefix `what_to_do` with `[no-test]` for files whose change is structurally untestable (pure plumbing, doc comment, type alias).
@@ -73,7 +73,7 @@ Write `{{WORKER_OUTPUT_DIR}}/implement.json` with:
 Markers: `<<<PHASE: implement_started>>>` / `<<<PHASE: implement_done>>>`.
 
 ### 4. `tests_green`
-Run the FULL suite + analyzer: call `.claude/run-tests.sh` with **no args** (per *Running tests* above). Read its exit code (0 = green) and its `RESULT: GREEN`/`RESULT: RED` summary. Both tests and analyzer must be clean before this phase passes.
+Run the project's FULL green gate per *Running tests* above (most projects: `.claude/run-tests.sh` with no args; see CLAUDE.md "Test execution" for the exact invocation). Read its exit code (0 = green) and its `RESULT: GREEN`/`RESULT: RED` summary. Tests AND analyzer/typecheck/lint must be clean before this phase passes.
 
 If a test fails:
 - If it's a test you wrote in tests_red that now passes — that's the goal, keep going.

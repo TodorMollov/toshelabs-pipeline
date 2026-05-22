@@ -963,7 +963,7 @@ export class Pipeline {
   // finish — see T-029 incident 2026-05-20).
   //
   // Returns {error|result, wallMs, inputTokens, outputTokens, cachedTokens}.
-  async _runSoftSpawn({ spawnName, prompt, model, tools, ticket, workerOutDir, retryOnce = false, terminalMarker = null, terminalGraceMs = 60_000 }) {
+  async _runSoftSpawn({ spawnName, prompt, model, tools, ticket, workerOutDir, retryOnce = false, terminalMarker = null, terminalGraceMs = 60_000, hardCapMs = null }) {
     const startedAt = Date.now();
     let inputTokens = 0;
     let outputTokens = 0;
@@ -971,6 +971,16 @@ export class Pipeline {
     let toolCalls = 0;
     let terminalMarkerSeenAt = null;
     let killTimer = null;
+    // Absolute wall-clock cap. Unlike killTimer/killHungChild — which only arms
+    // AFTER the terminal marker (catches hang-after-finish) — this fires no
+    // matter what, so it catches a spawn that hangs MID-execution and never
+    // reaches its marker (T-048: worker blocked in a Bash poll loop for hours).
+    // It is the catch-all for improvisations we didn't anticipate. Configurable
+    // via soft_spawn_hard_cap_min (default 45 min; longest legit worker ~half).
+    const effectiveHardCapMs = hardCapMs
+      || ((this.config.soft_spawn_hard_cap_min || 45) * 60_000);
+    let hardCapped = false;
+    let hardCapTimer = null;
     // childProc is set when we receive the process_started event from the
     // runner. spawnClaude doesn't expose the subprocess directly, so we
     // rely on PID detection via `ps` — see killHungChild() below.
@@ -998,6 +1008,36 @@ export class Pipeline {
         console.warn(`[soft] ${ticket.id}/${spawnName}: terminal-marker kill failed — ${err.message}`);
       }
     };
+
+    // Hard-cap killer: SIGKILL the claude -p child AND its whole descendant
+    // tree (so we don't orphan a wedged `find /` or poll loop, as happened on
+    // T-048). Walks ps once and kills leaves-first.
+    const killSpawnTreeHard = () => {
+      try {
+        const { execSync: ex } = require('node:child_process');
+        const roots = ex(`pgrep -P ${process.pid} -f 'claude -p'`, { encoding: 'utf-8' })
+          .trim().split('\n').filter(Boolean).map(Number);
+        if (!roots.length) return 0;
+        const childrenOf = new Map();
+        for (const line of ex('ps -eo pid=,ppid=', { encoding: 'utf-8' }).trim().split('\n')) {
+          const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+          if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+          childrenOf.get(ppid).push(pid);
+        }
+        const ordered = [];
+        const visit = (pid) => { for (const c of (childrenOf.get(pid) || [])) visit(c); ordered.push(pid); };
+        for (const r of roots) visit(r);
+        for (const pid of ordered) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+        return ordered.length;
+      } catch { return 0; }
+    };
+
+    hardCapTimer = setTimeout(() => {
+      hardCapped = true;
+      const n = killSpawnTreeHard();
+      console.error(`[soft] ${ticket.id}/${spawnName}: HARD CAP ${Math.round(effectiveHardCapMs / 60_000)}min exceeded — SIGKILL'd ${n} proc(s); spawn hung mid-execution`);
+      this.emit('soft_spawn_hard_capped', { ticket: ticket.id, spawn: spawnName, capMs: effectiveHardCapMs, killedCount: n });
+    }, effectiveHardCapMs);
 
     const dataHandler = (event) => {
       // Phase markers (advisory; orchestrator verifies state separately).
@@ -1042,6 +1082,7 @@ export class Pipeline {
         spawnName,
       );
       if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      if (hardCapTimer) { clearTimeout(hardCapTimer); hardCapTimer = null; }
       const wallMs = Date.now() - startedAt;
       const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), terminalMarkerSeenAt: terminalMarkerSeenAt ? new Date(terminalMarkerSeenAt).toISOString() : null };
       this.emit('soft_spawn_done', { ticket: ticket.id, spawn: spawnName, ...metrics });
@@ -1067,6 +1108,7 @@ export class Pipeline {
       return { result, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls };
     } catch (err) {
       if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+      if (hardCapTimer) { clearTimeout(hardCapTimer); hardCapTimer = null; }
       // If the terminal marker was seen, the subprocess exit was the
       // expected outcome (we may have SIGTERM'd it ourselves). Treat as
       // success — the work is done, checkpoints are on disk.
@@ -1084,6 +1126,24 @@ export class Pipeline {
         } catch {}
         console.log(`[soft] ${ticket.id}/${spawnName}: subprocess exit after terminal marker — treating as success`);
         return { result: null, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, terminalExit: true };
+      }
+      // Hard cap fired and no terminal marker was ever seen → genuine hang.
+      // Fail loudly (do NOT retry — a hang re-hangs); the dispatcher records
+      // blocked_reason and the queue moves on instead of freezing.
+      if (hardCapped) {
+        const wallMs = Date.now() - startedAt;
+        const capMin = Math.round(effectiveHardCapMs / 60_000);
+        const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), hard_capped: true };
+        this.emit('soft_spawn_done', { ticket: ticket.id, spawn: spawnName, ...metrics });
+        try {
+          const ps = await this.loadPipelineJson(ticket.id);
+          if (ps) {
+            ps.steps = ps.steps || {};
+            ps.steps[spawnName] = { status: 'failed', completed_at: new Date().toISOString(), metrics };
+            await this.savePipelineJson(ticket.id, ps);
+          }
+        } catch {}
+        return { error: `spawn '${spawnName}' exceeded the ${capMin}min wall-clock cap and was killed — no terminal marker seen, treated as a hang`, wallMs, inputTokens, outputTokens, hardCapped: true };
       }
       if (err.rateLimited) throw err;
       if (retryOnce) {
