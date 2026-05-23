@@ -1026,12 +1026,15 @@ export class Pipeline {
       this.emit('soft_terminal_marker_timeout', { ticket: ticket.id, spawn: spawnName, marker: terminalMarker, killed: n });
     };
 
-    hardCapTimer = setTimeout(() => {
+    // Arm (and re-arm, for the retry) the absolute cap. `label` distinguishes
+    // the first attempt from the retry in logs/events.
+    const armHardCap = (label) => setTimeout(() => {
       hardCapped = true;
       const n = killWorkerTree('SIGKILL');
-      console.error(`[soft] ${ticket.id}/${spawnName}: HARD CAP ${Math.round(effectiveHardCapMs / 60_000)}min exceeded — SIGKILL'd ${n} proc(s); spawn hung mid-execution`);
-      this.emit('soft_spawn_hard_capped', { ticket: ticket.id, spawn: spawnName, capMs: effectiveHardCapMs, killedCount: n });
+      console.error(`[soft] ${ticket.id}/${label}: HARD CAP ${Math.round(effectiveHardCapMs / 60_000)}min exceeded — SIGKILL'd ${n} proc(s); spawn hung mid-execution`);
+      this.emit('soft_spawn_hard_capped', { ticket: ticket.id, spawn: label, capMs: effectiveHardCapMs, killedCount: n });
     }, effectiveHardCapMs);
+    hardCapTimer = armHardCap(spawnName);
 
     const dataHandler = (event) => {
       // Phase markers (advisory; orchestrator verifies state separately).
@@ -1143,15 +1146,20 @@ export class Pipeline {
       if (err.rateLimited) throw err;
       if (retryOnce) {
         console.warn(`[soft] ${ticket.id}/${spawnName}: first attempt failed (${err.message}) — retrying once`);
+        // Re-arm the cap (cleared on catch entry) so a hung RETRY is killed too.
+        hardCapped = false;
+        hardCapTimer = armHardCap(spawnName + '_retry');
         try {
           const result = await this.runWithRateLimitRetry(
             () => spawnClaude({
               prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
               env: this.config.environment || {},
               onData: dataHandler,
+              onSpawn: (proc) => { knownChildPid = proc.pid; },
             }),
             ticket.id, spawnName + '_retry',
           );
+          if (hardCapTimer) { clearTimeout(hardCapTimer); hardCapTimer = null; }
           const wallMs = Date.now() - startedAt;
           const metrics = { model, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls, startedAt: new Date(startedAt).toISOString(), retried: true };
           try {
@@ -1164,7 +1172,12 @@ export class Pipeline {
           } catch {}
           return { result, wallMs, inputTokens, outputTokens, cachedTokens, toolCalls };
         } catch (err2) {
-          return { error: err2.message, wallMs: Date.now() - startedAt, inputTokens, outputTokens };
+          if (hardCapTimer) { clearTimeout(hardCapTimer); hardCapTimer = null; }
+          const wallMs = Date.now() - startedAt;
+          if (hardCapped) {
+            return { error: `spawn '${spawnName}' (retry) exceeded the ${Math.round(effectiveHardCapMs / 60_000)}min wall-clock cap and was killed — treated as a hang`, wallMs, inputTokens, outputTokens, hardCapped: true };
+          }
+          return { error: err2.message, wallMs, inputTokens, outputTokens };
         }
       }
       return { error: err.message, wallMs: Date.now() - startedAt, inputTokens, outputTokens };
