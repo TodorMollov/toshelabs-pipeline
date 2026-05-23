@@ -1394,7 +1394,30 @@ function setActiveTicket(id, title) {
 
 // Paint the step-chip trail from a steps map: done/not_applicable → done,
 // the first not-yet-done step → active, the rest → pending.
+// Soft-pipeline state is keyed by SPAWN (worker/reviewer/worker-apply); the
+// breadcrumb chips are keyed by PHASE. Expand spawn steps to the phases they
+// cover so a soft ticket's trail isn't blank. Phase-keyed input passes through.
+function expandSpawnSteps(steps) {
+  if (!steps) return {};
+  const keys = Object.keys(steps);
+  if (keys.some(k => STEPS.includes(k))) return steps; // already phase-level
+  const SPAWN_PHASES = {
+    worker: ['plan', 'tests_red', 'implement', 'tests_green'],
+    reviewer: ['review'],
+    'worker-apply': ['root_cause'],
+    worker_apply: ['root_cause'],
+  };
+  const out = {}; let isSpawn = false;
+  for (const [spawn, phases] of Object.entries(SPAWN_PHASES)) {
+    const ss = steps[spawn];
+    if (!ss) continue;
+    isSpawn = true;
+    for (const ph of phases) out[ph] = { status: ss.status };
+  }
+  return isSpawn ? out : steps;
+}
 function paintChipsFromSteps(steps) {
+  steps = expandSpawnSteps(steps);
   let cur = null;
   for (const [name, ss] of Object.entries(steps || {})) {
     if (ss?.status !== 'done' && ss?.status !== 'not_applicable') { cur = name; break; }
