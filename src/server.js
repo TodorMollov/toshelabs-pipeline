@@ -1332,8 +1332,10 @@ export async function startServer(config) {
         const fallbackId = config._activeProjectId || config.name || 'default';
         projects.set(fallbackId, config);
       }
+      const requested = req.query.project; // optional filter; default = all projects
       const disputes = [];
       for (const [pid, projectCfg] of projects.entries()) {
+        if (requested && pid !== requested) continue;
         const woDir = projectCfg._resolved?.workerOutputDir;
         if (!woDir || !existS(woDir)) continue;
         for (const ticketId of rdirS(woDir)) {
@@ -1658,7 +1660,14 @@ export async function startServer(config) {
   //     the corruption is visible.
   app.get('/api/pipeline-states', async (req, res) => {
     try {
-      const dir = config._resolved.pipelineDir;
+      // Honor ?project= so the dashboard can read a NON-active project's
+      // states; default to the active project. (Previously always used the
+      // active project's dir, so every project queried returned identical data.)
+      const requested = req.query.project;
+      const dir = (requested && config._projects?.has(requested))
+        ? config._projects.get(requested)._resolved?.pipelineDir
+        : config._resolved.pipelineDir;
+      if (!dir) return res.json({});
       const out = {};
       // Active state file = same shape as ticket id (BUG-261, T-359,
       // BUG-261A, PIPE-001, T-202v1) followed by `.json`. Archive
