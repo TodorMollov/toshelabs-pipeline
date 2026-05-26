@@ -765,7 +765,7 @@ export class Pipeline {
         const plan = JSON.parse(planRaw);
         const { execSync } = await import('node:child_process');
         const verdict = JSON.parse(execSync(
-          `node ${path.resolve(this.config._resolved.pipelineDir || '.', '..', '..', 'scripts', 'plan-static-check.js')} ${JSON.stringify(planPath)} --title ${JSON.stringify(ticket.title || '')}`,
+          `node ${path.resolve(this.config._resolved.pipelineHome || '.', 'scripts', 'plan-static-check.js')} ${JSON.stringify(planPath)} --title ${JSON.stringify(ticket.title || '')}`,
           { encoding: 'utf-8' },
         ));
         plan.static_check_verdict = { ...verdict, checked_at: new Date().toISOString() };

@@ -218,19 +218,43 @@ function checkImplementPhase(payload, worktree) {
 }
 
 function checkTestsGreenPhase(payload, _worktree) {
-  // Trust the metrics block — it's the artifact of having actually run the
-  // suite. all_pass must be true and unit_tests.failed must be 0.
-  if (payload.all_pass !== true) {
-    return { status: 'divergence', reason: `tests_green checkpoint has all_pass=${payload.all_pass}; phase did not converge` };
-  }
-  const unit = payload.unit_tests || {};
-  if (typeof unit.failed === 'number' && unit.failed > 0) {
-    return { status: 'divergence', reason: `tests_green reports ${unit.failed} failing unit tests` };
-  }
+  // Analyzer/tsc errors are deterministic and branch-independent for the
+  // worker's own code — these stay hard gates regardless of suite state.
   if (typeof payload.analyzer_errors === 'number' && payload.analyzer_errors > 0) {
     return { status: 'divergence', reason: `tests_green reports ${payload.analyzer_errors} analyzer errors` };
   }
-  return { status: 'match' };
+  if (typeof payload.tsc_errors === 'number' && payload.tsc_errors > 0) {
+    return { status: 'divergence', reason: `tests_green reports ${payload.tsc_errors} tsc errors` };
+  }
+
+  // Convergence means "this ticket introduced no failing tests", NOT "the full
+  // suite is green". A worktree branch legitimately carries pre-existing reds
+  // unrelated to the ticket (e.g. BUG-1007 backend baseline, branch-only
+  // privacy-content reds). Gating on full-suite all_pass false-fails honest
+  // workers that touched none of those files (see BUG-1011 / BUG-1013).
+  if (payload.all_pass === true) {
+    // Sanity: a true all_pass must not contradict a flat failing count.
+    const unit = payload.unit_tests || {};
+    if (typeof unit.failed === 'number' && unit.failed > 0) {
+      return { status: 'divergence', reason: `tests_green claims all_pass but unit_tests.failed=${unit.failed}` };
+    }
+    return { status: 'match' };
+  }
+
+  // all_pass=false is acceptable ONLY when the worker explicitly accounts for
+  // every red as pre-existing baseline (zero regressions introduced) AND
+  // documents which tests are pre-existing. Both field spellings are accepted
+  // (regression_introduced / introduced_failures); the documented list is
+  // required as evidence so a bare all_pass=false cannot slip through.
+  const noRegression = payload.regression_introduced === false || payload.introduced_failures === 0;
+  const baselineDocumented = Array.isArray(payload.preexisting_failures) && payload.preexisting_failures.length > 0;
+  if (noRegression && baselineDocumented) {
+    return { status: 'match' };
+  }
+  return {
+    status: 'divergence',
+    reason: `tests_green has all_pass=${payload.all_pass} without zero-regression + documented-baseline accounting; phase did not converge`,
+  };
 }
 
 function checkDocsUpdatePhase(payload, worktree) {
