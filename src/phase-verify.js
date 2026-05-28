@@ -205,6 +205,17 @@ function checkImplementPhase(payload, worktree) {
   // check. The git-diff verification belongs in tests_green's full-suite run.
   const declared = Array.isArray(payload.files_changed) ? payload.files_changed : [];
   if (declared.length === 0) {
+    // Escape hatch: a legitimate no-source-change ticket (e.g. BUG-1017, where
+    // the fix was already shipped by a prior ticket and the only deliverable
+    // was a test added during tests_red). The worker must justify the no-op
+    // by populating files_skipped with reasoned entries — otherwise an empty
+    // files_changed is still a contract violation.
+    const skipped = Array.isArray(payload.files_skipped) ? payload.files_skipped : [];
+    const allSkippedReasoned = skipped.length > 0 && skipped.every((f) => {
+      const reason = typeof f === 'object' && f ? f.reason : null;
+      return typeof reason === 'string' && reason.length >= 20;
+    });
+    if (allSkippedReasoned) return { status: 'match' };
     return { status: 'divergence', reason: 'implement checkpoint declares zero files_changed' };
   }
   for (const f of declared) {
@@ -233,9 +244,17 @@ function checkTestsGreenPhase(payload, _worktree) {
   // privacy-content reds). Gating on full-suite all_pass false-fails honest
   // workers that touched none of those files (see BUG-1011 / BUG-1013).
   if (payload.all_pass === true) {
-    // Sanity: a true all_pass must not contradict a flat failing count.
+    // Sanity: a true all_pass must not contradict a flat failing count UNLESS
+    // every red is itemised as pre-existing baseline (same evidence shape the
+    // all_pass=false branch accepts below). BUG-1011 hit this: the worker
+    // truthfully reported `unit_tests.failed=1` (the pre-existing BUG-1007
+    // m007 red) alongside `all_pass:true` ("green relative to my changes")
+    // and was rejected as self-contradicting — wasting a full ticket run.
     const unit = payload.unit_tests || {};
     if (typeof unit.failed === 'number' && unit.failed > 0) {
+      const noRegression = payload.regression_introduced === false || payload.introduced_failures === 0;
+      const baselineDocumented = Array.isArray(payload.preexisting_failures) && payload.preexisting_failures.length > 0;
+      if (noRegression && baselineDocumented) return { status: 'match' };
       return { status: 'divergence', reason: `tests_green claims all_pass but unit_tests.failed=${unit.failed}` };
     }
     return { status: 'match' };

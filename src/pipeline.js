@@ -443,19 +443,83 @@ export class Pipeline {
           const landed = result.ok || result.code === 'EMPTY';
           if (landed) {
             const masterSha = result.headSha || sha;
-            this.emit('worktree_merged', { ticket: ticket.id, sha: masterSha, source: sha, empty: !result.ok });
-            console.log(`[worktree] ${ticket.id}: ${result.ok
-              ? `cherry-picked ${sha.slice(0, 7)} onto ${worktreeCtx.defaultBranch} (${masterSha.slice(0, 7)})`
-              : `already present on ${worktreeCtx.defaultBranch} (empty cherry-pick) — treating as landed`}`);
-            // Persist merge status so the dashboard / next run can see it.
-            finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: masterSha, empty: !result.ok };
-            try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
-            // Landed → safe to archive. Backlog files are gitignored so
-            // this is a file-only operation that doesn't touch git history.
-            // landedCommit threads the real master sha into the archive and
-            // closed-bugs ledger so the audit can verify done == shipped.
-            await archiveTicket(ticket.id, this.config, { landedCommit: masterSha });
-          } else {
+            // BUG-1022 hardening: belt-and-braces ancestry assertion. When the
+            // cherry-pick reports ok, masterSha was just made the default
+            // branch's HEAD — but a concurrent operator/process could have
+            // moved the branch between then and here. EMPTY (content already
+            // on master) has no new sha to assert and we trust git's
+            // equivalence detection. If the assertion fails, drop into the
+            // merge-pending path instead of archiving a not-actually-landed
+            // ticket as done.
+            let ancestryOk = true;
+            if (result.ok) {
+              try {
+                execSync(`git -C "${this.config.project_dir}" merge-base --is-ancestor ${masterSha} ${worktreeCtx.defaultBranch}`,
+                  { encoding: 'utf-8', timeout: 10000, stdio: 'pipe' });
+              } catch {
+                ancestryOk = false;
+                console.error(`[worktree] ${ticket.id}: ANCESTRY ASSERTION FAILED — cherry-pick reported ok (${masterSha.slice(0, 7)}) but sha is not reachable from ${worktreeCtx.defaultBranch}. Treating as merge-pending.`);
+              }
+            }
+            if (ancestryOk) {
+              this.emit('worktree_merged', { ticket: ticket.id, sha: masterSha, source: sha, empty: !result.ok });
+              console.log(`[worktree] ${ticket.id}: ${result.ok
+                ? `cherry-picked ${sha.slice(0, 7)} onto ${worktreeCtx.defaultBranch} (${masterSha.slice(0, 7)})`
+                : `already present on ${worktreeCtx.defaultBranch} (empty cherry-pick) — treating as landed`}`);
+              // Persist merge status so the dashboard / next run can see it.
+              finalState.merge = { status: 'merged', at: new Date().toISOString(), source_sha: sha, master_sha: masterSha, empty: !result.ok };
+              try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
+              // Post-merge green-gate (T-376 class). The operational invariant
+              // from docs/pipeline-process.md: "done" requires the green gate
+              // has run against master HEAD with the fix included. A clean
+              // cherry-pick can still introduce reds when master moved between
+              // when the worker ran tests and when we cherry-picked (T-376:
+              // cherry-pick clean, 5 reds appeared in deploy-gate + smoke
+              // suites). EMPTY cherry-picks have no new commit on master so
+              // there's nothing to gate.
+              const gateEnabled = this.config.merge_gate?.enabled !== false;
+              let gateResult = { ok: true, skipped: true };
+              if (gateEnabled && result.ok) {
+                const wOutDir = resolve(this.config._resolved.workerOutputDir, ticket.id);
+                gateResult = await this._runPostMergeGreenGate(ticket, wOutDir, finalState);
+              }
+              if (gateResult.ok) {
+                if (!gateResult.skipped) {
+                  console.log(`[post-merge-gate] ${ticket.id}: PASS — ${gateResult.passed || 0} passed${gateResult.baselined?.length ? `, ${gateResult.baselined.length} pre-existing reds documented` : ''}`);
+                }
+                // Landed AND green-gated → safe to archive. Backlog files are
+                // gitignored so this is a file-only operation that doesn't
+                // touch git history. landedCommit threads the real master sha
+                // into the archive and closed-bugs ledger so the audit can
+                // verify done == shipped.
+                await archiveTicket(ticket.id, this.config, { landedCommit: masterSha });
+              } else {
+                // Gate failed — revert the cherry-pick and drop into
+                // merge-pending. We know HEAD is the cherry-pick commit (we
+                // just made it; DIRTY was gated upfront in cherryPickToMaster)
+                // so reset --hard HEAD~1 is precise.
+                console.error(`[post-merge-gate] ${ticket.id}: FAIL — ${gateResult.reason}. Reverting cherry-pick ${masterSha.slice(0, 7)}.`);
+                try {
+                  execSync(`git -C "${this.config.project_dir}" reset --hard HEAD~1`,
+                    { encoding: 'utf-8', timeout: 15000, stdio: 'pipe' });
+                  this.emit('post_merge_gate_revert', { ticket: ticket.id, reverted_sha: masterSha, code: gateResult.code, reason: gateResult.reason });
+                } catch (revertErr) {
+                  console.error(`[post-merge-gate] ${ticket.id}: REVERT FAILED — ${revertErr.message?.slice(0, 200)}. Master may be in an inconsistent state; operator intervention required.`);
+                  this.emit('post_merge_revert_failed', { ticket: ticket.id, master_sha: masterSha, error: revertErr.message?.slice(0, 200) });
+                }
+                result.ok = false;
+                result.code = gateResult.code;
+                result.files = gateResult.new_reds || [];
+              }
+            } else {
+              // Synthesise the merge-pending path so the not-actually-landed
+              // ticket is re-queued instead of mis-shipped. result.code carries
+              // the synthetic ANCESTRY_LOST so operators can grep for it.
+              result.ok = false;
+              result.code = 'ANCESTRY_LOST';
+            }
+          }
+          if (!landed || (result.code && ['ANCESTRY_LOST', 'POST_MERGE_TESTS_RED', 'POST_MERGE_ANALYZER_RED', 'GATE_INFRA_FAIL'].includes(result.code))) {
             // NOT landed. Do NOT archive — the ticket stays in the backlog
             // so it re-queues on the next run (loadOrCreatePipelineJson
             // resets the stale done-state) until it lands or the operator
@@ -484,6 +548,14 @@ export class Pipeline {
             console.error(`[worktree] ${ticket.id}: merge needs operator (code=${result.code}); NOT archived — will re-queue; commit ${sha.slice(0, 7)} anchored at tag ${tag}`);
             const attempts = (finalState.merge?.non_landing_attempts || 0) + 1;
             finalState.merge = { status: 'pending', at: new Date().toISOString(), source_sha: sha, code: result.code, files: result.files, tag, non_landing_attempts: attempts };
+            // BUG-1022: the top-level pipelineState.status was prematurely set
+            // to 'done' before the cherry-pick attempt (see pipeline.js:888).
+            // Walk it back so the on-disk state JSON / dashboard reflects
+            // reality — done means shipped to master, and this ticket isn't.
+            finalState.status = 'merge_pending';
+            finalState.completed_at = null;
+            finalState.blocked_step = 'merge';
+            finalState.blocked_reason = `cherry-pick to ${worktreeCtx.defaultBranch} failed: code=${result.code}; tag ${tag} anchored for manual recovery`;
             try { await this.savePipelineJson(ticket.id, finalState); } catch { /* best-effort */ }
             await this.parkIfNonLandingExhausted(ticket, attempts, `cherry-pick keeps failing (code=${result.code}) after %N% attempts; tag ${tag}`);
             // Halt the batch (see comment near the for-loop). Capture context
@@ -2277,6 +2349,67 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
   // park it (status → an excluded one, default 'manual' = needs operator)
   // with a reason naming the conflict, so token cost is bounded and the
   // operator sees it instead of an invisible infinite loop.
+  // Post-cherry-pick green-gate (T-376 class). After a successful cherry-pick
+  // to master, re-run the project's test suite ON master HEAD and reject the
+  // landing if any reds appeared that weren't in the worker's documented
+  // `preexisting_failures` baseline. This catches the case where master moved
+  // between when the worker tested in the worktree and when we cherry-picked,
+  // introducing reds that the worker couldn't have known about.
+  //
+  // Baseline source: the worker's tests_green.json. Its preexisting_failures
+  // and analyzer_errors define what was already red BEFORE this ticket's
+  // changes. Anything beyond that on master post-cherry-pick is a regression
+  // this ticket introduced.
+  //
+  // Return: { ok: boolean, code?: 'POST_MERGE_TESTS_RED'|'POST_MERGE_ANALYZER_RED'|'GATE_INFRA_FAIL', reason?, passed?, baselined?, new_reds? }
+  async _runPostMergeGreenGate(ticket, workerOutDir, pipelineState) {
+    let preexistingFailures = [];
+    let baselineAnalyzerErrors = 0;
+    const tgPath = resolve(workerOutDir, 'tests_green.json');
+    if (existsSync(tgPath)) {
+      try {
+        const tg = JSON.parse(readFileSync(tgPath, 'utf-8'));
+        if (Array.isArray(tg.preexisting_failures)) preexistingFailures = tg.preexisting_failures.map(String);
+        if (typeof tg.analyzer_errors === 'number') baselineAnalyzerErrors = tg.analyzer_errors;
+      } catch (err) {
+        console.warn(`[post-merge-gate] ${ticket.id}: could not read tests_green.json baseline — ${err.message}`);
+      }
+    }
+    console.log(`[post-merge-gate] ${ticket.id}: running test suite on ${this.cwd} (master HEAD; baseline: ${preexistingFailures.length} preexisting reds, ${baselineAnalyzerErrors} analyzer errors)`);
+    let res;
+    try {
+      res = await this.runTestSuite(pipelineState, { runAllExtras: false });
+    } catch (err) {
+      return { ok: false, code: 'GATE_INFRA_FAIL', reason: `runTestSuite threw: ${err.message?.slice(0, 200)}` };
+    }
+    if (res.unitCrashed) {
+      return { ok: false, code: 'GATE_INFRA_FAIL', reason: `unit test runner crashed on master HEAD (exit ${res.unitExitCode})` };
+    }
+    const newAnalyzerErrors = Math.max(0, (res.analyzerErrors || 0) - baselineAnalyzerErrors);
+    if (newAnalyzerErrors > 0) {
+      return {
+        ok: false,
+        code: 'POST_MERGE_ANALYZER_RED',
+        reason: `${newAnalyzerErrors} new analyzer errors on master HEAD after cherry-pick (baseline ${baselineAnalyzerErrors}, observed ${res.analyzerErrors})`,
+      };
+    }
+    if ((res.failed || 0) === 0) {
+      return { ok: true, passed: res.passed || 0 };
+    }
+    const failedTests = Array.isArray(res.failedTests) ? res.failedTests.map(String) : [];
+    const isPreexisting = (t) => preexistingFailures.some((p) => t.includes(p) || p.includes(t));
+    const newReds = failedTests.filter((t) => !isPreexisting(t));
+    if (newReds.length === 0) {
+      return { ok: true, passed: res.passed || 0, baselined: failedTests };
+    }
+    return {
+      ok: false,
+      code: 'POST_MERGE_TESTS_RED',
+      reason: `${newReds.length} new failing tests on master HEAD after cherry-pick: ${newReds.slice(0, 5).join(', ')}${newReds.length > 5 ? `, +${newReds.length - 5} more` : ''}`,
+      new_reds: newReds,
+    };
+  }
+
   async parkIfNonLandingExhausted(ticket, attempts, reasonTemplate) {
     const max = this.config.merge?.max_non_landing_attempts ?? 3;
     if (attempts < max) return false;
