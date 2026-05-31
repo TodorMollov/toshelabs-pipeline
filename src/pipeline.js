@@ -99,6 +99,13 @@ export class Pipeline {
     // `/api/stop?hard=true` uses this to SIGTERM the step immediately
     // instead of waiting for Claude to finish naturally.
     this.activeSubprocess = null;
+    // Real PID of the in-flight `claude -p` child, captured via spawnClaude's
+    // onSpawn (soft AND classic paths). stopActiveSubprocess() and the hard cap
+    // target THIS pid + its descendant tree — proc.kill() on the ChildProcess
+    // handle misses the reparented claude tree, which was the /api/stop
+    // "subprocessKilled:false" bug (the soft worker kept streaming). Cleared on
+    // the child's 'close'. Null when idle.
+    this._activeChildPid = null;
     // Sticky stop signal (PIPE-014). Set by requestStop() when the
     // operator clicks Stop. Checked at three supervisor checkpoints:
     // top of ticket loop, top of step loop, top of heal-attempt loop.
@@ -174,15 +181,53 @@ export class Pipeline {
    * the pipeline winds down through its normal error path. Harmless
    * no-op when no subprocess is active.
    */
+  /**
+   * SIGTERM/SIGKILL a process AND its whole descendant tree, leaves-first (so
+   * a wedged `find /` or poll-loop grandchild is never orphaned). Walks a
+   * `ps`-built pid->children map rather than the ChildProcess handle, because
+   * the real `claude` worker is reparented through a wrapper and proc.kill()
+   * on the handle misses it. Returns the count of processes signalled.
+   */
+  _killProcessTree(rootPid, signal) {
+    if (!rootPid) return 0;
+    try {
+      const { execSync: ex } = require('node:child_process');
+      const childrenOf = new Map();
+      for (const line of ex('ps -eo pid=,ppid=', { encoding: 'utf-8' }).trim().split('\n')) {
+        const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+        if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
+        childrenOf.get(ppid).push(pid);
+      }
+      const ordered = [];
+      const seen = new Set();
+      const visit = (pid) => { if (seen.has(pid)) return; seen.add(pid); for (const c of (childrenOf.get(pid) || [])) visit(c); ordered.push(pid); };
+      visit(rootPid);
+      for (const pid of ordered) { try { process.kill(pid, signal); } catch { /* already gone */ } }
+      return ordered.length;
+    } catch {
+      try { process.kill(rootPid, signal); return 1; } catch { return 0; }
+    }
+  }
+
   stopActiveSubprocess() {
+    // Prefer the captured child PID (set in onSpawn on BOTH paths): kill it +
+    // its descendant tree. proc.kill() on the handle misses the reparented
+    // `claude` tree — this was the /api/stop "subprocessKilled:false" bug where
+    // the soft worker kept streaming after a stop.
+    const pid = this._activeChildPid;
+    if (pid) {
+      const n = this._killProcessTree(pid, 'SIGTERM');
+      // Escalate to SIGKILL on whatever's still alive after 5s.
+      setTimeout(() => { this._killProcessTree(pid, 'SIGKILL'); }, 5000).unref();
+      this.emit('stop_subprocess_killed', { pid, signalled: n });
+      return n > 0;
+    }
+    // Fallback: classic-path ChildProcess handle when no pid was captured.
     const proc = this.activeSubprocess;
     if (!proc || proc.killed) return false;
     try {
       proc.kill('SIGTERM');
-      // Hard safety: if SIGTERM doesn't land within 5s, escalate.
-      setTimeout(() => {
-        try { if (!proc.killed) proc.kill('SIGKILL'); } catch { /* noop */ }
-      }, 5000).unref();
+      setTimeout(() => { try { if (!proc.killed) proc.kill('SIGKILL'); } catch { /* noop */ } }, 5000).unref();
       return true;
     } catch {
       return false;
@@ -1081,24 +1126,7 @@ export class Pipeline {
         console.warn(`[soft] ${ticket.id}/${spawnName}: no child pid captured — cannot ${signal} the worker`);
         return 0;
       }
-      try {
-        const { execSync: ex } = require('node:child_process');
-        const childrenOf = new Map();
-        for (const line of ex('ps -eo pid=,ppid=', { encoding: 'utf-8' }).trim().split('\n')) {
-          const [pid, ppid] = line.trim().split(/\s+/).map(Number);
-          if (!childrenOf.has(ppid)) childrenOf.set(ppid, []);
-          childrenOf.get(ppid).push(pid);
-        }
-        const ordered = [];
-        const seen = new Set();
-        const visit = (pid) => { if (seen.has(pid)) return; seen.add(pid); for (const c of (childrenOf.get(pid) || [])) visit(c); ordered.push(pid); };
-        visit(knownChildPid);
-        for (const pid of ordered) { try { process.kill(pid, signal); } catch {} }
-        return ordered.length;
-      } catch (err) {
-        // Last resort: signal just the tracked pid directly.
-        try { process.kill(knownChildPid, signal); return 1; } catch { return 0; }
-      }
+      return this._killProcessTree(knownChildPid, signal);
     };
 
     const killHungChild = () => {
@@ -1158,7 +1186,11 @@ export class Pipeline {
           prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
           env: this.config.environment || {},
           onData: dataHandler,
-          onSpawn: (proc) => { knownChildPid = proc.pid; },
+          onSpawn: (proc) => {
+            knownChildPid = proc.pid;
+            this._activeChildPid = proc.pid;
+            proc.on('close', () => { if (this._activeChildPid === proc.pid) this._activeChildPid = null; });
+          },
         }),
         ticket.id,
         spawnName,
@@ -1239,7 +1271,11 @@ export class Pipeline {
               prompt, model, tools, maxTurns: 200, workingDir: this.cwd, sessionId: null,
               env: this.config.environment || {},
               onData: dataHandler,
-              onSpawn: (proc) => { knownChildPid = proc.pid; },
+              onSpawn: (proc) => {
+            knownChildPid = proc.pid;
+            this._activeChildPid = proc.pid;
+            proc.on('close', () => { if (this._activeChildPid === proc.pid) this._activeChildPid = null; });
+          },
             }),
             ticket.id, spawnName + '_retry',
           );
@@ -3192,8 +3228,10 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
           maxSeconds: effectiveMaxSeconds,
           onSpawn: (proc) => {
             this.activeSubprocess = proc;
+            this._activeChildPid = proc.pid;
             proc.on('close', () => {
               if (this.activeSubprocess === proc) this.activeSubprocess = null;
+              if (this._activeChildPid === proc.pid) this._activeChildPid = null;
             });
           },
           effort: stepConfig.effort || null,
