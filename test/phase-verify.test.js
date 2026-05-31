@@ -83,6 +83,58 @@ describe('checkTestsGreenPhase — documented-baseline escape hatch', () => {
       assert.equal(r.status, 'match');
     } finally { cleanup(); }
   });
+
+  // PIPE-029: the documented baseline must COVER the failing count — a single
+  // documented red must not excuse N actual reds.
+  test('all_pass:true + failed:3 REJECTS when only 1 red is documented (under-covered baseline)', () => {
+    const { ticketDir, worktree, cleanup } = tmp();
+    try {
+      writePhase(ticketDir, 'tests_green', {
+        all_pass: true,
+        unit_tests: { passed: 100, failed: 3, skipped: 0 },
+        analyzer_errors: 0,
+        regression_introduced: false,
+        preexisting_failures: ['only-one-documented'],
+      });
+      const r = verifyCheckpoint({ ticketDir, phase: 'tests_green', worktree, ticket: { type: 'bug' } });
+      assert.equal(r.status, 'divergence', `expected divergence, got ${r.status}`);
+      assert.match(r.reason, /only 1 red\(s\) itemised/);
+    } finally { cleanup(); }
+  });
+
+  test('all_pass:true + failed:3 ACCEPTS when all 3 reds are itemised as pre-existing (T-179 shape, fixed)', () => {
+    const { ticketDir, worktree, cleanup } = tmp();
+    try {
+      writePhase(ticketDir, 'tests_green', {
+        all_pass: true,
+        unit_tests: { passed: 508, failed: 3, skipped: 11 },
+        analyzer_errors: 0,
+        regression_introduced: false,
+        preexisting_failures: [
+          'createLeague:app-check-deferral',
+          'joinLeagueByCode:app-check-deferral',
+          'deleteAccount:app-check-deferral',
+        ],
+      });
+      const r = verifyCheckpoint({ ticketDir, phase: 'tests_green', worktree, ticket: { type: 'feature' } });
+      assert.equal(r.status, 'match', `expected match, got ${r.status}: ${r.reason}`);
+    } finally { cleanup(); }
+  });
+
+  test('preexisting_failures nested under full_suite is accepted defensively', () => {
+    const { ticketDir, worktree, cleanup } = tmp();
+    try {
+      writePhase(ticketDir, 'tests_green', {
+        all_pass: true,
+        unit_tests: { passed: 10, failed: 2, skipped: 0 },
+        analyzer_errors: 0,
+        regression_introduced: false,
+        full_suite: { preexisting_failures: ['red-a', 'red-b'] },
+      });
+      const r = verifyCheckpoint({ ticketDir, phase: 'tests_green', worktree, ticket: { type: 'bug' } });
+      assert.equal(r.status, 'match', `expected match, got ${r.status}: ${r.reason}`);
+    } finally { cleanup(); }
+  });
 });
 
 describe('checkImplementPhase — no-source-change escape hatch', () => {

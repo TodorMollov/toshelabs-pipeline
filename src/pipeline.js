@@ -868,6 +868,18 @@ export class Pipeline {
       pipelineState.blocked_reason = `worker did not complete all phases (stuck at ${workerCheck.resumeFrom || 'divergence'})`;
       await this.savePipelineJson(ticket.id, pipelineState);
       this.emit('soft_worker_incomplete', { ticket: ticket.id, ...workerCheck });
+      // Bound the retry: a worker that keeps returning incomplete (a divergence
+      // it can't resolve, or requiresOperator) must NOT be re-run from scratch
+      // forever — each cycle burns a full worker spawn (minutes + Mtok of cached
+      // reads) and blocks every dependent behind it (PIPE-020). After the cap,
+      // park for an operator with a reason naming the unresolved divergence,
+      // mirroring parkIfNonLandingExhausted on the cherry-pick path.
+      try {
+        const attempts = await this._countSoftWorkerAttempts(ticket.id);
+        await this.parkIfWorkerIncompleteExhausted(ticket, attempts, workerCheck);
+      } catch (err) {
+        console.warn(`[worker-bound] ${ticket.id}: incomplete-park check failed — ${err.message}`);
+      }
       return;
     }
     console.log(`[soft] ${ticket.id}: worker phases verified (${workerCheck.completed.length} done)`);
@@ -2424,6 +2436,49 @@ After fixing, DO NOT run the tests — the pipeline will re-run them automatical
       return true;
     } catch (err) {
       console.warn(`[merge-bound] ${ticket.id}: park failed — ${err.message}`);
+      return false;
+    }
+  }
+
+  // Count how many times this ticket's soft worker has run: the live
+  // worker-output dir (this attempt) plus any `<id>.stale-*` siblings archived
+  // by prior restarts (processTicketSoft moves stale output aside on each fresh
+  // start). Filesystem-derived so it survives the pipelineState rebuild that
+  // loadOrCreatePipelineJson does between runs.
+  async _countSoftWorkerAttempts(ticketId) {
+    try {
+      const entries = await readdir(this.config._resolved.workerOutputDir);
+      const prior = entries.filter((e) => e.startsWith(`${ticketId}.stale-`)).length;
+      return prior + 1; // + the current (live) attempt
+    } catch {
+      return 1;
+    }
+  }
+
+  // PIPE-020 bound for the worker-incomplete / requiresOperator path — the
+  // counterpart to parkIfNonLandingExhausted for the cherry-pick path. After
+  // max_worker_incomplete_attempts runs that all came back incomplete, park the
+  // ticket for an operator with a reason naming the unresolved divergence, so a
+  // worker that cannot converge (e.g. an undocumented tests_green baseline, or a
+  // genuinely red feature) stops re-running at full cost and stops blocking its
+  // dependents.
+  async parkIfWorkerIncompleteExhausted(ticket, attempts, workerCheck) {
+    const max = this.config.soft?.max_worker_incomplete_attempts ?? 2;
+    if (attempts < max) return false;
+    const parkStatus = this.config.merge?.park_status || 'manual';
+    const what = (workerCheck.divergences && workerCheck.divergences.length)
+      ? workerCheck.divergences.map((d) => `${d.phase}: ${d.reason}`).join('; ')
+      : `stuck at ${workerCheck.resumeFrom || 'divergence'}`;
+    const reason = `[PIPE-020] worker came back incomplete ${attempts}x — ${what}`;
+    try {
+      await setBacklogTicketStatus(ticket.id, this.config, parkStatus, reason);
+      this.emit('worker_incomplete_parked', {
+        ticket: ticket.id, attempts, max, parked_status: parkStatus, reason,
+      });
+      console.error(`[worker-bound] ${ticket.id}: parked status=${parkStatus} after ${attempts} incomplete attempts — ${reason}`);
+      return true;
+    } catch (err) {
+      console.warn(`[worker-bound] ${ticket.id}: park failed — ${err.message}`);
       return false;
     }
   }
