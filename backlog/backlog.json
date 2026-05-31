@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
-  "updated_at": "2026-05-19",
-  "_last_session_note": "2026-05-18 — predictor session: recovered+archived T-018 (commit c8788f1), filed predictor T-044 (Compare leak/tests correction). Pipeline self: extended PIPE-021 with the T-018 else-branch false-done vector (minimal positive-landed guard applied to src/pipeline.js this session), filed PIPE-025 (review false-pass).",
+  "updated_at": "2026-05-31",
+  "_last_session_note": "2026-05-31 — filed PIPE-058 (P1): concurrent backlog/archive writes corrupt backlog.json (stateless per-request MCP + non-atomic writeFile + no lock; same race in pipeline backlog.js). Confirmed by code review + real corrupted predictor archive. Fix = atomic tmp+rename AND a per-file write mutex across all backlog writers.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -824,6 +824,866 @@
       "completed": "2026-05-19",
       "completed_at": "2026-05-19T18:11:41.922Z",
       "resolution_note": "Fixed 2026-05-19 (code + tests, 146/146 green). Deterministic core ACs implemented; any prompt-text sub-items are project-side."
+    },
+    {
+      "id": "PIPE-027",
+      "schema_version": 1,
+      "title": "Soft-mode ticket archived as \"done\" without landing when checkpoints are disabled",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "medium",
+      "area": "src/pipeline.js (processTicketSoft, run archive-gate else-branch)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "processTicketSoft sets pipelineState.status=\"done\" (~:960) but only commits / produces checkpoint.ticket_sha inside `if (config.checkpoints?.enabled)` (~:974). With checkpoints OFF the soft path returns done with no ticket_sha. In run(), worktree mode active + no ticket_sha falls into the non-worktree archive-gate else-branch (~:573), which computes changedFiles from steps.implement.files_changed — a classic-step key soft mode never writes. changedFiles===0 → landed=true → archiveTicket. The worktree diff is then discarded at the next baseline reset.",
+      "user_impact": "Defeats the done-implies-shipped invariant (PIPE-021 class) for the soft + checkpoints-off combination: real work is recorded shipped while its diff is silently dropped.",
+      "acceptance_criteria": [
+        "In the run() archive-gate, changedFiles is derived mode-agnostically (soft step keys / worktree git diff), not solely from steps.implement.files_changed",
+        "A soft-mode ticket that produced a worktree diff with checkpoints disabled is NOT archived as done (treated as not-landed / blocked)",
+        "Worktree + checkpoints-on production path behaviour is unchanged",
+        "Regression test: soft mode, checkpoints off, ticket with a diff -> not archived done"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Reworking the worktree/checkpoint model itself"
+      ]
+    },
+    {
+      "id": "PIPE-028",
+      "schema_version": 1,
+      "title": "Classic review→implement feedback loop loses feedback and resets its cycle counter (unbounded re-runs)",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "medium",
+      "area": "src/pipeline.js (review cycle ~:2005-2034, loadOrCreatePipelineJson ~:2470-2515)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "On review findings the code writes steps.implement.review_feedback, bumps pipelineState._reviewCycles, then `return await this.processTicket(ticket)`. The recursive call hits loadOrCreatePipelineJson, which on an existing in-progress run rebuilds a fresh state (steps:{} all pending), preserving only merge.non_landing_attempts. This discards both review_feedback AND _reviewCycles, so implement re-runs with no feedback and `reviewCycle = _reviewCycles||0` reads 0 every time — the maxReviewCycles cap never trips.",
+      "user_impact": "Classic-mode tickets (pipeline_mode:\"classic\") whose review keeps finding issues loop indefinitely, burning tokens with zero convergence and no feedback ever reaching implement. The 3-cycle cap is dead.",
+      "acceptance_criteria": [
+        "The review→implement cycle preserves _reviewCycles across re-entry (cap actually enforced)",
+        "review_feedback survives into the re-run of implement",
+        "Re-entry does not full-reset plan/tests_red unnecessarily",
+        "Regression test: classic mode, review returns findings N>maxReviewCycles times -> loop terminates at the cap"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Soft-mode review path (uses _runSoftSpawn, separate)"
+      ]
+    },
+    {
+      "id": "PIPE-029",
+      "schema_version": 1,
+      "title": "tests_green gate waves through unaccounted reds — preexisting_failures length never checked against unit.failed",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/phase-verify.js (checkTestsGreenPhase ~:253-272)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "When unit.failed>0 the gate passes if noRegression && baselineDocumented. baselineDocumented only requires preexisting_failures to be a non-empty array; it never checks the array covers unit.failed. A worker can report failed=12, list ONE preexisting failure, self-assert regression_introduced=false, and pass — 11 unaccounted reds (possible real regressions) are waved through. noRegression is worker-asserted, not derived.",
+      "user_impact": "A ticket that introduces real test regressions can pass tests_green by listing a single unrelated red. Exactly the false-done class the gate exists to prevent.",
+      "acceptance_criteria": [
+        "Gate requires every red itemised: preexisting_failures.length >= unit.failed (or computes introduced = failed - preexisting.length and gates on 0)",
+        "A documented genuine pre-existing red still passes (no false-fail regression)",
+        "Regression test: failed=2 with one documented preexisting -> gate BLOCKS; failed=1 fully documented -> passes"
+      ],
+      "files_likely_affected": [
+        "src/phase-verify.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing how preexisting failures are captured upstream"
+      ]
+    },
+    {
+      "id": "PIPE-030",
+      "schema_version": 1,
+      "title": "selfHeal hardcodes Opus regardless of step or failure triviality — route through escalation ladder",
+      "status": "requested",
+      "priority": "P1",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "src/pipeline.js (selfHeal ~:3576-3578)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "The generic gate-failure self-heal always spawns model:\"opus\", even though most gate heals are mechanical field-population (\"criteria_to_test_map missing an entry\") that Haiku/Sonnet handle. The tests_green heal (~:1662-1668) and the main-step heal ladder (~:3097-3098) already climb haiku→sonnet→opus; selfHeal does not.\n\n[4.8 cost review 2026-05-30] CONFIRMED: keep the MODEL ladder (haiku→sonnet→opus), do NOT convert to an effort ladder. Opus is 5x Haiku per token ($5/$25 vs $1/$5); effort/adaptive-thinking change token VOLUME, not the per-token RATE, so they cannot close the 5x gap on trivial mechanical heals. Use effort only as a secondary dial WITHIN the Opus rung.",
+      "user_impact": "Token cost: Opus input ~5x Sonnet / ~15x Haiku. Gate heals are common; routing attempt-1 through the ladder can cut heal token cost ~60-80% on the trivial majority.",
+      "acceptance_criteria": [
+        "selfHeal selects model via the escalation ladder / pickAttemptModel by heal attempt, not a hardcoded opus",
+        "Final rung still escalates to opus for stubborn heals",
+        "Regression test: selfHeal attempt 1 does not request opus"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Re-tuning the ladder tiers themselves"
+      ]
+    },
+    {
+      "id": "PIPE-031",
+      "schema_version": 1,
+      "title": "Heal loop has no cumulative wall-clock cap — only per-attempt timedOut is checked (5h-overrun class)",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/retry-policy.js (shouldHeal ~:68-79), src/pipeline.js (heal loop ~:3044-3047,3358)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "shouldHeal refuses only when the CURRENT attempt timed out or hit max turns. A gate-failed attempt that runs just under its per-attempt max_seconds still heals up to maxAttempts=3, with no cap on the SUM of attempt durations; decideRestart can then re-enter and multiply further. Worst case ≈ maxAttempts × max_seconds × (1 + maxRestarts × steps). This is the recurring 5h-overrun class and the open \"wall-clock spawn cap\" memory item.",
+      "user_impact": "Doomed tickets burn hours of wall-clock and tokens before failing the step.",
+      "acceptance_criteria": [
+        "A per-ticket (or per-step) cumulative elapsed budget is threaded into shouldHeal",
+        "Heal is refused once summed attempt durations exceed the cap, even if no single attempt timed out",
+        "Regression test: three under-budget gate-failing attempts whose sum exceeds the cap -> heal refused before attempt 3"
+      ],
+      "files_likely_affected": [
+        "src/retry-policy.js",
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "The reviewer-retry wall-clock path (already covered, commit 7b06337)"
+      ]
+    },
+    {
+      "id": "PIPE-032",
+      "schema_version": 1,
+      "title": "think-loop risk-cap converges right after applying a revise, without re-challenging the edit",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/think-loop.js (risk_capped break ~:403-411 vs revise apply ~:299-383)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "For risk!=high, riskCapEnabled is true. After the isBetter branch applies a revise, control reaches the end-of-loop risk-cap break; if findings are non-blocking it breaks immediately — so the revised artifact is never re-challenged. A revise that did not actually take (common) is never caught for medium/low-risk tickets; the non-convergence detector never gets a second round.",
+      "user_impact": "Medium/low-risk tickets can ship an unverified or incorrect revise edit; the \"fix that did not take\" safety net is bypassed for the majority risk tier.",
+      "acceptance_criteria": [
+        "Do not risk-cap on an iteration where a revise was applied this round; require at least one follow-up challenge after any applied revise",
+        "High-risk behaviour unchanged",
+        "Regression test: medium-risk ticket, revise applied -> at least one more challenge round runs before convergence"
+      ],
+      "files_likely_affected": [
+        "src/think-loop.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing the better/worse comparison heuristic"
+      ]
+    },
+    {
+      "id": "PIPE-033",
+      "schema_version": 1,
+      "title": "autoCommitPaths absorbs tracked-and-modified allow-listed paths, silently committing operator WIP",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/checkpoint.js (autoCommitPaths ~:61-83, setupTicketBaseline ~:101-116)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "The PIPE-026 fix auto-commits absorbPaths before the dirty check to absorb untracked pinned context files, but autoCommitPaths matches any porcelain status — including \" M\" (tracked+modified). If a declared context file is version-controlled and the operator has uncommitted edits, those edits are committed under a \"[human] backlog edits\" message and the DIRTY_TREE guard never sees them.",
+      "user_impact": "Operator WIP on an allow-listed context file is silently auto-committed with a misleading message, bypassing the dirty-tree safety for allow-listed paths.",
+      "acceptance_criteria": [
+        "autoCommitPaths absorbs only untracked (\"??\") allow-listed paths; tracked modifications (\" M\"/\"MM\") are left to trip DIRTY_TREE",
+        "PIPE-026 case still works: untracked pinned context file -> absorbed, run starts",
+        "Regression test: tracked allow-listed file with uncommitted edits -> DIRTY_TREE blocks (not silently committed)"
+      ],
+      "files_likely_affected": [
+        "src/checkpoint.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing which paths are on the absorb allow-list"
+      ]
+    },
+    {
+      "id": "PIPE-034",
+      "schema_version": 1,
+      "title": "Move static prompt boilerplate (EFFICIENCY_RULE + fixed step instructions) into a cacheable system-prompt prefix",
+      "status": "requested",
+      "priority": "P1",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/prompts.js (~:244-470), src/runner.js (~:117-119,149), src/pipeline.js (~:3145)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "The large constant blocks of every template (EFFICIENCY_RULE ≈681 tokens + fixed step instructions + git rules) are interpolated into the piped stdin user prompt, interleaved with the small dynamic bits, so prompt-caching gets no stable prefix. Only validationRules uses --append-system-prompt-file (attempt 1 only). Putting the static instructions per-step into a system-prompt file yields a cacheable prefix across the ~6 steps/ticket and across tickets (the code already reads cache_read/cache_creation tokens).\n\n[4.8 review 2026-05-30] PROMOTED P2→P1: Opus 4.8 lowered the prompt-cache minimum to 1,024 tokens and added mid-conversation system messages, so the ~681-token prefix now caches with no restructuring. This is the single largest token saver in the set and is on EVERY ticket path; do it first.",
+      "user_impact": "Token cost: ~2-4k tokens/step of constant instructions become ~90% cheaper on cache hits instead of fresh uncached input every spawn.",
+      "acceptance_criteria": [
+        "Static step instructions + EFFICIENCY_RULE are delivered via a per-step system-prompt prefix; only ticket/state/files remain in the piped user prompt",
+        "A trimmed/short variant is used for low-tool steps (root_cause, docs_update)",
+        "Observed cache_read tokens increase across steps of a ticket after the change"
+      ],
+      "files_likely_affected": [
+        "src/prompts.js",
+        "src/runner.js",
+        "src/pipeline.js"
+      ],
+      "out_of_scope": [
+        "Rewording the instruction content itself"
+      ]
+    },
+    {
+      "id": "PIPE-035",
+      "schema_version": 1,
+      "title": "review reuse_session resumes the implement session (not tests_green) and crosses model tiers (opus resuming sonnet)",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "pipeline.config.example.yaml (~:227,261,271), src/pipeline.js (~:1716-1727,3208), src/runner.js (~:97,122-124)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "review is configured reuse_session:true with comment \"reuses tests_green session — test output already in context\". But tests_green runs natively (no LLM, no session) and never sets this.sessionId, so review actually resumes the implement session — which ran under model:sonnet while review runs model:opus. spawnClaude sends both --model opus and --resume <sonnet-session>, so there is no cache benefit and the documented optimization does not exist.\n\n[4.8 review 2026-05-30] The cross-tier framing is now MOOT under the single-model (Opus 4.8) default — the \"opus resumes a sonnet session, no cache benefit\" defect dissolves. The REAL bug stands: review resumes the IMPLEMENT session because tests_green is native and never sets sessionId. Re-scope to fixing/removing the misleading reuse_session on review.",
+      "user_impact": "Misleading config drives tuning decisions; review re-pays a possibly-large implement transcript as input with no cache reuse across the tier boundary instead of a lean cold start.",
+      "acceptance_criteria": [
+        "Decide intent: either cold-start review (reuse_session:false, feeding files_changed via the existing template) or fix the comment to reflect the real (implement) session",
+        "If reuse stays on, it must reuse a same-model session or be documented as a full re-read",
+        "The config comment matches actual behaviour"
+      ],
+      "files_likely_affected": [
+        "pipeline.config.example.yaml",
+        "src/pipeline.js"
+      ],
+      "out_of_scope": [
+        "Changing the review prompt template content"
+      ]
+    },
+    {
+      "id": "PIPE-036",
+      "schema_version": 1,
+      "title": "Ticket ID-pattern drift: code regex accepts IDs the published JSON schema rejects",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/ticket-schema.js (~:33) vs schemas/ticket.v1.schema.json (~:12)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "ticket-schema.js regex accepts lowercase and multi-char suffixes (BUG-261a, T-12ab, BUG-261AB); ticket.v1.schema.json pattern ^[A-Z][A-Z0-9]*-\\d+[A-Z]?$ accepts only an optional single uppercase letter. The runtime validator uses the JS schema; the .json is the published external contract. This is the real \"schema↔config drift\" (the status ENUMs actually agree — that open memory item can be closed).",
+      "user_impact": "A ticket the pipeline ingests can be rejected by any external tool validating against the published schema, and vice-versa — silent contract divergence in a v1 contract meant to be identical.",
+      "acceptance_criteria": [
+        "Both patterns are made identical (single optional uppercase suffix is the documented intent)",
+        "A shared test asserts the two patterns accept/reject the same set on a fixture list",
+        "Update the memory note: status-enum drift not present; ID pattern was the drift"
+      ],
+      "files_likely_affected": [
+        "src/ticket-schema.js",
+        "schemas/ticket.v1.schema.json",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Redesigning the ID grammar"
+      ]
+    },
+    {
+      "id": "PIPE-037",
+      "schema_version": 1,
+      "title": "archiveTicket marks status=\"done\" without enforcing the checkDoneTransition criteria gate",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/backlog.js (archiveTicket ~:116-183, line ~125), src/ticket-schema.js (checkDoneTransition ~:137-143)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "checkDoneTransition exists specifically to block marking a behavioural, non-trivial ticket done without acceptance criteria, but archiveTicket writes ticket.status=\"done\" unconditionally and never calls it. The gate is dead at the one transition it was written to guard.",
+      "user_impact": "The exact failure the gate documents (tickets shipped done with no criteria) can still occur via the archive path.",
+      "acceptance_criteria": [
+        "archiveTicket calls checkDoneTransition before setting done and rejects/records the violation per the project schema mode (strict vs warn)",
+        "Trivial / non-behavioural tickets still archive without criteria",
+        "Regression test: behavioural ticket with no acceptance_criteria -> archive blocked in strict mode"
+      ],
+      "files_likely_affected": [
+        "src/backlog.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing requiresCriteria semantics per project"
+      ]
+    },
+    {
+      "id": "PIPE-038",
+      "schema_version": 1,
+      "title": "write-zones anchored deny globs silently fail on nested dirs; allowGlobs undefined throws",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/write-zones.js (globMatch ~:52-74, checkWriteZones ~:125-144)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "globMatch is fully anchored (^...$) with no implicit prefix, so a natural deny pattern like \"test/**\" matches only a repo-root test/ tree and NOT app/test/foo.dart or packages/*/test — the common Flutter/monorepo layout. The deny mechanism is the TDD-integrity guard (prevents implement editing a red test to make it pass), so it is silently inert there. Separately, denyGlobs defaults to [] but allowGlobs has no default: a strict-mode config with no allow: key throws TypeError at allowGlobs.some(...).",
+      "user_impact": "implement can edit nested test files undetected (TDD guard hole, no error raised); and a missing allow: in strict mode throws instead of behaving as \"all outside zones\".",
+      "acceptance_criteria": [
+        "Document that globs are root-anchored and/or auto-prepend **/ for bare segment patterns; provide **/test/** in examples",
+        "allowGlobs defaults to [] symmetrically with denyGlobs",
+        "Regression test: deny \"**/test/**\" matches app/test/x.dart; checkWriteZones with no allow: does not throw"
+      ],
+      "files_likely_affected": [
+        "src/write-zones.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Switching to a full glob library"
+      ]
+    },
+    {
+      "id": "PIPE-039",
+      "schema_version": 1,
+      "title": "/api/reports/tickets and /api/pipeline/:ticketId ignore ?project= and always read the active project",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/server.js (~:1181-1291, ~:1636-1644)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "/api/pipeline-states was fixed (commit be59243) to honor ?project=, but these two sibling read endpoints still hardcode config._resolved.pipelineDir and never read req.query.project. The dashboard can switch active project mid-run, so reports/timeline for a non-active project silently returns the wrong project data. Same recurring project-routing class.",
+      "user_impact": "Reports/timeline page shows the active project even when the operator selected another — cross-project confusion in the multi-project dashboard.",
+      "acceptance_criteria": [
+        "Both endpoints resolve dir from ?project= when present and valid (config._projects.has(p)), falling back to active, matching /api/pipeline-states",
+        "Regression test: request with ?project=other returns other project tickets"
+      ],
+      "files_likely_affected": [
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Reworking the project-switch UX"
+      ]
+    },
+    {
+      "id": "PIPE-040",
+      "schema_version": 1,
+      "title": "GET handlers mutate the shared live config._projects map",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/server.js (/api/disputes ~:1330-1334, /api/dashboard/pipeline-stats ~:1474-1478)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "Both read handlers do `const projects = config._projects || new Map(); if (projects.size===0) projects.set(fallbackId, config);`. When _projects exists but is empty, projects IS the real live map, so a GET permanently injects config under fallbackId into shared state (the canonical Map shared by configForProject, /api/projects, startPipeline, MCP).",
+      "user_impact": "A read request can durably alter the project registry; a project can \"appear\" after a disputes poll. Wrong by construction even if low-likelihood.",
+      "acceptance_criteria": [
+        "Build a local fallback map instead of mutating: const projects = config._projects?.size ? config._projects : new Map([[fallbackId, config]])",
+        "No GET handler mutates config._projects",
+        "Regression test: GET /api/disputes with empty registry leaves config._projects unchanged"
+      ],
+      "files_likely_affected": [
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Refactoring the project registry construction"
+      ]
+    },
+    {
+      "id": "PIPE-041",
+      "schema_version": 1,
+      "title": "Synchronous fs in request handlers (disputes/stats/full) blocks the event loop during incidents",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/server.js (~:1326-1381, ~:1470-1541, ~:1557-1623)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "These handlers use readdirSync/existsSync/readFileSync/statSync/openSync/readSync while iterating every project and ticket dir; /api/ticket/.../full additionally readSyncs up to 5MB of pipeline.log and regexes per line — all on the event loop. /api/pipeline-states was deliberately moved to async Promise.all (PIPE-011) for exactly this reason; these endpoints never got the treatment.",
+      "user_impact": "While these polls run the server cannot process SSE writes, /api/status, or /api/stop — multi-hundred-ms stalls that delay the very stop/status calls an operator hits during an incident.",
+      "acceptance_criteria": [
+        "Switch to fs/promises (readdir/readFile/stat) with Promise.all parallelism, matching /api/pipeline-states",
+        "The full-log read is streamed/async, not a 5MB sync read",
+        "No Sync fs call remains in these three handlers"
+      ],
+      "files_likely_affected": [
+        "src/server.js"
+      ],
+      "out_of_scope": [
+        "Adding a caching layer (separate optimisation)"
+      ]
+    },
+    {
+      "id": "PIPE-042",
+      "schema_version": 1,
+      "title": "No unhandledRejection/uncaughtException handler — a stray async throw kills the orchestrator",
+      "status": "requested",
+      "priority": "P2",
+      "type": "bug",
+      "complexity": "trivial",
+      "area": "src/index.js (~:118-121), src/server.js (process handlers ~:270,308-309)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "The process installs SIGTERM/SIGINT/exit handlers but no process.on(\"unhandledRejection\") / \"uncaughtException\". The server is a long-lived single process hosting MCP + live pipelines; on Node >=15 a single unhandled rejection terminates it by default, taking down running pipelines whose locks then go stale.",
+      "user_impact": "One unanticipated async throw kills the server mid-run; recovery depends on start.sh + stale-lock detection.",
+      "acceptance_criteria": [
+        "Add process.on(\"unhandledRejection\") and (\"uncaughtException\") that log richly and fail gracefully (optionally emit + drain) in startServer/index.js",
+        "Handler does not mask genuine programmer errors silently (must log)",
+        "Regression/smoke test: a rejected detached promise is logged, process survives (or exits cleanly with lock release)"
+      ],
+      "files_likely_affected": [
+        "src/index.js",
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Auditing every call site for missing awaits (separate)"
+      ]
+    },
+    {
+      "id": "PIPE-043",
+      "schema_version": 1,
+      "title": "tests_green heal loop: add no-progress guard and scope test re-runs",
+      "status": "requested",
+      "priority": "P3",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "src/pipeline.js (~:1528-1700, ~:1662-1691)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "Two efficiency gaps in the native tests_green heal loop: (1) unlike the generic path which consults shouldHeal({maxTurnsHit,timedOut,toolCalls}), this loop spawns up to maxHealAttempts purely on failure count — a heal that hit its turn cap or made 0 edits re-runs the next rung regardless; (2) each heal re-runs the FULL native suite (unit+analyzer), so 3 heals = 4 full suite runs, the dominant wall-clock cost for Flutter suites.",
+      "user_impact": "Wasted attempts/tokens on non-converging heals and minutes of redundant full-suite runs on heal-heavy tickets.",
+      "acceptance_criteria": [
+        "Capture maxTurnsHit/toolCalls from the heal spawn and break early when a heal made no progress (mirror shouldHeal)",
+        "On heal re-runs, run the previously-failing test files first; full suite only on the final confirming pass",
+        "No change to the honest final gate result"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Restructuring the native test runner"
+      ]
+    },
+    {
+      "id": "PIPE-044",
+      "schema_version": 1,
+      "title": "Post-merge green-gate skips extras phases in soft mode (implPaths empty)",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/pipeline.js (_runPostMergeGreenGate ~:2381, runTestSuite extras trigger ~:3782-3797)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "_runPostMergeGreenGate calls runTestSuite({runAllExtras:false}), which only triggers an extras phase when implPaths start with its trigger_file_prefix. implPaths = pipelineState.steps.implement.files_changed, a key soft mode (the default) never writes, so the post-merge gate runs unit+analyzer only and never backend/integration extras even when the ticket changed backend files. Related to the open \"post-cherry-pick green-gate on master HEAD\" follow-up.",
+      "user_impact": "Extras-suite regressions (the exact failure the gate was built to catch) can land on master through soft mode without being re-run post-cherry-pick.",
+      "acceptance_criteria": [
+        "Post-merge gate derives changed paths from the worktree git diff (or runs all extras) rather than steps.implement.files_changed",
+        "A soft-mode ticket touching backend triggers the backend extras phase in the post-merge gate",
+        "Regression test covers the soft-mode extras trigger"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing extras phase definitions"
+      ]
+    },
+    {
+      "id": "PIPE-045",
+      "schema_version": 1,
+      "title": "Stale-lock detection: PID-reuse can pin the lock forever (no age backstop when pid present)",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "trivial",
+      "area": "src/lock.js (isLockStale ~:33-43, ~:85)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "When a pid= marker is present, isLockStale returns purely !isPidAlive(pid) and never falls back to STALE_LOCK_MAX_AGE_MS. After a SIGKILL, if the OS recycles the dead PID onto an unrelated live process, the lock is treated as held indefinitely. The age backstop only applies to legacy pid-less locks, contradicting the \"belt + braces\" comment.",
+      "user_impact": "Rare but real permanent queue freeze requiring manual lock deletion after PID reuse.",
+      "acceptance_criteria": [
+        "Treat stale if PID dead OR file older than the age ceiling: return !isPidAlive(pid) || ageMs > STALE_LOCK_MAX_AGE_MS",
+        "A fresh live-PID lock within the age ceiling is still respected",
+        "Regression test: live-but-reused PID on an old lock -> considered stale"
+      ],
+      "files_likely_affected": [
+        "src/lock.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Switching to PID+starttime fingerprinting (larger change)"
+      ]
+    },
+    {
+      "id": "PIPE-046",
+      "schema_version": 1,
+      "title": "validator.js rule fixes: non_empty_string accepts arrays/objects; inconsistent object stringify in messages",
+      "status": "requested",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "trivial",
+      "area": "src/validator.js (~:20-34, ~:36-69)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "(1) non_empty_string only fails on an empty object/array, so a populated array [\"x\"] or object {a:1} passes a rule named \"non_empty_string\" — the name lies and no string-type contract is enforced. (2) equals/equals_or_missing/one_of interpolate ${value} directly, rendering objects as [object Object], while non_empty_array/string use JSON.stringify — inconsistent failure messages.",
+      "user_impact": "Weak/misleading validation and unhelpful gate-failure messages for object-valued fields.",
+      "acceptance_criteria": [
+        "Either rename non_empty_string to non_empty (presence check) or enforce string type when the contract demands a string",
+        "All rule failure messages use JSON.stringify(value) consistently",
+        "Unit test covers an array passed to a string-expecting field and an object in an equals message"
+      ],
+      "files_likely_affected": [
+        "src/validator.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Adding new validation rule types"
+      ]
+    },
+    {
+      "id": "PIPE-047",
+      "schema_version": 1,
+      "title": "MCP tool robustness: dedup backlog load, guard existsSync(undefined), reject id/schema_version patch",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/mcp/server.js (~:127-287)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "list_tickets/get_ticket/update_ticket/archive_ticket each independently existsSync→readFile→JSON.parse and disagree on the missing-file response. get_ticket (~:155) lacks the !backlogPath guard list_tickets has, so existsSync(undefined) returns false and a misconfigured _resolved.backlog surfaces as \"ticket not found\" rather than a clear error. Separately, update_ticket does {...existing, ...patch} with no key filtering, so a patch can silently change id/schema_version and create duplicate-id situations.",
+      "user_impact": "Config errors masked as not-found; accidental id/schema_version mutation through the normal patch path.",
+      "acceptance_criteria": [
+        "Extract a loadBacklogData(cfg) helper validating backlogPath is set; reuse across the four tools with one consistent missing shape",
+        "update_ticket rejects patch.id and patch.schema_version (clear toolError) before merge",
+        "Regression test: undefined backlog path -> explicit error; patch with id -> rejected"
+      ],
+      "files_likely_affected": [
+        "src/mcp/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Reworking the MCP transport/mount lifecycle"
+      ]
+    },
+    {
+      "id": "PIPE-048",
+      "schema_version": 1,
+      "title": "Dead tests_green config + nonexistent prompt_template paths in example config",
+      "status": "requested",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "trivial",
+      "area": "pipeline.config.example.yaml (~:236-247 tests_green; ~:162,185,211,237,260,282,303 prompt_template), src/pipeline.js (~:1508), src/prompts.js (~:150-161)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "tests_green runs natively (intercepted at pipeline.js:1508 before any prompt/model use), so its declared model:haiku, prompt_template, tools, max_turns and the prompts.js tests_green template are inert — tuning them has no effect. Separately, every step points prompt_template at prompts/<step>.md but only plan_critic.md/reviewer.md/worker.md/worker-apply.md exist, so existsSync always falls through to getDefaultTemplate — the documented \"edit prompts/plan.md to customize\" workflow silently no-ops.",
+      "user_impact": "Maintenance/clarity traps: editing tests_green model/template or the per-step prompt_template files has no runtime effect.",
+      "acceptance_criteria": [
+        "tests_green native-only nature is documented or its unused model/template/tools removed from the example config",
+        "Either ship the referenced prompt_template files or drop the prompt_template lines so the built-in path is explicit",
+        "No silent no-op customization path remains in the example config"
+      ],
+      "files_likely_affected": [
+        "pipeline.config.example.yaml",
+        "prompts/",
+        "docs/"
+      ],
+      "out_of_scope": [
+        "Changing the default prompt content"
+      ]
+    },
+    {
+      "id": "PIPE-049",
+      "schema_version": 1,
+      "title": "Resume trusts stale checkpoints after a worktree reset (hard-restart mid-ticket)",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "trivial",
+      "area": "src/phase-verify.js (determineResumePoint ~:93-111, checkPlanPhase ~:166-175)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "On restart the walk treats a phase with a valid checkpoint + payload sanity as completed and resumes from the first missing phase. Early phases (plan/tests_red) verify on declaration/file-existence only, ignoring the worktree. A hard restart that resets the worktree but leaves worker-output/*.json intact yields false \"match\" for plan/tests_red while the edits are gone, so resume starts mid-stream on an empty worktree.",
+      "user_impact": "Resume can proceed on a worktree that no longer contains the work the checkpoints claim, producing inconsistent ticket output. Rare (operator-guarded hard restart).",
+      "acceptance_criteria": [
+        "Checkpoints record the baseline SHA; on resume, if HEAD/baseline tag does not match the checkpoint baseline, treat all phases as missing (full restart)",
+        "Normal resume (worktree intact) still resumes at the first missing phase",
+        "Regression test: checkpoint baseline != current baseline -> full restart"
+      ],
+      "files_likely_affected": [
+        "src/phase-verify.js",
+        "src/checkpoint.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Changing checkpoint storage format beyond adding baseline SHA"
+      ]
+    },
+    {
+      "id": "PIPE-050",
+      "schema_version": 1,
+      "title": "Disputes reject path writes an unvalidated correction ticket with inconsistent date format",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "small",
+      "area": "src/server.js (~:1417-1455)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "The /api/disputes reject path builds a correctionTicket and writeFileSyncs it straight into backlog.tickets with no validateTicket() call — missing schema-required constraints the MCP create path enforces (description length, complexity enum, etc.) and possibly complexity:\"unknown\" not in the project enum. It also writes updated_at as a full ISO string whereas every other writer uses .slice(0,10).",
+      "user_impact": "The pipeline can inject a ticket that fails its own project schema; updated_at date-format inconsistency in the backlog.",
+      "acceptance_criteria": [
+        "Run validateTicket on the correction ticket before push; reject/normalise on failure",
+        "updated_at normalised to .slice(0,10) like other writers",
+        "Regression test: reject path produces a schema-valid ticket"
+      ],
+      "files_likely_affected": [
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Redesigning the disputes workflow"
+      ]
+    },
+    {
+      "id": "PIPE-051",
+      "schema_version": 1,
+      "title": "/api/backlog/reorder returns an untagged/unfiltered backlog (v2 leak) and lacks null guards",
+      "status": "requested",
+      "priority": "P3",
+      "type": "bug",
+      "complexity": "trivial",
+      "area": "src/server.js (~:845-867), src/backlog.js (reorderTicket ~:228-232)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "loadFullBacklog tags tickets backlog:\"primary\"/\"v2\" (the UI filters runnable items via t.backlog!==\"v2\"); the reorder handler hand-rolls `const all = [...tickets, ...v2Tickets]` WITHOUT the v2 tag, so if the UI repaints from the reorder response, v2 tickets leak into the runnable list until the next full fetch. Separately reorderTicket reads .order on srcTicket/swpTicket with no null check — a future filterAndSort change could turn reorder into an opaque 500.",
+      "user_impact": "Transient v2-ticket leak into the runnable list after a reorder; latent null-deref in reorder.",
+      "acceptance_criteria": [
+        "Reorder handler returns loadFullBacklog() (or applies the same tagging) rather than hand-rolling all",
+        "reorderTicket guards `if (!srcTicket || !swpTicket) return null` before swapping",
+        "Regression test: reorder response carries backlog tags; missing ticket -> null not throw"
+      ],
+      "files_likely_affected": [
+        "src/server.js",
+        "src/backlog.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Reworking the reorder algorithm"
+      ]
+    },
+    {
+      "id": "PIPE-052",
+      "schema_version": 1,
+      "title": "Schema field-naming drift: root_cause why vs why_happened; pipeline_managed unused archived_at/merge_status vs completed_at",
+      "status": "requested",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "trivial",
+      "area": "src/pipeline.js (STEP_OUTPUT_SCHEMA.root_cause ~:78-81) vs src/phase-verify.js (~:312-320); src/ticket-schema.js (pipeline_managed ~:69) vs src/backlog.js (~:125-129)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "(1) Classic ingest whitelists root_cause fields why_happened/why_not_caught/proposed_rule; soft phase-verify requires why/why_not_caught — the two paths disagree on the primary field name, so a worker satisfying one is dropped/diverged by the other. (2) pipeline_managed lists archived_at/merge_status/pipeline_state_ref but archiveTicket writes completed/completed_at/landed_commit and never the former — dead allowlist entries / drift on the real archive timestamp.",
+      "user_impact": "root_cause can be silently dropped (classic) or false-diverged (soft); confusing archived-ticket field naming when auditing.",
+      "acceptance_criteria": [
+        "Pick one root_cause field name (or accept both spellings) in both STEP_OUTPUT_SCHEMA and checkRootCausePhase",
+        "Reconcile pipeline_managed: either write archived_at in archiveTicket or drop the unused names",
+        "A test asserts a single root_cause shape passes both paths"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "src/phase-verify.js",
+        "src/ticket-schema.js",
+        "src/backlog.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Broader checkpoint schema redesign"
+      ]
+    },
+    {
+      "id": "PIPE-053",
+      "schema_version": 1,
+      "title": "Event-log can lose its buffered tail on restart/kill (no flush on clean-exit path)",
+      "status": "requested",
+      "priority": "P3",
+      "type": "enhancement",
+      "complexity": "trivial",
+      "area": "src/event-log.js (~:41-50), src/pipeline.js (RESTART_EXIT_CODE exit path)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — independent pipeline code review (5-agent read-only fan-out, adversarially verified, default-refute).",
+      "description": "write() uses a plain createWriteStream(append) with no flush and ignores backpressure; close() calls stream.end() but nothing guarantees close() runs before process.exit (the restart path exits after a 250ms setTimeout, not after eventLog.close()). On abrupt exit the unflushed tail is lost. Swallowing write failures is by-design; the gap is no flush on the known clean-exit path.",
+      "user_impact": "Telemetry gaps (missing tail of the event log) after a restart/kill. Advisory logs, so low severity.",
+      "acceptance_criteria": [
+        "eventLog.close() (awaiting stream drain) runs before process.exit on the restart path",
+        "Optionally honour write() backpressure",
+        "Manual/smoke check: event log tail is present after a graceful restart"
+      ],
+      "files_likely_affected": [
+        "src/event-log.js",
+        "src/pipeline.js"
+      ],
+      "out_of_scope": [
+        "Switching to a synchronous logging library"
+      ]
+    },
+    {
+      "id": "PIPE-054",
+      "schema_version": 1,
+      "title": "Wire the native diff classifier (currently a stub) to drive reviewer cost-routing and suppress spurious findings",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "src/pipeline.js (DIFF_CLASSIFICATION stub ~:894), src/diff-classify.js (new), prompts/reviewer.md (rule #4)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — Opus 4.8 architecture+cost review (workflow fan-out, verified pricing Haiku $1/$5, Sonnet $3/$15, Opus $5/$25).",
+      "description": "The reviewer DIFF_CLASSIFICATION input is hardcoded to \"(classifier not yet wired — treat as code_behavioural)\", so reviewer.md rule #4 (suppress \"missing tests\" on docs/logging/refactor diffs) NEVER fires and every diff is reviewed as behavioural. Add a deterministic src/diff-classify.js (pure git+regex on the already-captured diff at pipeline.js:882) bucketing each hunk into docs_only|logging_only|refactor_only|code_behavioural, FAIL-CLOSED (ambiguous → code_behavioural). Feed the real verdict to the reviewer to (a) route model/effort — sonnet+medium on non-behavioural, opus+high on behavioural — and (b) suppress spurious missing-tests findings and the worker-apply churn they cause. Native, no LLM.",
+      "user_impact": "Lower reviewer cost on the large non-behavioural slice of tickets + fewer fake \"missing tests\" findings. Strictly additive: worst case equals today (all-behavioural).",
+      "acceptance_criteria": [
+        "src/diff-classify.js buckets each hunk deterministically by path + change-shape; ambiguous → code_behavioural",
+        "Reviewer receives the real classification instead of the stub placeholder",
+        "A docs-only diff is classified docs_only and its missing-tests finding is suppressed by reviewer rule #4",
+        "Unit test covers each bucket incl. a behavioural-disguised-as-refactor case staying code_behavioural"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "src/diff-classify.js",
+        "prompts/reviewer.md",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Reviewer fan-out / multi-lens panel (evaluated and REJECTED on cost grounds — 2-3x review tokens for marginal catch given 4.8 ships 4x fewer unflagged flaws)",
+        "Changing the review rubric"
+      ]
+    },
+    {
+      "id": "PIPE-055",
+      "schema_version": 1,
+      "title": "Adopt the Opus 4.8 effort dial driven by ticket complexity on the soft worker/reviewer/apply spawns",
+      "status": "requested",
+      "priority": "P2",
+      "type": "enhancement",
+      "complexity": "small",
+      "area": "src/pipeline.js (_runSoftSpawn ~:1145-1150; call sites ~:816/903/945), src/runner.js (effort forward ~:106)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — Opus 4.8 architecture+cost review (workflow fan-out, verified pricing Haiku $1/$5, Sonnet $3/$15, Opus $5/$25).",
+      "description": "_runSoftSpawn calls spawnClaude with NO effort, so all three soft spawns run at CLI-default high regardless of ticket size — paying for deep thinking on trivial tickets. spawnClaude already forwards effort (runner.js:106); the soft path simply never wired it. Thread an effort param and set it by ROLE + ticket COMPLEXITY: worker effort derived from ticket.complexity (trivial/small→low, medium→medium, large→high); reviewer=high; worker-apply=medium. Because complexity is an author pre-estimate (under-graded \"large\" tickets are the 5h-overrun class), let the native size-KPI post-plan check (files_to_change>=10 / prod>=6 / layers>=4) OVERRIDE the worker effort UPWARD. NOTE: effort changes token VOLUME at the SAME per-token rate — savings come from adaptive thinking on easy work, NOT a model swap; do NOT use effort to replace cheap-model utility calls (see PIPE-030).",
+      "user_impact": "Cuts wasted thinking/output tokens on the trivial/small majority of tickets at the same model rate; no quality loss on the reasoning core (worker stays high on large tickets, reviewer always high).",
+      "acceptance_criteria": [
+        "_runSoftSpawn accepts and forwards an effort arg to spawnClaude for all three call sites",
+        "Worker effort is derived from ticket.complexity per the mapping; reviewer=high; worker-apply=medium",
+        "The size-KPI check overrides worker effort upward when the plan exceeds the complexity estimate",
+        "Regression test: complexity→effort mapping and the upward override both covered"
+      ],
+      "files_likely_affected": [
+        "src/pipeline.js",
+        "src/runner.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Replacing Haiku/Sonnet utility calls with Opus-low (cost regression: Opus is 5x Haiku/token; see PIPE-030)",
+        "Classic-path effort wiring"
+      ]
+    },
+    {
+      "id": "PIPE-056",
+      "schema_version": 1,
+      "title": "Drop the same-model plan think_loop; fold its self-checks into the plan prompt",
+      "status": "requested",
+      "priority": "P3",
+      "type": "refactor",
+      "complexity": "trivial",
+      "area": "pipeline.config.example.yaml (steps.plan.think_loop), src/prompts.js / prompts (plan template), src/think-loop.js",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — Opus 4.8 architecture+cost review (workflow fan-out, verified pricing Haiku $1/$5, Sonnet $3/$15, Opus $5/$25).",
+      "description": "The plan step is wrapped by a same-model think_loop (challenge/compare/revise) that shares the planner prior, so the second pass rarely yields independent signal. With 4.8 adaptive thinking + effort=high the planner performs that \"missed callers / edge cases\" self-review in one call. Set steps.plan.think_loop:false and move the think_challenge bullets into a mandatory self-check section of the plan prompt. KEEP plan_critic (the SEPARATE independent-context falsifier with ground-truth tool access) — this only removes the redundant SAME-context loop, not the independent gate.",
+      "user_impact": "Removes 1-3 challenge+compare+revise round-trips per high/load-bearing ticket with negligible quality loss (the loop shared the planner blind spots). Independent plan_critic unaffected.",
+      "acceptance_criteria": [
+        "steps.plan.think_loop disabled in config",
+        "The planner prompt carries the former think_challenge checks as a mandatory self-check section",
+        "plan_critic still fires on its existing gate (risk=high / load_bearing)",
+        "Regression test: the plan step no longer spawns the think_loop"
+      ],
+      "files_likely_affected": [
+        "pipeline.config.example.yaml",
+        "src/prompts.js",
+        "prompts/",
+        "test/"
+      ],
+      "out_of_scope": [
+        "plan_critic (must stay separate)",
+        "think_loop on other steps"
+      ]
+    },
+    {
+      "id": "PIPE-057",
+      "schema_version": 1,
+      "title": "Persistent critic session across rounds via Opus 4.8 mid-conversation system messages",
+      "status": "requested",
+      "priority": "P3",
+      "type": "enhancement",
+      "complexity": "medium",
+      "area": "src/think-loop.js (per-round cold re-spawn ~:259 challenge), src/pipeline.js (classic review→implement re-recursion ~:2033)",
+      "reported": "2026-05-30",
+      "source": "Session 2026-05-30 — Opus 4.8 architecture+cost review (workflow fan-out, verified pricing Haiku $1/$5, Sonnet $3/$15, Opus $5/$25).",
+      "description": "think-loop tears down and cold-respawns the challenger every round (re-reading the worktree from scratch and re-billing the static boilerplate). 4.8 mid-conversation system messages (role:\"system\" after a user turn) let the challenger KEEP its file-reading context and prompt-cache across rounds while receiving per-round feedback (\"your prior findings were applied/rejected because X; re-examine the now-modified files\"). Rounds 2+ become cache hits instead of cold reads, and feedback actually carries across rounds — complements PIPE-028 (recursive re-spawn loses feedback) and PIPE-032 (converge-without-recheck). Keep COMPARE on Haiku (cheap, output-light — effort cannot beat its rate). Command the challenger to re-read modified files each round so round N+1 independence is preserved; re-validate the non-convergence/BLOCKED guards for persistent-session signature semantics.",
+      "user_impact": "Fewer cold-start spawns + cached prefix on later rounds (lower tokens/latency), and feedback no longer lost between rounds so the loop converges in fewer rounds.",
+      "acceptance_criteria": [
+        "Challenger persists across rounds via a mid-conversation system message instead of a cold re-spawn",
+        "Per-round accept/reject feedback is injected into the persistent session",
+        "Non-convergence and BLOCKED guards (think-loop.js:198-211) re-validated for the persistent-session signature change",
+        "COMPARE stays on the cheap model; regression test covers carry-over of feedback across two rounds"
+      ],
+      "files_likely_affected": [
+        "src/think-loop.js",
+        "src/pipeline.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Merging the reviewer into the worker session (must stay independent)",
+        "Adopting think_loop in the soft default path"
+      ]
+    },
+    {
+      "id": "PIPE-058",
+      "schema_version": 1,
+      "title": "Concurrent backlog/archive writes corrupt backlog.json (non-atomic writeFile + no lock across MCP and pipeline writers)",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "medium",
+      "area": "src/mcp/server.js (archive_ticket/update_ticket/create_ticket writes ~:196/235/280-281), src/backlog.js (archiveTicket/setBacklogTicketStatus ~:133/145/200/235), src/server.js (stateless MCP mount ~:333)",
+      "reported": "2026-05-31",
+      "source": "Session 2026-05-31 — reported from the predictor side (MCP archive_ticket corrupts backlog.json under rapid sequential calls) and confirmed by code review + a real corrupted archive (predictor backlog-archive.json.bak threw \"Unexpected non-whitespace character after JSON at position 204588\").",
+      "description": "The MCP server is mounted stateless-per-request (server.js: a fresh server+transport per POST /mcp), so rapid sequential archive_ticket/update_ticket/create_ticket calls execute CONCURRENTLY on the event loop. Every writer does an unguarded read-modify-write and a NON-ATOMIC writeFile straight to the canonical file (open O_TRUNC + write + close; no tmp+rename, and grep finds no lock/mutex/queue anywhere). The pipeline own backlog.js archiveTicket/setBacklogTicketStatus run in the SAME process and write the SAME files with no coordination, so even one MCP call racing one pipeline archive corrupts. Two failure modes: (1) trailing-garbage corruption — two concurrent writeFile to one path where the shorter payload (one-more-ticket-archived) leaves the longer payload tail bytes, yielding valid JSON followed by leftover bytes (\"Unexpected non-whitespace character after JSON\"); the shrinking archive workload makes this dominant. (2) lost updates — two handlers read the same snapshot, each splices a different ticket, last write wins, an archived ticket reappears. archive_ticket writes TWO files per call (backlog + archive), doubling the surface. A corrupt backlog freezes the queue / forces a recovery (the 2026-05-31 _recovery event).",
+      "user_impact": "Corrupts the source-of-truth backlog/archive under bulk or rapid archiving — silently loses archived tickets and/or produces unparseable JSON that freezes the whole queue until manually recovered. Already observed corrupting the predictor archive.",
+      "acceptance_criteria": [
+        "All backlog/archive writes are atomic: write <path>.tmp then rename() (same-FS atomic), in BOTH src/mcp/server.js and src/backlog.js",
+        "Read-modify-write is serialized by a per-file async mutex/queue shared across every backlog writer (MCP tools + backlog.js) so concurrent archives cannot interleave or lose updates",
+        "Regression test: N parallel archive_ticket (and archive+update mix) calls leave backlog.json + archive valid JSON with every intended ticket moved exactly once (no trailing garbage, no resurrected/lost tickets)",
+        "create_ticket and update_ticket writes go through the same atomic + serialized path"
+      ],
+      "files_likely_affected": [
+        "src/mcp/server.js",
+        "src/backlog.js",
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Moving the backlog off a JSON file to a real DB",
+        "Adding MCP auth / network exposure changes"
+      ]
     }
   ]
 }
