@@ -1,7 +1,7 @@
 {
   "schema": "backlog-v1",
-  "updated_at": "2026-05-30",
-  "_last_session_note": "2026-05-30 — Opus 4.8 architecture+cost review. Added PIPE-054..057: native diff-classifier (054), complexity→effort dial on soft spawns (055), drop same-model plan think_loop (056), persistent critic via mid-conversation system messages (057). Reviewer FAN-OUT/multi-lens panel was evaluated and REJECTED on cost grounds (2-3x review tokens for marginal catch given 4.8 ships 4x fewer flaws) — left UNFILED, recorded in PIPE-054 out_of_scope. Annotated PIPE-030 (keep MODEL ladder — Opus 5x Haiku/token, effort can't close the rate gap), promoted PIPE-034 P2→P1 (1024-tok cache min + mid-conv system msgs make the cacheable prefix the top saver), re-scoped PIPE-035 (single-model moots the cross-tier half).",
+  "updated_at": "2026-05-31",
+  "_last_session_note": "2026-05-31 — filed PIPE-058 (P1): concurrent backlog/archive writes corrupt backlog.json (stateless per-request MCP + non-atomic writeFile + no lock; same race in pipeline backlog.js). Confirmed by code review + real corrupted predictor archive. Fix = atomic tmp+rename AND a per-file write mutex across all backlog writers.",
   "tickets": [
     {
       "id": "PIPE-001",
@@ -1653,6 +1653,36 @@
       "out_of_scope": [
         "Merging the reviewer into the worker session (must stay independent)",
         "Adopting think_loop in the soft default path"
+      ]
+    },
+    {
+      "id": "PIPE-058",
+      "schema_version": 1,
+      "title": "Concurrent backlog/archive writes corrupt backlog.json (non-atomic writeFile + no lock across MCP and pipeline writers)",
+      "status": "requested",
+      "priority": "P1",
+      "type": "bug",
+      "complexity": "medium",
+      "area": "src/mcp/server.js (archive_ticket/update_ticket/create_ticket writes ~:196/235/280-281), src/backlog.js (archiveTicket/setBacklogTicketStatus ~:133/145/200/235), src/server.js (stateless MCP mount ~:333)",
+      "reported": "2026-05-31",
+      "source": "Session 2026-05-31 — reported from the predictor side (MCP archive_ticket corrupts backlog.json under rapid sequential calls) and confirmed by code review + a real corrupted archive (predictor backlog-archive.json.bak threw \"Unexpected non-whitespace character after JSON at position 204588\").",
+      "description": "The MCP server is mounted stateless-per-request (server.js: a fresh server+transport per POST /mcp), so rapid sequential archive_ticket/update_ticket/create_ticket calls execute CONCURRENTLY on the event loop. Every writer does an unguarded read-modify-write and a NON-ATOMIC writeFile straight to the canonical file (open O_TRUNC + write + close; no tmp+rename, and grep finds no lock/mutex/queue anywhere). The pipeline own backlog.js archiveTicket/setBacklogTicketStatus run in the SAME process and write the SAME files with no coordination, so even one MCP call racing one pipeline archive corrupts. Two failure modes: (1) trailing-garbage corruption — two concurrent writeFile to one path where the shorter payload (one-more-ticket-archived) leaves the longer payload tail bytes, yielding valid JSON followed by leftover bytes (\"Unexpected non-whitespace character after JSON\"); the shrinking archive workload makes this dominant. (2) lost updates — two handlers read the same snapshot, each splices a different ticket, last write wins, an archived ticket reappears. archive_ticket writes TWO files per call (backlog + archive), doubling the surface. A corrupt backlog freezes the queue / forces a recovery (the 2026-05-31 _recovery event).",
+      "user_impact": "Corrupts the source-of-truth backlog/archive under bulk or rapid archiving — silently loses archived tickets and/or produces unparseable JSON that freezes the whole queue until manually recovered. Already observed corrupting the predictor archive.",
+      "acceptance_criteria": [
+        "All backlog/archive writes are atomic: write <path>.tmp then rename() (same-FS atomic), in BOTH src/mcp/server.js and src/backlog.js",
+        "Read-modify-write is serialized by a per-file async mutex/queue shared across every backlog writer (MCP tools + backlog.js) so concurrent archives cannot interleave or lose updates",
+        "Regression test: N parallel archive_ticket (and archive+update mix) calls leave backlog.json + archive valid JSON with every intended ticket moved exactly once (no trailing garbage, no resurrected/lost tickets)",
+        "create_ticket and update_ticket writes go through the same atomic + serialized path"
+      ],
+      "files_likely_affected": [
+        "src/mcp/server.js",
+        "src/backlog.js",
+        "src/server.js",
+        "test/"
+      ],
+      "out_of_scope": [
+        "Moving the backlog off a JSON file to a real DB",
+        "Adding MCP auth / network exposure changes"
       ]
     }
   ]
