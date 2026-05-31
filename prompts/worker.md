@@ -77,13 +77,16 @@ Run the project's FULL green gate per *Running tests* above (most projects: `.cl
 
 If a test fails:
 - If it's a test you wrote in tests_red that now passes — that's the goal, keep going.
-- If it's a pre-existing test now failing — you've broken something. Fix the production code, re-run, until clean.
+- If a test in a file *this ticket changed* fails — you've broken something. Fix the production code, re-run, until clean.
+- If a test in a file this ticket NEVER touched is already failing on the base branch (a pre-existing red), do NOT try to fix it — record it as baseline (see `preexisting_failures` below). Do NOT report `all_pass: true` while leaving it out of that list.
 - If multiple iterations fail to converge (>3 fix attempts on the same test) — halt with a `tests_green.json` whose `all_pass: false` and write the diagnostic into `failure_evidence`. The orchestrator surfaces this as a halt to the operator.
 
 Write `{{WORKER_OUTPUT_DIR}}/tests_green.json` with:
 - `all_pass`: boolean (true only if zero failing, zero analyzer errors)
 - `unit_tests: {passed, failed, skipped}`
 - `analyzer_errors`: integer
+- `regression_introduced`: boolean — `false` only if you introduced zero new failures (every current red is pre-existing).
+- `preexisting_failures`: array — REQUIRED whenever `unit_tests.failed > 0`. List the identifier of **every** currently-failing test that is pre-existing (not introduced by this ticket), one entry per red. The orchestrator gate requires this list to cover the full failing count: a `failed` count greater than this list's length is treated as introduced regressions and FAILS the phase. Do not bury this list inside another object — it must be a top-level array with this exact key.
 - `test_output_summary`: tail of the test output (truncated to ~500 chars)
 - `metrics: {wallMs, ...}`
 

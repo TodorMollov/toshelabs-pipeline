@@ -252,10 +252,15 @@ function checkTestsGreenPhase(payload, _worktree) {
     // and was rejected as self-contradicting — wasting a full ticket run.
     const unit = payload.unit_tests || {};
     if (typeof unit.failed === 'number' && unit.failed > 0) {
-      const noRegression = payload.regression_introduced === false || payload.introduced_failures === 0;
-      const baselineDocumented = Array.isArray(payload.preexisting_failures) && payload.preexisting_failures.length > 0;
-      if (noRegression && baselineDocumented) return { status: 'match' };
-      return { status: 'divergence', reason: `tests_green claims all_pass but unit_tests.failed=${unit.failed}` };
+      // PIPE-029: every current red must be itemised as pre-existing — a single
+      // documented red must NOT excuse N actual reds. redsFullyAccounted requires
+      // the documented baseline to COVER unit.failed.
+      if (redsFullyAccounted(payload, unit.failed)) return { status: 'match' };
+      const documented = collectPreexisting(payload).length;
+      return {
+        status: 'divergence',
+        reason: `tests_green claims all_pass but unit_tests.failed=${unit.failed} with only ${documented} red(s) itemised as pre-existing — list every red in top-level preexisting_failures (or fix the regressions)`,
+      };
     }
     return { status: 'match' };
   }
@@ -265,15 +270,42 @@ function checkTestsGreenPhase(payload, _worktree) {
   // documents which tests are pre-existing. Both field spellings are accepted
   // (regression_introduced / introduced_failures); the documented list is
   // required as evidence so a bare all_pass=false cannot slip through.
-  const noRegression = payload.regression_introduced === false || payload.introduced_failures === 0;
-  const baselineDocumented = Array.isArray(payload.preexisting_failures) && payload.preexisting_failures.length > 0;
-  if (noRegression && baselineDocumented) {
+  const unitFalse = payload.unit_tests || {};
+  if (redsFullyAccounted(payload, typeof unitFalse.failed === 'number' ? unitFalse.failed : null)) {
     return { status: 'match' };
   }
   return {
     status: 'divergence',
     reason: `tests_green has all_pass=${payload.all_pass} without zero-regression + documented-baseline accounting; phase did not converge`,
   };
+}
+
+// Collect the worker's documented pre-existing-failure baseline. Canonical field
+// is the top-level `preexisting_failures` array; a `full_suite.preexisting_failures`
+// nest is accepted defensively. Workers are instructed to emit the top-level field
+// (prompts/worker.md tests_green contract).
+function collectPreexisting(payload) {
+  const out = [];
+  const push = (v) => {
+    if (Array.isArray(v)) for (const x of v) if (x != null) out.push(typeof x === 'string' ? x : JSON.stringify(x));
+  };
+  push(payload.preexisting_failures);
+  if (payload.full_suite) push(payload.full_suite.preexisting_failures);
+  return [...new Set(out)];
+}
+
+// True when every currently-failing test is accounted for as a documented
+// pre-existing red and the worker did not flag a regression. When `failed` is a
+// number the documented list must COVER it (length >= failed) so a token
+// single-entry baseline cannot excuse an unbounded number of reds (PIPE-029).
+// When `failed` is unknown, fall back to "explicit zero-regression + a non-empty
+// documented baseline".
+function redsFullyAccounted(payload, failed) {
+  if (payload.regression_introduced === true) return false;
+  const documented = collectPreexisting(payload).length;
+  if (typeof failed === 'number') return documented >= failed;
+  const noRegression = payload.regression_introduced === false || payload.introduced_failures === 0;
+  return noRegression && documented > 0;
 }
 
 function checkDocsUpdatePhase(payload, worktree) {
